@@ -7,6 +7,10 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/signal"
+	"sync"
+	"syscall"
+	"time"
 
 	"github.com/DevNewbie1826/omosense/internal/core"
 )
@@ -24,8 +28,38 @@ Flags:
 // Run is the compat subcommand host: it runs the listen sources in-process
 // under the listen lock with the TS stdout grammar and exit semantics.
 func Run(ctx *core.Ctx, args []string) int {
-	fmt.Fprintln(os.Stderr, "omosense listen: not implemented yet")
-	return 1
+	if ctx.Flags["--dry-run"] || core.ParseArgs(args).Flags["--dry-run"] {
+		bots := ctx.Profile.Telegram
+		if bots == nil {
+			bots = []string{}
+		}
+		ctx.Out.Emit("PLAN", map[string]any{"profile": ctx.Profile.Name, "discord": ctx.Profile.Discord, "telegram": bots, "lock": "listen-" + ctx.Profile.Name, "state": ctx.State})
+		return 0
+	}
+	release := ctx.Acquire("listen-"+ctx.Profile.Name, "listen")
+	defer release()
+	ctx.Out.Log("omomeow listener starting (profile " + ctx.Profile.Name + ")")
+	runCtx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	defer cancel()
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	for _, source := range Sources(ctx) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := source.Run(runCtx, ctx.Out); err != nil {
+				errs <- err
+				cancel()
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		fmt.Fprintln(os.Stderr, "omosense listen:", err)
+		return 1
+	}
+	return 0
 }
 
 // Sources returns the telegram and discord sources of ctx's profile. They
@@ -33,25 +67,35 @@ func Run(ctx *core.Ctx, args []string) int {
 // that lock across the two.
 func Sources(ctx *core.Ctx) []core.Source {
 	p := ctx.Profile.Name
-	return []core.Source{
+	result := []core.Source{
 		src{
+			cfg:      ctx,
+			sleep:    sleep,
 			name:     "telegram",
 			prefixes: []string{"EVENT"},
 			lock:     "listen-" + p,
 			legacy:   "listen",
 		},
-		src{
+	}
+	if ctx.Profile.Discord {
+		result = append(result, src{
+			cfg:      ctx,
+			sleep:    sleep,
 			name:     "discord",
 			prefixes: []string{"EVENT"},
 			alwaysOn: true,
 			lock:     "listen-" + p,
 			legacy:   "listen",
-		},
+		})
 	}
+	return result
 }
 
-// src is the metadata-only Source used until the real sources land.
+// src hosts one platform under either the daemon or compat host.
 type src struct {
+	cfg      *core.Ctx
+	sleep    func(context.Context, time.Duration) error
+	clock    clock
 	name     string
 	prefixes []string
 	alwaysOn bool
@@ -65,5 +109,19 @@ func (s src) AlwaysOn() bool             { return s.alwaysOn }
 func (s src) LockName() (string, string) { return s.lock, s.legacy }
 
 func (s src) Run(ctx context.Context, sink core.Sink) error {
-	return fmt.Errorf("%s: not implemented", s.name)
+	if s.name == "telegram" {
+		return s.telegram(ctx, sink)
+	}
+	return s.discord(ctx, sink)
+}
+
+func sleep(ctx context.Context, duration time.Duration) error {
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
