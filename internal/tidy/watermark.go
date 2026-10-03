@@ -1,0 +1,175 @@
+package tidy
+
+import (
+	"errors"
+	"fmt"
+	"math"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+
+	"github.com/DevNewbie1826/omosense/internal/core"
+)
+
+// exclude is the EXCLUDE set: agent memory dirs whose tidiness is not
+// watched (they are still backed up).
+var exclude = map[string]bool{"owo-mode-57b805e5": true, "owo-family-bccd4b63": true}
+
+func (t *tidyer) watermarkPath() string {
+	return filepath.Join(t.state, "memory-tidy.json")
+}
+
+// readWatermark parses <State>/memory-tidy.json, filling the TS defaults
+// (repos, lastRun, lastBackupDate, appended in that order) exactly like
+// {...raw, repos: ..., lastRun: ..., lastBackupDate: ...} does. A missing
+// file yields the defaults; a parse failure is a SyntaxError, like
+// JSON.parse in the TS.
+func (t *tidyer) readWatermark() (*core.OMap, error) {
+	b, err := os.ReadFile(t.watermarkPath())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return withDefaults(core.NewOMap()), nil
+		}
+		return nil, errors.New("Error: " + err.Error())
+	}
+	v, err := core.ParseJSON(b)
+	if err != nil {
+		return nil, errors.New("SyntaxError: " + err.Error())
+	}
+	m, ok := v.(*core.OMap)
+	if !ok {
+		// {...primitive} spreads to an empty object; only an array (with
+		// index keys) diverges, which the TS never writes.
+		m = core.NewOMap()
+	}
+	return withDefaults(m), nil
+}
+
+func withDefaults(m *core.OMap) *core.OMap {
+	if v, ok := m.Get("repos"); !ok || v == nil {
+		m.Set("repos", core.NewOMap())
+	}
+	if v, ok := m.Get("lastRun"); !ok || v == nil {
+		m.Set("lastRun", nil)
+	}
+	if v, ok := m.Get("lastBackupDate"); !ok || v == nil {
+		m.Set("lastBackupDate", nil)
+	}
+	return m
+}
+
+// reposOf returns w.repos when it is an object, else nil: JS property
+// lookups on a non-object are undefined and Object.assign onto one is a
+// no-op, so callers skip assignment when it is nil.
+func reposOf(w *core.OMap) *core.OMap {
+	v, _ := w.Get("repos")
+	m, _ := v.(*core.OMap)
+	return m
+}
+
+// writeWatermarkDoc writes JSON.stringify(w, null, 2) + "\n" through a
+// .tmp file + rename (IS-4).
+func writeWatermarkDoc(path string, w *core.OMap) error {
+	b, err := w.MarshalIndent2()
+	if err != nil {
+		return errors.New("Error: " + err.Error())
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, append(b, '\n'), 0o644); err != nil {
+		return errors.New("Error: " + err.Error())
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return errors.New("Error: " + err.Error())
+	}
+	return nil
+}
+
+// sortedAgents lists AGENTS entries in readdir(...).sort() order (both
+// byte-wise and UTF-16 code-unit order agree on the names that appear).
+func sortedAgents(agents string) ([]string, error) {
+	entries, err := os.ReadDir(agents)
+	if err != nil {
+		return nil, errors.New("Error: " + err.Error())
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+type headRec struct {
+	name string
+	sha  string
+	at   float64
+}
+
+// heads lists HEAD of every non-EXCLUDE agent repo that has a repo/.git
+// entry. at is %ct*1000; a git log failure is logged per repo and skipped.
+func (t *tidyer) heads() ([]headRec, error) {
+	names, err := sortedAgents(t.agents)
+	if err != nil {
+		return nil, err
+	}
+	var out []headRec
+	for _, name := range names {
+		if exclude[name] {
+			continue
+		}
+		repo := filepath.Join(t.agents, name, "repo")
+		if _, err := os.Stat(filepath.Join(repo, ".git")); err != nil {
+			continue
+		}
+		stdout, stderr, code, err := runGit("-C", repo, "log", "-1", "--format=%H%x20%ct")
+		if err != nil {
+			return nil, err
+		}
+		if code != 0 {
+			t.sink.Log(fmt.Sprintf("memory-tidy git log failed %s: %s", name, core.Trunc(strings.TrimSpace(stderr), 200)))
+			continue
+		}
+		parts := strings.Split(strings.TrimSpace(stdout), " ")
+		rec := headRec{name: name, at: math.NaN()}
+		if len(parts) > 0 {
+			rec.sha = parts[0]
+		}
+		if len(parts) > 1 {
+			if n, finite := jsNumber(parts[1]); finite {
+				rec.at = n * 1000
+			}
+		}
+		out = append(out, rec)
+	}
+	return out, nil
+}
+
+// changed lists the repos whose watermark sha differs from HEAD. The
+// comparison is a JS strict !== against the sha string, so a json.Number
+// or boolean watermark value always counts as changed; from is the raw
+// watermark value, null when absent.
+func (t *tidyer) changed() ([]change, error) {
+	w, err := t.readWatermark()
+	if err != nil {
+		return nil, err
+	}
+	repos := reposOf(w)
+	heads, err := t.heads()
+	if err != nil {
+		return nil, err
+	}
+	var out []change
+	for _, h := range heads {
+		cur, _ := repos.Get(h.name)
+		if s, isStr := cur.(string); isStr && s == h.sha {
+			continue
+		}
+		from := any(nil)
+		if cur != nil {
+			from = cur
+		}
+		out = append(out, change{repo: h.name, from: from, to: h.sha, committedAt: h.at})
+	}
+	return out, nil
+}

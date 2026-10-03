@@ -1,10 +1,14 @@
-// Package tidy hosts the memory-tidy watcher, printing TIDY and LOG lines.
+// Package tidy hosts the memory-tidy watcher: it prints a TIDY line when a
+// source memory repo's HEAD moved past the watermark, keeps daily
+// git-bundle backups, and mirrors ~/.omomeow/memory-tidy.ts state interop.
 package tidy
 
 import (
 	"context"
 	"fmt"
 	"os"
+	"slices"
+	"strings"
 
 	"github.com/DevNewbie1826/omosense/internal/core"
 )
@@ -15,44 +19,143 @@ const Help = `Usage: omosense tidy [--profile P] [--once|--now] [flags]
 Runs the memory tidy watcher, printing TIDY and LOG lines to stdout.
 
 Flags:
-  --check-min/--quiet-min/--max-min [m]   thresholds in minutes
+  --check-min/--quiet-min/--max-min [m]   thresholds in minutes (JS number)
   --write-watermark [repo=sha ...]        update the watermark and exit
-  --backup-now                            run a backup and exit
-  --once, --now                           read-only check
+  --backup-now                            run the daily backup and exit
+  --once, --now                           read-only change check
 `
 
-// Run is the compat subcommand host: it runs the tidy source in-process
-// under the memory-tidy lock with the TS stdout grammar and exit semantics.
-func Run(ctx *core.Ctx, args []string) int {
-	fmt.Fprintln(os.Stderr, "omosense tidy: not implemented yet")
-	return 1
-}
-
-// Sources returns the tidy source of ctx's profile (no legacy lock name).
-func Sources(ctx *core.Ctx) []core.Source {
-	return []core.Source{
-		src{
-			name:     "tidy",
-			prefixes: []string{"TIDY"},
-			lock:     "memory-tidy-" + ctx.Profile.Name,
-		},
+// Run is the compat subcommand host, in memory-tidy.ts order: the
+// threshold flags parse first (a bad value logs and exits 2), then
+// --write-watermark, --backup-now and the read-only --now/--once run
+// without the lock, and everything else enters the locked watcher loop.
+func Run(c *core.Ctx, args []string) int {
+	t := newTidyer(c, c.Out)
+	checkMs, quietMs, maxMs, ok := parseMinutes(c.Out, args)
+	if !ok {
+		return 2
 	}
+	t.checkMs, t.quietMs, t.maxMs = checkMs, quietMs, maxMs
+
+	switch {
+	case c.Flags["--write-watermark"]:
+		if err := t.writeWatermarkCmd(args); err != nil {
+			fmt.Fprintln(os.Stderr, "omosense:", err)
+			return 1
+		}
+		return 0
+	case c.Flags["--backup-now"]:
+		allGood, err := t.backup(false)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "omosense:", err)
+			return 1
+		}
+		if !allGood {
+			return 1
+		}
+		return 0
+	case c.Flags["--now"] || c.Flags["--once"]:
+		if err := t.nowOnce(); err != nil {
+			fmt.Fprintln(os.Stderr, "omosense:", err)
+			return 1
+		}
+		return 0
+	}
+	release := c.Acquire("memory-tidy-"+c.Profile.Name, "")
+	defer release()
+	if err := t.runLoop(context.Background()); err != nil {
+		fmt.Fprintln(os.Stderr, "omosense:", err)
+		return 1
+	}
+	return 0
 }
 
-// src is the metadata-only Source used until the real source lands.
+// writeWatermarkCmd is --write-watermark: the repo=sha pairs after the
+// flag (skipping --flags and values without "=") override the current
+// heads as the repos map, lastRun is stamped, and the LOG line reports
+// the unique key count. The JS split("=", 2) limit drops any tail:
+// "a=b=c" sets repo "a" to "b".
+func (t *tidyer) writeWatermarkCmd(args []string) error {
+	w, err := t.readWatermark()
+	if err != nil {
+		return err
+	}
+	set := core.NewOMap()
+	if i := slices.Index(args, "--write-watermark"); i >= 0 {
+		for _, a := range args[i+1:] {
+			if strings.HasPrefix(a, "--") || !strings.Contains(a, "=") {
+				continue
+			}
+			parts := strings.SplitN(a, "=", 3)
+			set.Set(parts[0], parts[1])
+		}
+	}
+	count := set.Len()
+	if count > 0 {
+		if repos := reposOf(w); repos != nil {
+			for _, k := range set.Keys() {
+				v, _ := set.Get(k)
+				repos.Set(k, v)
+			}
+		}
+	} else {
+		heads, err := t.heads()
+		if err != nil {
+			return err
+		}
+		count = len(heads)
+		if repos := reposOf(w); repos != nil {
+			for _, h := range heads {
+				repos.Set(h.name, h.sha)
+			}
+		}
+	}
+	w.Set("lastRun", core.ISO(t.now()))
+	if err := writeWatermarkDoc(t.watermarkPath(), w); err != nil {
+		return err
+	}
+	t.sink.Log(fmt.Sprintf("memory-tidy watermark set %d repos", count))
+	return nil
+}
+
+// nowOnce is the read-only --now/--once check: print one TIDY line when
+// any repo changed; never lock and never write (IS-9).
+func (t *tidyer) nowOnce() error {
+	changes, err := t.changed()
+	if err != nil {
+		return err
+	}
+	if len(changes) > 0 {
+		t.emitTidy(changes)
+	}
+	return nil
+}
+
+// Sources returns the tidy source of c's profile. It is pause-while-idle
+// (IS-13) and takes memory-tidy-<profile> with no legacy lock name.
+func Sources(c *core.Ctx) []core.Source {
+	return []core.Source{src{
+		c:        c,
+		name:     "tidy",
+		prefixes: []string{"TIDY"},
+		lock:     "memory-tidy-" + c.Profile.Name,
+	}}
+}
+
+// src is the daemon-hosted tidy source. The daemon owns the lock (IS-15),
+// so Run only watches, with the TS default thresholds.
 type src struct {
+	c        *core.Ctx
 	name     string
 	prefixes []string
-	alwaysOn bool
 	lock     string
-	legacy   string
 }
 
 func (s src) Name() string               { return s.name }
 func (s src) Prefixes() []string         { return s.prefixes }
-func (s src) AlwaysOn() bool             { return s.alwaysOn }
-func (s src) LockName() (string, string) { return s.lock, s.legacy }
+func (s src) AlwaysOn() bool             { return false }
+func (s src) LockName() (string, string) { return s.lock, "" }
 
 func (s src) Run(ctx context.Context, sink core.Sink) error {
-	return fmt.Errorf("%s: not implemented", s.name)
+	return newTidyer(s.c, sink).runLoop(ctx)
 }
