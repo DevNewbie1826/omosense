@@ -139,6 +139,10 @@
     "tagstr": "010",
     "korean": "마스크된 긴 문자열 스칼라 확인용 텍스트입니다. 한글 텍스트 반복 한글 텍스트 반복 한글 텍스트 반복 한글 텍스트 반복 한글 텍스트 반복 한글 텍스트 반복",
     "negint": -42,
-    "plusint": 7
+    "plusint": 7,
+    "tagintq": "5",
+    "tagboolq": "yes",
+    "tagnullx": "x",
+    "tagcustom": "bar"
   }
 }
