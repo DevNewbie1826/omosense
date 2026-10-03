@@ -517,6 +517,53 @@ items:
 	}
 }
 
+// TestCalendarFilter pins the profile.calendars allow-list: nil means
+// all calendars, a list passes only events whose calendar is in it.
+func TestCalendarFilter(t *testing.T) {
+	mustSeoul(t)
+	cal := fixture(t, "cal.yaml")
+	cv, err := parseYAML(cal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	iv, _ := cv.(*core.OMap).Get("items")
+	items := iv.([]any)
+	last := items[4].(*core.OMap)
+	wantCal, _ := last.Get("calendar")
+	allow := []string{wantCal.(string)}
+	for _, tc := range []struct {
+		name string
+		list *[]string
+		want int
+	}{
+		{"nil allows all", nil, 4},
+		{"list allows only the synthetic calendar", &allow, 1},
+		{"list excluding everything", &[]string{"nowhere@virtual"}, 0},
+	} {
+		var buf bytes.Buffer
+		sink := core.NewOut(&buf)
+		w, err := newWatcher(newTestCtx(t.TempDir(), core.Profile{Name: "main", Mail: true, Calendars: tc.list}, sink), sink, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		w.zele = fakeZele(cal, nil, nil)
+		w.now = func() time.Time { return time.Date(2026, 10, 3, 19, 0, 0, 0, time.Local) }
+		if err := w.calendar(); err != nil {
+			t.Fatal(err)
+		}
+		cals := linesWith(&buf, "CAL")
+		if len(cals) != tc.want {
+			t.Errorf("%s: CAL lines = %d, want %d:\n%s", tc.name, len(cals), tc.want, buf.String())
+		}
+		if tc.want == 1 {
+			got, _ := payloadOf(t, cals[0]).Get("calendar")
+			if got != wantCal {
+				t.Errorf("%s: emitted calendar = %v, want %v", tc.name, got, wantCal)
+			}
+		}
+	}
+}
+
 // TestSourcesMetadata pins the daemon contract: one pausable google source
 // with the watch-google-<profile> lock and the legacy watch-google
 // fallback.
