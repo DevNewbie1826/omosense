@@ -21,6 +21,11 @@ JSON to stdout. --profile is validated but does not select the bot;
 pass {"bot":"name"} in the json to override it.
 `
 
+// Sources returns no daemon sources because say is a one-shot command.
+func Sources(*core.Ctx) []core.Source {
+	return nil
+}
+
 // client bounds a single one-shot request; bun fetch has no timeout, but a
 // hung API must never wedge the remind tick that execs say.
 var client = &http.Client{Timeout: 60 * time.Second}
