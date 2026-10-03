@@ -1,0 +1,234 @@
+package say
+
+import (
+	"bytes"
+	"encoding/json"
+	"io"
+	"mime/multipart"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"sync"
+	"testing"
+
+	"github.com/DevNewbie1826/omosense/internal/core"
+)
+
+// testEnv points HOME, OMOMEOW_DIR and OMOMEOW_STATE at temp dirs with a
+// config.json and fake agent-messenger credentials (obviously fake tokens).
+func testEnv(t *testing.T) (home, dir, state string) {
+	t.Helper()
+	home = t.TempDir()
+	dir = filepath.Join(home, ".omomeow")
+	state = filepath.Join(dir, "state")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	creds := filepath.Join(home, ".config", "agent-messenger")
+	if err := os.MkdirAll(creds, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(`{"telegram":{"bot":"b1","dm_bot":"b2"},"discord":{"bot":"d1"}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(creds, "telegrambot-credentials.json"), []byte(`{"bots":{"b1":{"token":"TGTOK1"},"dm2":{"token":"TGTOK2"}}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(creds, "discordbot-credentials.json"), []byte(`{"bots":{"d1":{"token":"DCTOK1"}}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("OMOMEOW_DIR", dir)
+	t.Setenv("OMOMEOW_STATE", state)
+	return home, dir, state
+}
+
+// captureStd swaps the process streams so Run's real surface (the compat
+// host writing to os.Stdout/os.Stderr like say.ts console.log) is observable.
+func captureStd(t *testing.T) (restore func() (stdout, stderr string)) {
+	t.Helper()
+	oldOut, oldErr := os.Stdout, os.Stderr
+	rOut, wOut, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rErr, wErr, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout, os.Stderr = wOut, wErr
+	return func() (stdout, stderr string) {
+		wOut.Close()
+		wErr.Close()
+		ob, _ := io.ReadAll(rOut)
+		eb, _ := io.ReadAll(rErr)
+		os.Stdout, os.Stderr = oldOut, oldErr
+		return string(ob), string(eb)
+	}
+}
+
+func runSay(t *testing.T, args ...string) (stdout, stderr string, code int) {
+	t.Helper()
+	testEnv(t)
+	restore := captureStd(t)
+	ctx, err := core.Load(core.ParseArgs(args), false)
+	if err != nil {
+		stdout, stderr = restore()
+		t.Fatalf("load: %v", err)
+	}
+	code = Run(ctx, args)
+	stdout, stderr = restore()
+	return
+}
+
+type recorded struct {
+	method string
+	path   string
+	header http.Header
+	body   []byte
+	fields map[string][]string
+	files  map[string][]byte
+}
+
+type recorder struct {
+	mu   sync.Mutex
+	reqs []recorded
+}
+
+func (rec *recorder) handler(respond func(w http.ResponseWriter)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		rec.mu.Lock()
+		defer rec.mu.Unlock()
+		// EscapedPath is the wire form; URL.Path would decode the
+		// percent-encoded reaction emoji.
+		rr := recorded{method: r.Method, path: r.URL.EscapedPath(), header: r.Header.Clone(), body: b}
+		if ct := r.Header.Get("Content-Type"); strings.HasPrefix(ct, "multipart/form-data") {
+			form, err := multipart.NewReader(bytes.NewReader(b), strings.TrimPrefix(ct, "multipart/form-data; boundary=")).ReadForm(1 << 20)
+			if err == nil {
+				rr.fields = form.Value
+				rr.files = map[string][]byte{}
+				for k, fh := range form.File {
+					if len(fh) == 0 {
+						continue
+					}
+					f, err := fh[0].Open()
+					if err != nil {
+						continue
+					}
+					fb, _ := io.ReadAll(f)
+					f.Close()
+					rr.files[k] = fb
+				}
+			}
+		}
+		rec.reqs = append(rec.reqs, rr)
+		respond(w)
+	}
+}
+
+func (rec *recorder) last(t *testing.T) recorded {
+	t.Helper()
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	if len(rec.reqs) == 0 {
+		t.Fatal("no request recorded")
+	}
+	return rec.reqs[len(rec.reqs)-1]
+}
+
+func jsonResponder(status int, body string) func(w http.ResponseWriter) {
+	return func(w http.ResponseWriter) {
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(body))
+	}
+}
+
+// jsonEqual compares two JSON documents semantically (key order free).
+func jsonEqual(t *testing.T, got []byte, want string) {
+	t.Helper()
+	var g, w any
+	dec := json.NewDecoder(bytes.NewReader(got))
+	dec.UseNumber()
+	if err := dec.Decode(&g); err != nil {
+		t.Fatalf("response body is not JSON: %s (%v)", got, err)
+	}
+	dec = json.NewDecoder(strings.NewReader(want))
+	dec.UseNumber()
+	if err := dec.Decode(&w); err != nil {
+		t.Fatalf("want is not JSON: %s (%v)", want, err)
+	}
+	if !reflect.DeepEqual(g, w) {
+		t.Errorf("body:\n got %s\nwant %s", got, want)
+	}
+}
+
+func TestUnknownPlatformExits2(t *testing.T) {
+	stdout, stderr, code := runSay(t, "nope", "send", `{}`)
+	if code != 2 {
+		t.Errorf("exit = %d, want 2", code)
+	}
+	if stderr != "unknown nope send\n" {
+		t.Errorf("stderr = %q, want \"unknown nope send\"", stderr)
+	}
+	if stdout != "" {
+		t.Errorf("stdout = %q, want empty", stdout)
+	}
+}
+
+func TestUnknownActionExits2(t *testing.T) {
+	for _, platform := range []string{"telegram", "discord"} {
+		stdout, stderr, code := runSay(t, platform, "nope", `{}`)
+		if code != 2 {
+			t.Errorf("%s: exit = %d, want 2", platform, code)
+		}
+		if want := "unknown " + platform + " nope\n"; stderr != want {
+			t.Errorf("%s: stderr = %q, want %q", platform, stderr, want)
+		}
+		if stdout != "" {
+			t.Errorf("%s: stdout = %q, want empty", platform, stdout)
+		}
+	}
+}
+
+func TestEmptyArgsUnknownPlatformExits2(t *testing.T) {
+	_, stderr, code := runSay(t, "telegram")
+	if code != 2 || stderr != "unknown telegram \n" {
+		t.Errorf("code=%d stderr=%q, want 2/\"unknown telegram \"", code, stderr)
+	}
+}
+
+func TestBadJSONArgsErrorExits1(t *testing.T) {
+	// say.ts: JSON.parse throws -> unhandled crash (exit 1); the Go port
+	// reports the same failure as an error JSON on stderr.
+	stdout, stderr, code := runSay(t, "telegram", "send", `{oops`)
+	if code != 1 {
+		t.Errorf("exit = %d, want 1", code)
+	}
+	if !strings.HasPrefix(stderr, `{"error":`) {
+		t.Errorf("stderr = %q, want error JSON", stderr)
+	}
+	if stdout != "" {
+		t.Errorf("stdout = %q, want empty", stdout)
+	}
+}
+
+func TestMissingJSONArgDefaultsToEmptyObject(t *testing.T) {
+	rec := &recorder{}
+	srv := httptest.NewServer(rec.handler(jsonResponder(200, `{"ok":true}`)))
+	t.Cleanup(srv.Close)
+	t.Setenv("OMOSENSE_TELEGRAM_API", srv.URL)
+
+	_, _, code := runSay(t, "telegram", "send")
+	r := rec.last(t)
+	if r.path != "/botTGTOK1/sendMessage" {
+		t.Errorf("path = %s, want sendMessage", r.path)
+	}
+	jsonEqual(t, r.body, `{}`)
+	if code != 0 {
+		t.Errorf("exit = %d, want 0", code)
+	}
+}

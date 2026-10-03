@@ -4,7 +4,10 @@ package say
 
 import (
 	"fmt"
+	"io"
+	"net/http"
 	"os"
+	"time"
 
 	"github.com/DevNewbie1826/omosense/internal/core"
 )
@@ -17,13 +20,83 @@ JSON to stdout. --profile is validated but does not select the bot;
 pass {"bot":"name"} in the json to override it.
 `
 
-// Run is the compat subcommand host for say.
+// client bounds a single one-shot request; bun fetch has no timeout, but a
+// hung API must never wedge the remind tick that execs say.
+var client = &http.Client{Timeout: 60 * time.Second}
+
+// Run is the compat subcommand host for say. The positional
+// platform/action/json are read from ctx.Args (the host parsed the flags).
 func Run(ctx *core.Ctx, args []string) int {
-	fmt.Fprintln(os.Stderr, "omosense say: not implemented yet")
-	return 1
+	return run(ctx, os.Stdout, os.Stderr)
 }
 
-// Sources returns nil: say is a sender, not a daemon-hosted source.
-func Sources(ctx *core.Ctx) []core.Source {
-	return nil
+type env struct {
+	stdout io.Writer
+	stderr io.Writer
+}
+
+func run(ctx *core.Ctx, stdout, stderr io.Writer) int {
+	e := &env{stdout: stdout, stderr: stderr}
+	platform, action, raw := positionals(ctx.Args)
+	if platform != "telegram" && platform != "discord" {
+		fmt.Fprintf(stderr, "unknown %s %s\n", platform, action)
+		return 2
+	}
+	a, err := argsJSON(raw)
+	if err != nil {
+		return e.fail(err)
+	}
+	if platform == "telegram" {
+		bot := ctx.Cfg.Telegram.Bot
+		if v, ok := a.Get("bot"); ok {
+			if s, is := v.(string); is {
+				bot = s
+			}
+		}
+		a.Delete("bot")
+		return e.telegram(action, a, bot)
+	}
+	return e.discord(action, a, ctx.Cfg.Discord.Bot)
+}
+
+func positionals(argv []string) (platform, action, raw string) {
+	raw = "{}"
+	if len(argv) > 0 {
+		platform = argv[0]
+	}
+	if len(argv) > 1 {
+		action = argv[1]
+	}
+	if len(argv) > 2 {
+		raw = argv[2]
+	}
+	return platform, action, raw
+}
+
+// argsJSON parses the json-args document; a non-object document behaves as
+// an empty args object (say.ts reads undefined from it, same net effect).
+func argsJSON(raw string) (*core.OMap, error) {
+	v, err := core.ParseJSON([]byte(raw))
+	if err != nil {
+		return nil, fmt.Errorf("parse json args: %w", err)
+	}
+	om, _ := v.(*core.OMap)
+	if om == nil {
+		om = core.NewOMap()
+	}
+	return om, nil
+}
+
+// fail prints an error JSON to stderr and yields exit 1; say.ts crashes on
+// these paths (unhandled rejection), the port reports the failure instead
+// (plan IS-8: exit 1 on network/JSON errors).
+func (e *env) fail(err error) int {
+	m := core.NewOMap()
+	m.Set("error", err.Error())
+	b, mErr := m.Marshal()
+	if mErr != nil {
+		b = []byte(`{"error":"unprintable failure"}`)
+	}
+	fmt.Fprintln(e.stderr, string(b))
+	return 1
 }

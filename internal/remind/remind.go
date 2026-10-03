@@ -1,6 +1,8 @@
 // Package remind hosts the reminder scheduler: it reads the reminder file
-// every 20 seconds and sends due reminders through say, printing REMIND and
-// LOG lines.
+// every 20 seconds, sends due reminders through the say subcommand and
+// prints REMIND and LOG lines. A failed send is terminal: the entry
+// records failed and error and is never retried (plan IS-8), fixing
+// remind.ts, which retried failed sends on every tick.
 package remind
 
 import (
@@ -19,39 +21,52 @@ Runs the reminder scheduler, printing REMIND and LOG lines to stdout.
 
 // Run is the compat subcommand host: it runs the remind source in-process
 // under the remind lock with the TS stdout grammar and exit semantics.
-func Run(ctx *core.Ctx, args []string) int {
-	fmt.Fprintln(os.Stderr, "omosense remind: not implemented yet")
-	return 1
+func Run(c *core.Ctx, args []string) int {
+	_ = args
+	name, legacy := lockNames(c.Profile.Name)
+	release := c.Acquire(name, legacy)
+	defer release()
+	if err := newScheduler(c, c.Out).run(context.Background()); err != nil {
+		fmt.Fprintln(os.Stderr, "omosense:", err)
+		return 1
+	}
+	return 0
+}
+
+func lockNames(profile string) (name, legacy string) {
+	return "remind-" + profile, "remind"
 }
 
 // Sources returns the remind source of ctx's profile. It is always-on in
-// the daemon because it must send even with no client attached.
-func Sources(ctx *core.Ctx) []core.Source {
+// the daemon (IS-13): reminders must fire even with no client attached.
+func Sources(c *core.Ctx) []core.Source {
+	name, legacy := lockNames(c.Profile.Name)
 	return []core.Source{
 		src{
+			c:        c,
 			name:     "remind",
 			prefixes: []string{"REMIND"},
-			alwaysOn: true,
-			lock:     "remind-" + ctx.Profile.Name,
-			legacy:   "remind",
+			lock:     name,
+			legacy:   legacy,
 		},
 	}
 }
 
-// src is the metadata-only Source used until the real source lands.
+// src is the daemon-hosted remind source; the daemon host owns the lock
+// (IS-15), so Run only schedules.
 type src struct {
+	c        *core.Ctx
 	name     string
 	prefixes []string
-	alwaysOn bool
 	lock     string
 	legacy   string
 }
 
 func (s src) Name() string               { return s.name }
 func (s src) Prefixes() []string         { return s.prefixes }
-func (s src) AlwaysOn() bool             { return s.alwaysOn }
+func (s src) AlwaysOn() bool             { return true }
 func (s src) LockName() (string, string) { return s.lock, s.legacy }
 
 func (s src) Run(ctx context.Context, sink core.Sink) error {
-	return fmt.Errorf("%s: not implemented", s.name)
+	return newScheduler(s.c, sink).run(ctx)
 }
