@@ -1,0 +1,31 @@
+n010: 010
+n001: 001
+hex: 0x10
+hexp: +0x10
+hexm: -0x10
+oct: 0o17
+octm: -0o17
+under: 1_000
+float: 1.5
+exp: 1e3
+dotfive: .5
+infp: .inf
+infn: -.inf
+nan: .nan
+t1: true
+t2: True
+t3: FALSE
+yes: yes
+tilde: ~
+nullword: null
+nullbig: Null
+emptyval:
+date: 2026-10-05
+big: 9007199254740993
+str010: '010'
+strempty: ''
+esc: 'It''s a masked ''quoted'' string'
+tagstr: !!str 010
+korean: 마스크된 긴 문자열 스칼라 확인용 텍스트입니다. 한글 텍스트 반복 한글 텍스트 반복 한글 텍스트 반복 한글 텍스트 반복 한글 텍스트 반복 한글 텍스트 반복
+negint: -42
+plusint: +7

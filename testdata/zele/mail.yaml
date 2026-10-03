@@ -1,0 +1,51 @@
+summary: 5 threads (inbox)
+items:
+  - account: fixturemain@gmail.com
+    id: 1a1024917255ca5b
+    flags: unread
+    from: Google <no-reply@accounts.google.com>
+    to: fixturemain@gmail.com
+    subject: fixtureother@gmail.com 관련 보안 경고
+    snippet: 이 메일은 fixtureother@gmail.com 주소로 전송된 보안 경고의 사본입니다. fixturemain@gmail.com 주소는 이 계정의 복구 이메일입니다. 모르는 계정이라면 삭제하세요 Android에서 새로 로그인함 fixtureother@gmail.com Android 기기에서 내 Google 계정에 새로 로그인했습니다. 직접 로그인한 것이 맞다면
+    date: 2h ago
+    messages: 1
+    labels: 일반
+  - account: fixturemain@gmail.com
+    id: 1a0ffa63888a1460
+    flags: unread, attachment
+    from: 마스크은행 <openbanking@maskedbank.example>
+    to: 마스크님 <fixturemain@gmail.com>
+    subject: 2026년 3분기 오픈뱅킹 금융거래정보 제공사실 안내(마스크협)
+    snippet: '[마스크협]금융거래정보 제공사실 안내 항상 마스크은행을 믿고 이용해 주시는 고객님께 깊은 감사를 드립니다. ''금융실명거래 및 비밀보장에 관한 법률 제4조의2''에 의거, 오픈뱅킹 서비스를 통해 제공된 고객님의 금융거래정보 내역을 안내드립니다. 1. 제공 목적 : 고객님의 오픈뱅킹 서비스 이용 2. 제공 근거 : 금융실명거래 및 비밀보장에 관한 법률 제'
+    date: 15h ago
+    messages: 1
+    labels: 일반
+  - account: fixturemain@gmail.com
+    id: 1a0ff41e81e22bc6
+    flags: unread
+    from: MaskedX <noreply@email-service.maskedx.example>
+    to: fixturemain@gmail.com
+    subject: '[MaskedX]Your Auto Cashback Have Been Successfully Redeemed!'
+    snippet: Dear MaskedX user, We are delighted to inform you that your Reward Points have been successfully converted into USDT. Please review the details below and verify your MaskedX Funding Account accordingly.
+    date: 17h ago
+    messages: 1
+    labels: 일반
+  - account: fixturemain@gmail.com
+    id: 1a10300000000001
+    flags: unread
+    from: MaskedWelcome <hello@maskedwelcome.example>
+    to: 마스크님 <fixturemain@gmail.com>
+    subject: Welcome to Masked Service
+    snippet: Your masked account is ready. Thanks for signing up!
+    date: 1h ago
+    messages: 1
+    labels: 일반
+  - account: fixturemain@gmail.com
+    id: 1a10300000000002
+    flags: unread
+    from: MaskedNews <news@maskednews.example>
+    subject: 오늘의 마스크 뉴스
+    snippet: 오늘의 마스크 뉴스 브리핑입니다. 금융과 기술, 생활 전반에 걸친 주요 소식을 짧게 전해드립니다. 오늘의 마스크 뉴스 브리핑입니다. 금융과 기술, 생활 전반에 걸친 주요 소식을 짧게 전해드립니다. 오늘의 마스크 뉴스 브리핑입니다. 금융과 기술, 생활 전반에 걸친 주요 소식을 짧게 전해드립니다. 오늘의 마스크 뉴스 브리핑입니다. 금융과 기술, 생활 전반에 걸친 주요 소식을 짧게 전해드립니다. 오늘의 마스크 뉴스 브리핑입니다. 금융과 기술, 생활 전반에 걸친 주요 소식을 짧게 전해드립니다.
+    date: 3h ago
+    messages: 1
+    labels: 일반

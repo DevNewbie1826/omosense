@@ -1,5 +1,7 @@
 // Package google hosts the calendar and mail watcher backed by the zele
-// CLI, printing CAL, SOON, MAIL and LOG lines.
+// CLI, printing CAL, SOON, MAIL and LOG lines with watch-google.ts
+// semantics: Bun-compatible seen keys, a year-corrected SOON window, the
+// NOISE mail filter, 7-day pruning and a read-only --once snapshot mode.
 package google
 
 import (
@@ -21,38 +23,72 @@ Flags:
 `
 
 // Run is the compat subcommand host: it runs the google source in-process
-// under the watch-google lock with the TS stdout grammar and exit semantics.
-func Run(ctx *core.Ctx, args []string) int {
-	fmt.Fprintln(os.Stderr, "omosense google: not implemented yet")
-	return 1
+// under the watch-google lock with the TS stdout grammar and exit
+// semantics, or a single read-only --once pass without the lock.
+func Run(c *core.Ctx, args []string) int {
+	_ = args
+	if c.Flags["--once"] {
+		w, err := newWatcher(c, c.Out, false)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "omosense:", err)
+			return 1
+		}
+		w.once()
+		return 0
+	}
+	name, legacy := lockNames(c.Profile.Name)
+	release := c.Acquire(name, legacy)
+	defer release()
+	w, err := newWatcher(c, c.Out, true)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "omosense:", err)
+		return 1
+	}
+	if err := w.run(context.Background()); err != nil {
+		fmt.Fprintln(os.Stderr, "omosense:", err)
+		return 1
+	}
+	return 0
+}
+
+func lockNames(profile string) (name, legacy string) {
+	return "watch-google-" + profile, "watch-google"
 }
 
 // Sources returns the google source of ctx's profile.
-func Sources(ctx *core.Ctx) []core.Source {
+func Sources(c *core.Ctx) []core.Source {
+	name, legacy := lockNames(c.Profile.Name)
 	return []core.Source{
 		src{
+			c:        c,
 			name:     "google",
 			prefixes: []string{"CAL", "SOON", "MAIL"},
-			lock:     "watch-google-" + ctx.Profile.Name,
-			legacy:   "watch-google",
+			lock:     name,
+			legacy:   legacy,
 		},
 	}
 }
 
-// src is the metadata-only Source used until the real source lands.
+// src is the daemon-hosted google source: one pausable watcher per profile.
 type src struct {
+	c        *core.Ctx
 	name     string
 	prefixes []string
-	alwaysOn bool
 	lock     string
 	legacy   string
 }
 
 func (s src) Name() string               { return s.name }
 func (s src) Prefixes() []string         { return s.prefixes }
-func (s src) AlwaysOn() bool             { return s.alwaysOn }
+func (s src) AlwaysOn() bool             { return false }
 func (s src) LockName() (string, string) { return s.lock, s.legacy }
 
+// Run hosts the watcher on the daemon's sink. The daemon host owns the
+// watch-google lock (IS-15), so no lock is taken here.
 func (s src) Run(ctx context.Context, sink core.Sink) error {
-	return fmt.Errorf("%s: not implemented", s.name)
+	w, err := newWatcher(s.c, sink, true)
+	if err != nil {
+		return err
+	}
+	return w.run(ctx)
 }

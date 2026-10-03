@@ -1,0 +1,32 @@
+summary: 5 events
+items:
+  - account: fixturemain@gmail.com
+    id: 20261005_a3v3ietd9obqpnrv5hg4emhmvc@google.com
+    summary: 마스크된 휴일
+    start: Oct 5
+    end: Oct 5
+    calendar: 4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5@virtual
+  - account: fixturemainai@gmail.com
+    id: 20261005_a3v3ietd9obqpnrv5hg4emhmvc@google.com
+    summary: 마스크된 휴일
+    start: Oct 5
+    end: Oct 5
+    calendar: 4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5@virtual
+  - account: fixturemain@gmail.com
+    id: 20261006_2d3e4f5a6b7c8d9e0f1a2b3c4@google.com
+    summary: 마스크된 정기 회의
+    start: Oct 6, 9:30 AM
+    end: Oct 6, 10:30 AM
+    calendar: 4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5@virtual
+  - account: fixturemain@gmail.com
+    id: 20261007_4f5a6b7c8d9e0f1a2b3c4d5e0@google.com
+    summary: 마스크된 저녁 약속
+    start: Oct 7, 10:00 PM
+    end: Oct 8, 12:00 AM
+    calendar: 4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5@virtual
+  - account: fixturemainai@gmail.com
+    id: 20261008_6b7c8d9e0f1a2b3c4d5e0a1b2@google.com
+    summary: 마스크된 심야 작업
+    start: Oct 8, 21:30
+    end: Oct 8, 23:30
+    calendar: 18293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f@virtual
