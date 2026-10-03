@@ -1,6 +1,7 @@
 package core_test
 
 import (
+	"bufio"
 	"bytes"
 	"errors"
 	"fmt"
@@ -9,7 +10,9 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
+	"time"
 )
 
 var (
@@ -168,7 +171,7 @@ func TestCLIReadOnlyPathsLeaveStateAbsent(t *testing.T) {
 
 	for _, args := range [][]string{
 		{"google", "--once", "--profile", "main"},
-		{"herdr", "--now", "--profile", "main"},
+		{"herdr", "--once", "--profile", "main"},
 		{"listen", "--dry-run", "--profile", "main"},
 		{"say", "--profile", "main"},
 	} {
@@ -183,8 +186,50 @@ func TestCLIWritableRunCreatesState(t *testing.T) {
 	_, dir, state := cliEnv(t)
 	writeCliConfig(t, dir, cliFallbackCfg)
 
-	runBin(t, "google", "--profile", "main")
+	// remind is a long-running writable path with no external calls when the
+	// reminders file is absent; it must create the state dir, then stop on SIGTERM.
+	// The startup LOG line is printed only after the state dir exists and the
+	// lock is held, so it is the exact readiness signal.
+	buildBinaries(t)
+	cmd := exec.Command(binPath, "remind", "--profile", "main")
+	out, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	ready := make(chan string, 1)
+	go func() {
+		sc := bufio.NewScanner(out)
+		for sc.Scan() {
+			if strings.HasPrefix(sc.Text(), "LOG reminder scheduler starting") {
+				ready <- sc.Text()
+			}
+		}
+		close(ready)
+	}()
+	select {
+	case line, ok := <-ready:
+		if !ok {
+			t.Fatalf("remind exited before its startup line")
+		}
+		_ = line
+	case <-time.After(10 * time.Second):
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		t.Fatalf("remind printed no startup line within 10s")
+	}
 	if fi, err := os.Stat(state); err != nil || !fi.IsDir() {
 		t.Errorf("writable run did not create the state dir (err=%v)", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	_ = cmd.Process.Signal(syscall.SIGTERM)
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		_ = cmd.Process.Kill()
+		t.Fatalf("remind did not exit on SIGTERM")
 	}
 }
