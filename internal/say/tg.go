@@ -34,6 +34,7 @@ func (e *env) telegram(action string, a *core.OMap, bot string) int {
 	if err != nil {
 		return e.fail(err)
 	}
+	e.token = token
 	return e.postTG(token, call)
 }
 

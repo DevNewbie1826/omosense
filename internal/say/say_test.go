@@ -216,6 +216,20 @@ func TestBadJSONArgsErrorExits1(t *testing.T) {
 	}
 }
 
+func TestTelegramNetworkErrorRedactsToken(t *testing.T) {
+	t.Setenv("OMOSENSE_TELEGRAM_API", "http://127.0.0.1:9")
+	stdout, stderr, code := runSay(t, "telegram", "send", `{}`)
+	if code != 1 {
+		t.Errorf("exit = %d, want 1", code)
+	}
+	if strings.Contains(stdout+stderr, "TGTOK1") {
+		t.Errorf("output contains bot token: stdout=%q stderr=%q", stdout, stderr)
+	}
+	if !strings.Contains(stdout+stderr, "[redacted]") {
+		t.Errorf("output = stdout %q stderr %q, want [redacted]", stdout, stderr)
+	}
+}
+
 func TestMissingJSONArgDefaultsToEmptyObject(t *testing.T) {
 	rec := &recorder{}
 	srv := httptest.NewServer(rec.handler(jsonResponder(200, `{"ok":true}`)))

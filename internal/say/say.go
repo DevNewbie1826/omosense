@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/DevNewbie1826/omosense/internal/core"
@@ -33,6 +34,7 @@ func Run(ctx *core.Ctx, args []string) int {
 type env struct {
 	stdout io.Writer
 	stderr io.Writer
+	token  string
 }
 
 func run(ctx *core.Ctx, stdout, stderr io.Writer) int {
@@ -92,7 +94,11 @@ func argsJSON(raw string) (*core.OMap, error) {
 // (plan IS-8: exit 1 on network/JSON errors).
 func (e *env) fail(err error) int {
 	m := core.NewOMap()
-	m.Set("error", err.Error())
+	message := err.Error()
+	if e.token != "" {
+		message = strings.ReplaceAll(message, e.token, "[redacted]")
+	}
+	m.Set("error", message)
 	b, mErr := m.Marshal()
 	if mErr != nil {
 		b = []byte(`{"error":"unprintable failure"}`)

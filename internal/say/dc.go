@@ -35,6 +35,7 @@ func (e *env) discord(action string, a *core.OMap, cfgBot string) int {
 	if err != nil {
 		return e.fail(err)
 	}
+	e.token = token
 	return e.doDC(token, call)
 }
 
