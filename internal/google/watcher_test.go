@@ -590,6 +590,21 @@ func TestSourcesMetadata(t *testing.T) {
 	}
 }
 
+// TestZeleMissingBinaryLogsLikeBun pins the not-installed path: bun
+// spawns zele through a shell, so a missing binary yields sh's "command
+// not found" on stderr with exit 127, and the LOG line carries exactly
+// that text.
+func TestZeleMissingBinaryLogsLikeBun(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	r := zeleExec(calArgs)
+	if r.code != 127 {
+		t.Errorf("exit code = %d, want 127", r.code)
+	}
+	if r.stderr != "zele: command not found" {
+		t.Errorf("stderr = %q, want %q", r.stderr, "zele: command not found")
+	}
+}
+
 // TestRunOnceCompatReadOnly drives the real compat entry point: --once
 // under a family profile (mail:false) loads read-only, prints CAL only and
 // writes nothing.

@@ -56,15 +56,16 @@ func zeleExec(args []string) zeleResult {
 	var out, errb bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &errb
-	code := 0
 	if err := cmd.Run(); err != nil {
-		code = 1
 		var ee *exec.ExitError
 		if errors.As(err, &ee) {
-			code = ee.ExitCode()
+			return zeleResult{stdout: out.String(), stderr: errb.String(), code: ee.ExitCode()}
 		}
+		// bun spawns zele through a shell: a missing binary surfaces as sh's
+		// "command not found" on stderr with exit 127.
+		return zeleResult{stdout: out.String(), stderr: "zele: command not found", code: 127}
 	}
-	return zeleResult{stdout: out.String(), stderr: errb.String(), code: code}
+	return zeleResult{stdout: out.String(), stderr: errb.String(), code: 0}
 }
 
 var execZele zeleFunc = zeleExec
