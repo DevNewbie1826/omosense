@@ -79,29 +79,6 @@ func (s *server) handle(conn net.Conn) {
 		writeFrame(conn, reply{Error: rejection})
 		return
 	}
-	// A hello only negotiates. Probes and clients requesting an upgrade must
-	// not register interest or consume replay before accepting this version.
-	s.mu.Unlock()
-	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-	if err := writeFrame(conn, reply{OK: true, Version: s.options.version}); err != nil {
-		return
-	}
-	if err := reader.read(&cmd); err != nil {
-		return
-	}
-	if cmd.Cmd != "subscribe" {
-		s.control(conn, cmd)
-		return
-	}
-	if cmd.Version != s.options.version {
-		writeFrame(conn, reply{Error: "subscription version not accepted"})
-		return
-	}
-	s.mu.Lock()
-	if s.stopping {
-		s.mu.Unlock()
-		return
-	}
 	c := newClient(conn)
 	c.enqueue(reply{OK: true, Version: s.options.version})
 	for _, e := range p.journal.pending(h) {

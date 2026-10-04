@@ -14,7 +14,7 @@ import (
 	"github.com/DevNewbie1826/omosense/internal/core"
 )
 
-func TestJournalNegotiationHelloDoesNotSubscribeOrConsume(t *testing.T) {
+func TestJournalNegotiationStatusDoesNotSubscribeOrConsume(t *testing.T) {
 	for _, version := range []string{"test-v1", "test-v2"} {
 		t.Run(version, func(t *testing.T) {
 			// Given pending always-on messages and an idle pausable source.
@@ -33,11 +33,10 @@ func TestJournalNegotiationHelloDoesNotSubscribeOrConsume(t *testing.T) {
 			// When the client only negotiates, without accepting a version.
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
-			conn, _, gotVersion, err := handshake(ctx, s.paths, h)
+			gotVersion, err := daemonVersion(ctx, s.paths)
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer conn.Close()
 			if gotVersion != "test-v1" {
 				t.Fatalf("advertised version=%q", gotVersion)
 			}
@@ -45,27 +44,61 @@ func TestJournalNegotiationHelloDoesNotSubscribeOrConsume(t *testing.T) {
 			// Then neither subscription interest nor delivery is committed.
 			st := requestStatus(t, s)
 			if len(st.Clients) != 0 {
-				t.Errorf("hello-only probe registered clients: %+v", st.Clients)
+				t.Errorf("status-only probe registered clients: %+v", st.Clients)
 			}
 			for _, src := range st.Sources {
 				if src.State != "paused" {
-					t.Errorf("hello-only probe started source: %+v", src)
+					t.Errorf("status-only probe started source: %+v", src)
 				}
 			}
 			s.mu.Lock()
 			pending := s.profiles["main"].journal.pending(h)
 			s.mu.Unlock()
 			if len(pending) != 2 {
-				t.Errorf("hello-only probe consumed journal: pending=%+v, want two entries", pending)
+				t.Errorf("status-only probe consumed journal: pending=%+v, want two entries", pending)
 			}
 		})
 	}
 }
 
+func TestJournalControlStopDoesNotConsume(t *testing.T) {
+	// Given pending messages with no subscriber.
+	s := serverFixture(t, func(*core.Ctx) []core.Source { return nil })
+	s.emit("main", "remind", true, "REMIND sent pending")
+	s.emit("main", "discord", true, "EVENT pending")
+	path := s.profiles["main"].journal.path
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// When a control-only connection stops the daemon.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := daemonControl(ctx, s.paths, "stop"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Then shutdown has not appended delivery markers or consumed entries.
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("control stop changed pending journal:\nbefore=%s\nafter=%s", before, after)
+	}
+}
+
 func testUpgradeJournalReplay(t *testing.T, bin string) {
+	testUpgradeJournalReplayFrom(t, bin, bin)
+}
+
+func testUpgradeJournalReplayFrom(t *testing.T, bin, oldBin string) {
 	// Given a real old-version daemon with both always-on prefixes pending.
 	f := subprocessFixture(t, bin)
+	f.bin = oldBin
 	peer := f.attach("v1", "main")
+	f.bin = bin
 	old := f.streamPID(peer, 0)
 	f.waitEvent("source:main:remind", old)
 	f.waitEvent("source:main:discord", old)
@@ -124,6 +157,13 @@ func testUpgradeJournalReplay(t *testing.T, bin string) {
 		}
 		if payload.PID != old {
 			next[prefix] = payload.PID
+		}
+	}
+	// Assert replay before teardown, so a legacy shutdown failure cannot mask
+	// the data-loss regression we are reproducing.
+	for i, want := range expected {
+		if i >= len(output) || output[i] != want {
+			t.Errorf("upgrade lost/reordered pending entry: want stdout[%d]=%q, got stdout=%q", i, want, output)
 		}
 	}
 	f.stop(peer, a)

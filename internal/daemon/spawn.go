@@ -42,27 +42,29 @@ func handshake(ctx context.Context, p paths, h hello) (net.Conn, *framer, string
 	return conn, reader, r.Version, nil
 }
 
-// subscribe accepts the negotiated daemon version, which may differ from an
-// older peer's binary after an upgrade notice. Only this step enables replay.
-func subscribe(ctx context.Context, conn net.Conn, reader *framer, version string) (net.Conn, *framer, error) {
+// daemonVersion probes without subscribing, including on pre-fix daemons where
+// an accepted hello immediately consumes pending journal entries.
+func daemonVersion(ctx context.Context, p paths) (string, error) {
+	conn, err := (&net.Dialer{}).DialContext(ctx, "unix", p.socket)
+	if err != nil {
+		return "", err
+	}
+	defer conn.Close()
 	stopClose := context.AfterFunc(ctx, func() { conn.Close() })
 	defer stopClose()
-	end, _ := ctx.Deadline()
-	conn.SetDeadline(end)
-	err := writeFrame(conn, command{Cmd: "subscribe", Version: version})
-	if err == nil {
-		var r reply
-		err = reader.read(&r)
-		if err == nil && !r.OK {
-			err = &rejectedHello{r.Error}
-		}
+	deadline := time.Now().Add(time.Second)
+	if end, ok := ctx.Deadline(); ok && end.Before(deadline) {
+		deadline = end
 	}
-	if err != nil {
-		conn.Close()
-		return nil, nil, err
+	conn.SetDeadline(deadline)
+	if err := writeFrame(conn, command{Cmd: "status"}); err != nil {
+		return "", err
 	}
-	conn.SetDeadline(time.Time{})
-	return conn, reader, nil
+	var st status
+	if err := newFramer(conn).read(&st); err != nil {
+		return "", err
+	}
+	return st.Version, nil
 }
 
 func retryDelay(ctx context.Context, d time.Duration) error {
@@ -125,22 +127,16 @@ func spawnProcess(p paths, exe string) (*exec.Cmd, <-chan error, error) {
 	return cmd, done, nil
 }
 
-// ensureDaemon holds the spawn flock from re-dial until a hello proves the
+// ensureDaemon holds the spawn flock from re-dial until status proves the
 // spawned daemon is ready. The daemon's own lifetime flock is separate.
 func ensureDaemon(parent context.Context, p paths, h hello, exe string) (net.Conn, *framer, error) {
 	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
 	defer cancel()
 	acceptDifferent, _ := parent.Value(acceptVersionKey{}).(bool)
-	conn, reader, v, err := handshake(ctx, p, h)
+	v, err := daemonVersion(ctx, p)
 	if err == nil && (v == h.Version || acceptDifferent) {
-		return subscribe(ctx, conn, reader, v)
-	}
-	if conn != nil {
-		conn.Close()
-	}
-	var rejected *rejectedHello
-	if errors.As(err, &rejected) {
-		return nil, nil, err
+		conn, reader, _, err := handshake(ctx, p, h)
+		return conn, reader, err
 	}
 	lock, err := acquireSpawn(ctx, p.spawn)
 	if err != nil {
@@ -158,23 +154,28 @@ func ensureDaemon(parent context.Context, p paths, h hello, exe string) (net.Con
 	}()
 	backoff := 50 * time.Millisecond
 	for {
-		conn, reader, v, err = handshake(ctx, p, h)
+		v, err = daemonVersion(ctx, p)
 		if err == nil {
 			if v == h.Version || acceptDifferent {
 				ready = true
-				return subscribe(ctx, conn, reader, v)
+				conn, reader, _, err := handshake(ctx, p, h)
+				return conn, reader, err
 			}
 			if upgraded {
-				conn.Close()
 				return nil, nil, fmt.Errorf("daemon version still differs after upgrade")
 			}
 			upgraded = true
+			conn, err := (&net.Dialer{}).DialContext(ctx, "unix", p.socket)
+			if err != nil {
+				return nil, nil, err
+			}
 			end, _ := ctx.Deadline()
 			conn.SetDeadline(end)
 			if err := writeFrame(conn, command{Cmd: "stop", Reason: "upgrade"}); err != nil {
 				conn.Close()
 				return nil, nil, err
 			}
+			reader := newFramer(conn)
 			var f frame
 			for {
 				err = reader.read(&f)
@@ -193,12 +194,6 @@ func ensureDaemon(parent context.Context, p paths, h hello, exe string) (net.Con
 			}
 			lifetime.Close()
 			continue
-		}
-		if errors.As(err, &rejected) {
-			// A rejection still proves readiness. The daemon must keep its
-			// always-on jobs; only this invalid client exits.
-			ready = true
-			return nil, nil, err
 		}
 		missing := errors.Is(err, syscall.ENOENT) || errors.Is(err, syscall.ECONNREFUSED)
 		if child == nil && missing {
