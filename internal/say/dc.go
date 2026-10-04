@@ -131,6 +131,7 @@ func (e *env) doDC(token string, c dcCall) int {
 	if err != nil {
 		return e.fail(err)
 	}
+	o = e.redactJSON(o)
 	fmt.Fprintln(e.stdout, string(o))
 	if resp.StatusCode >= 400 {
 		return 1

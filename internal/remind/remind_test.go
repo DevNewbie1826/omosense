@@ -2,6 +2,9 @@ package remind
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -338,6 +341,84 @@ func TestFailedReminderIsTerminal(t *testing.T) {
 		if strings.Contains(ln, "REMIND sent") {
 			t.Errorf("failed entry was retried and sent: %q", ln)
 		}
+	}
+
+	cancel()
+	if err := waitDone(t, done); err != nil {
+		t.Errorf("Run returned %v, want nil after cancel", err)
+	}
+}
+
+// review-1 P1 #2 regression: a Telegram API failure body echoing the
+// credential-bearing /bot<token>/ URL reaches the reminder only sanitized.
+// The scheduler execs the REAL omosense binary as the say child (as the
+// reproduction did), so this fails if say ever prints the token again.
+func TestFailedReminderErrorHasNoToken(t *testing.T) {
+	ctx := loadCtx(t)
+	creds := filepath.Join(os.Getenv("HOME"), ".config", "agent-messenger")
+	if err := os.MkdirAll(creds, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(creds, "telegrambot-credentials.json"), []byte(`{"bots":{"b1":{"token":"TGTOK1"}}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		msg := "backend rejected " + r.URL.EscapedPath()
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"ok":false,"description":"` + msg + `","message":"` + msg + `"}`))
+	}))
+	t.Cleanup(api.Close)
+	t.Setenv("OMOSENSE_TELEGRAM_API", api.URL)
+
+	file := remindersFile(ctx)
+	due := `[{"id":"r1","at":"2026-10-03T10:04:00.000Z","platform":"telegram","target":{"chat_id":42},"text":"hi"}]`
+	if err := os.WriteFile(file, []byte(due), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sleep := newFakeSleeper()
+	withHooks(t, fixedTime, omosenseBin(t), sleep.sleep)
+
+	sink := newChanSink()
+	cancel, done := runSource(t, ctx, sink)
+
+	failLine := sink.waitLine(t, "REMIND failed ")
+	if strings.Contains(failLine, "TGTOK1") {
+		t.Errorf("REMIND failed line contains the bot token: %q", failLine)
+	}
+	var failedEntry map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimPrefix(failLine, "REMIND failed ")), &failedEntry); err != nil {
+		t.Fatalf("REMIND failed line is not JSON: %q (%v)", failLine, err)
+	}
+	// say's sanitized failure stdout, verbatim, is the only diagnostic the
+	// reminder may store (review-1 P1 #2).
+	wantErr := `{"ok":false,"description":"backend rejected /bot[redacted]/sendMessage","message":"backend rejected /bot[redacted]/sendMessage"}`
+	if got := failedEntry["error"]; got != wantErr {
+		t.Errorf("REMIND failed error = %v, want say's sanitized stdout", got)
+	}
+	for _, ln := range sink.snapshot() {
+		if strings.Contains(ln, "TGTOK1") {
+			t.Errorf("grammar line contains the bot token: %q", ln)
+		}
+	}
+	after := string(mustRead(t, file))
+	if strings.Contains(after, "TGTOK1") {
+		t.Errorf("state file contains the bot token: %s", after)
+	}
+	var entries []map[string]any
+	if err := json.Unmarshal([]byte(after), &entries); err != nil {
+		t.Fatalf("state file is not JSON: %s (%v)", after, err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("state file has %d entries, want 1", len(entries))
+	}
+	if got := entries[0]["error"]; got != wantErr {
+		t.Errorf("state error = %v, want say's sanitized stdout", got)
+	}
+	if got := entries[0]["failed"]; got != "2026-10-03T10:05:00.000Z" {
+		t.Errorf("state failed = %v, want the injected-clock ISO", got)
+	}
+	if _, ok := entries[0]["sent"]; ok {
+		t.Errorf("a failed send must not be marked sent: %s", after)
 	}
 
 	cancel()

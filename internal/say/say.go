@@ -94,6 +94,19 @@ func argsJSON(raw string) (*core.OMap, error) {
 	return om, nil
 }
 
+// redactJSON returns the JSON bytes with every occurrence of the bot
+// token replaced by "[redacted]". API failure bodies can echo the
+// credential-bearing request back (the Telegram /bot<token>/ URL path or
+// the Discord Authorization value), and that body is printed verbatim
+// (review-1 P1 #2); JSON structure, status and exit code are preserved
+// because the token never appears outside string values.
+func (e *env) redactJSON(b []byte) []byte {
+	if e.token == "" {
+		return b
+	}
+	return []byte(strings.ReplaceAll(string(b), e.token, "[redacted]"))
+}
+
 // fail prints an error JSON to stderr and yields exit 1; say.ts crashes on
 // these paths (unhandled rejection), the port reports the failure instead
 // (plan IS-8: exit 1 on network/JSON errors).

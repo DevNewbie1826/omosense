@@ -114,6 +114,7 @@ func (e *env) postTG(token string, c tgCall) int {
 	if err != nil {
 		return e.fail(err)
 	}
+	out = e.redactJSON(out)
 	fmt.Fprintln(e.stdout, string(out))
 	om, _ := v.(*core.OMap)
 	ok, _ := om.Get("ok")

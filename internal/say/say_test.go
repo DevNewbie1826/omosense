@@ -230,6 +230,50 @@ func TestTelegramNetworkErrorRedactsToken(t *testing.T) {
 	}
 }
 
+// reflectingAPI serves a 403 whose body echoes the credential-bearing
+// request material back, the shape review-1 P1 #2 reproduced against the
+// real binary: Telegram reflects the /bot<token>/ URL path, Discord the
+// Bot <token> Authorization value.
+func reflectingAPI(echo func(r *http.Request) string) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		msg := "backend rejected " + echo(r)
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"ok":false,"description":"` + msg + `","message":"` + msg + `"}`))
+	}))
+}
+
+func TestTelegramAPIFailureResponseRedactsToken(t *testing.T) {
+	api := reflectingAPI(func(r *http.Request) string { return r.URL.EscapedPath() })
+	t.Cleanup(api.Close)
+	t.Setenv("OMOSENSE_TELEGRAM_API", api.URL)
+
+	stdout, stderr, code := runSay(t, "telegram", "send", `{"chat_id":123,"text":"hi"}`)
+	if code != 1 {
+		t.Errorf("exit = %d, want 1 for ok:false", code)
+	}
+	if strings.Contains(stdout+stderr, "TGTOK1") {
+		t.Errorf("output contains bot token: stdout=%q stderr=%q", stdout, stderr)
+	}
+	// Structure, echoed description and exit code survive; only the
+	// credential is replaced.
+	jsonEqual(t, []byte(stdout), `{"ok":false,"description":"backend rejected /bot[redacted]/sendMessage","message":"backend rejected /bot[redacted]/sendMessage"}`)
+}
+
+func TestDiscordAPIFailureResponseRedactsToken(t *testing.T) {
+	api := reflectingAPI(func(r *http.Request) string { return r.Header.Get("Authorization") })
+	t.Cleanup(api.Close)
+	t.Setenv("OMOSENSE_DISCORD_API", api.URL)
+
+	stdout, stderr, code := runSay(t, "discord", "send", `{"channel_id":"c1","text":"hi"}`)
+	if code != 1 {
+		t.Errorf("exit = %d, want 1 for HTTP 403", code)
+	}
+	if strings.Contains(stdout+stderr, "DCTOK1") {
+		t.Errorf("output contains bot token: stdout=%q stderr=%q", stdout, stderr)
+	}
+	jsonEqual(t, []byte(stdout), `{"status":403,"ok":false,"description":"backend rejected Bot [redacted]","message":"backend rejected Bot [redacted]"}`)
+}
+
 func TestMissingJSONArgDefaultsToEmptyObject(t *testing.T) {
 	rec := &recorder{}
 	srv := httptest.NewServer(rec.handler(jsonResponder(200, `{"ok":true}`)))
