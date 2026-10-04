@@ -22,10 +22,11 @@ type clientStatus struct {
 }
 
 type status struct {
-	PID     int            `json:"pid"`
-	Version string         `json:"version"`
-	Sources []sourceStatus `json:"sources"`
-	Clients []clientStatus `json:"clients"`
+	PID      int            `json:"pid"`
+	Version  string         `json:"version"`
+	Features []string       `json:"features"`
+	Sources  []sourceStatus `json:"sources"`
+	Clients  []clientStatus `json:"clients"`
 }
 
 func (s *server) handle(conn net.Conn) {
@@ -162,7 +163,7 @@ func (s *server) control(conn net.Conn, c command) {
 		conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 		s.mu.Lock()
 		st := status{PID: os.Getpid(), Version: s.options.version,
-			Sources: []sourceStatus{}, Clients: []clientStatus{}}
+			Features: []string{"profile-stop"}, Sources: []sourceStatus{}, Clients: []clientStatus{}}
 		for profile, p := range s.profiles {
 			for name, w := range p.workers {
 				state := w.state()

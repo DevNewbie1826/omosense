@@ -232,7 +232,7 @@ func daemonProfileStop(parent context.Context, p paths, profile string) (profile
 	result := profileStopResult{Profile: profile, Stopped: []string{}, Daemon: "offline"}
 	conn, err := (&net.Dialer{}).DialContext(ctx, "unix", p.socket)
 	if err == nil {
-		return onlineProfileStop(ctx, conn, profile)
+		return onlineProfileStop(ctx, conn, p, profile)
 	}
 	if !errors.Is(err, syscall.ENOENT) && !errors.Is(err, syscall.ECONNREFUSED) {
 		return result, err
@@ -268,7 +268,7 @@ func daemonProfileStop(parent context.Context, p paths, profile string) (profile
 		for {
 			conn, err := (&net.Dialer{}).DialContext(readyCtx, "unix", p.socket)
 			if err == nil {
-				return onlineProfileStop(ctx, conn, profile)
+				return onlineProfileStop(ctx, conn, p, profile)
 			}
 			if !errors.Is(err, syscall.ENOENT) && !errors.Is(err, syscall.ECONNREFUSED) {
 				return result, err
@@ -320,17 +320,38 @@ func daemonProfileStop(parent context.Context, p paths, profile string) (profile
 	return result, errors.Join(stopErr, err)
 }
 
-func onlineProfileStop(ctx context.Context, conn net.Conn, profile string) (profileStopResult, error) {
+func onlineProfileStop(ctx context.Context, conn net.Conn, p paths, profile string) (profileStopResult, error) {
 	defer conn.Close()
 	stopClose := context.AfterFunc(ctx, func() { conn.Close() })
 	defer stopClose()
 	end, _ := ctx.Deadline()
 	conn.SetDeadline(end)
-	if err := writeFrame(conn, command{Cmd: "stop", Profile: profile}); err != nil {
+	// Probe on its own connection: old daemons treat every stop as a
+	// whole-daemon stop, even when the command contains a profile.
+	if err := writeFrame(conn, command{Cmd: "status"}); err != nil {
+		return profileStopResult{}, err
+	}
+	var st status
+	if err := newFramer(conn).read(&st); err != nil {
+		return profileStopResult{}, err
+	}
+	conn.Close()
+	if !slices.Contains(st.Features, "profile-stop") {
+		return profileStopResult{}, fmt.Errorf("omosense daemon (version %s) does not support stop --profile; upgrade the running daemon first (attach any source with the new binary, which negotiates the upgrade), then retry", st.Version)
+	}
+	stopConn, err := (&net.Dialer{}).DialContext(ctx, "unix", p.socket)
+	if err != nil {
+		return profileStopResult{}, err
+	}
+	defer stopConn.Close()
+	stopControlClose := context.AfterFunc(ctx, func() { stopConn.Close() })
+	defer stopControlClose()
+	stopConn.SetDeadline(end)
+	if err := writeFrame(stopConn, command{Cmd: "stop", Profile: profile}); err != nil {
 		return profileStopResult{}, err
 	}
 	var r profileStopReply
-	if err := newFramer(conn).read(&r); err != nil {
+	if err := newFramer(stopConn).read(&r); err != nil {
 		return profileStopResult{}, err
 	}
 	if !r.OK {
@@ -338,6 +359,9 @@ func onlineProfileStop(ctx context.Context, conn net.Conn, profile string) (prof
 			return r.profileStopResult, core.UnknownProfileError{Name: profile}
 		}
 		return r.profileStopResult, fmt.Errorf("daemon stop: %s", r.Error)
+	}
+	if r.Profile != profile {
+		return r.profileStopResult, fmt.Errorf("daemon stop: reply profile %q does not match requested profile %q", r.Profile, profile)
 	}
 	return r.profileStopResult, nil
 }
