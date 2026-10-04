@@ -187,7 +187,7 @@ func runTicks(t *testing.T, c *core.Ctx, n int) {
 		}
 		return nil
 	}
-	if err := newWatcher(c, c.Out).run(context.Background()); err != nil {
+	if err := Sources(c)[0].Run(context.Background(), c.Out); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -221,11 +221,12 @@ func TestTransitions(t *testing.T) {
 		{"first working", []string{"working"}, []int{4}, nil, nil},
 		{"working idle", []string{"working", "idle"}, []int{0, 0}, []string{"done"}, []any{"working"}},
 		{"working blocked idle", []string{"working", "blocked", "idle"}, []int{0, 0, 0}, []string{"blocked", "done"}, []any{"working", "blocked"}},
-		{"idle growth", []string{"idle", "idle"}, []int{1, 2}, []string{"done"}, []any{"idle"}},
-		{"blocked growth", []string{"blocked", "idle"}, []int{1, 2}, []string{"blocked", "done"}, []any{nil, "blocked"}},
+		{"idle growth", []string{"idle", "idle"}, []int{1, 2}, nil, nil},
+		{"blocked growth", []string{"blocked", "idle"}, []int{1, 2}, []string{"blocked"}, []any{nil}},
 		{"blocked no run", []string{"blocked", "idle"}, []int{1, 1}, []string{"blocked"}, []any{nil}},
 		{"quiet transitions", []string{"idle", "working", "blocked", "working"}, []int{0, 0, 0, 0}, []string{"blocked"}, []any{"working"}},
 		{"done clears run", []string{"working", "idle", "idle"}, []int{0, 0, 0}, []string{"done"}, []any{"working"}},
+		{"done clears run despite growth", []string{"working", "idle", "idle"}, []int{1, 2, 3}, []string{"done"}, []any{"working"}},
 		{"compacting", []string{"compacting", "idle"}, []int{0, 0}, []string{"done"}, []any{"working"}},
 	}
 	for _, tc := range cases {
@@ -417,8 +418,8 @@ func TestThreadFiltersAndWatchAll(t *testing.T) {
 		all                   bool
 		keys                  []any
 	}{
-		{"object", `{"a":{"session_id":"d1"},"b":{"session":"rpc-2"}}`, `{}`, false, []any{"a", "b"}},
-		{"array", `[{"session":"d1"},{"session_id":"rpc-2"}]`, `{}`, false, []any{"0", "1"}},
+		{"object", `{"a":{"session_id":"d1"},"b":{"session":"d2"}}`, `{}`, false, []any{"a", "b"}},
+		{"array", `[{"session":"d1"},{"session_id":"d2"}]`, `{}`, false, []any{"0", "1"}},
 		{"missing", "", `{}`, false, nil},
 		{"malformed", `broken`, `{}`, false, nil},
 		{"non true", "", `{"rpc":{"all":"true"}}`, false, nil},
@@ -461,6 +462,114 @@ func TestThreadFiltersAndWatchAll(t *testing.T) {
 					t.Fatalf("non-readonly command %s", cmd)
 				}
 			}
+		})
+	}
+}
+
+func TestRegisteredJobSource(t *testing.T) {
+	for _, tc := range []struct {
+		name, threads string
+		cwd           any
+		key           string
+	}{
+		{"stale handle", `{"job":{"session_id":"rpc-1","cwd":"/work/other"}}`, "/work/job", ""},
+		{"handle without cwd", `{"job":{"session":"rpc-1"}}`, "/work/job", ""},
+		{"handle empty cwd", `{"job":{"session":"rpc-1","cwd":""}}`, "/work/job", ""},
+		{"handle missing session cwd", `{"job":{"session":"rpc-1","cwd":"/work/job"}}`, nil, ""},
+		{"handle empty session cwd", `{"job":{"session":"rpc-1","cwd":"/work/job"}}`, "", ""},
+		{"cwd alone", `{"job":{"cwd":"/work/job"}}`, "/work/job", ""},
+		{"different identity same cwd", `{"job":{"session_id":"other","cwd":"/work/job"}}`, "/work/job", ""},
+		{"handle equal cwd", `{"job":{"session_id":"rpc-1","cwd":"/work/job"}}`, "/work/job", "job"},
+		{"handle cleaned cwd", `{"job":{"session":"rpc-1","cwd":"/work/./job/"}}`, "/work/job", "job"},
+		{"handle durable field", `{"job":{"durable_session_id":"rpc-1","cwd":"/work/job"}}`, "/work/job", "job"},
+		{"durable session id", `{"job":{"session_id":"durable","cwd":"/work/other"}}`, "/work/job", "job"},
+		{"durable session", `{"job":{"session":"durable"}}`, nil, "job"},
+		{"durable explicit field", `{"job":{"durable_session_id":"durable"}}`, nil, "job"},
+		{"durable array", `[{"durable_session_id":"durable"}]`, nil, "0"},
+		{"handle array", `[{"session_id":"rpc-1","cwd":"/work/job"}]`, "/work/job", "0"},
+		{"later valid handle", `{"stale":{"session":"rpc-1","cwd":"/work/other"},"job":{"session":"rpc-1","cwd":"/work/job"}}`, "/work/job", "job"},
+		{"status ignored", `{"job":{"session_id":"durable","status":"done"}}`, nil, "job"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Given a newly opened session with a registered or reused handle.
+			row := session("rpc-1", "durable")
+			row["cwd"] = tc.cwd
+			ticks := []scriptTick{{}}
+			for i, status := range []string{"working", "idle", "idle", "blocked", "idle"} {
+				ticks = append(ticks, scriptTick{sessions: []map[string]any{row}, states: map[string]any{"rpc-1": state(status, i)}})
+			}
+			ticks = append(ticks, scriptTick{})
+			path := shortSocket(t)
+			f := serveRPC(t, path, ticks)
+			t.Setenv("OMOSENSE_RPC_SOCK", path)
+			var b bytes.Buffer
+			c := rpcCtx(t, &b, tc.threads)
+			// When the real source drives the NDJSON socket through all transitions.
+			runTicks(t, c, len(ticks))
+			// Then only matched jobs produce semantic lines, including questions.
+			got := events(t, &b)
+			want := []string{}
+			if tc.key != "" {
+				want = []string{"opened", "done", "blocked", "closed"}
+			}
+			if len(got) != len(want) {
+				t.Fatalf("events = %v, want %v; stdout %s", got, want, b.String())
+			}
+			for i, e := range got {
+				questions := []any{}
+				if want[i] == "blocked" {
+					questions = []any{"Which?"}
+				}
+				if e["event"] != want[i] || e["thread"] != tc.key || e["id"] != "durable" || e["cwd"] != tc.cwd || !reflect.DeepEqual(e["questions"], questions) {
+					t.Fatalf("event = %v, want %s on thread %s", e, want[i], tc.key)
+				}
+			}
+			f.mu.Lock()
+			calls := append([]string(nil), f.calls...)
+			f.mu.Unlock()
+			wantCalls := len(ticks)
+			if tc.key != "" {
+				wantCalls += 5
+			}
+			if len(calls) != wantCalls {
+				t.Fatalf("calls = %v, want %d", calls, wantCalls)
+			}
+			t.Logf("Source.Run registration %s: %s", tc.name, b.String())
+			t.Log("cleanup: test Cleanup closes and joins fake RPC, removes temporary socket/state, and restores environment and sleepFn")
+		})
+	}
+}
+
+func TestWatchAllDoneRule(t *testing.T) {
+	for _, mode := range []string{"flag", "config"} {
+		t.Run(mode, func(t *testing.T) {
+			// Given unregistered work and count growth with explicit watch-all.
+			var ticks []scriptTick
+			for i, status := range []string{"idle", "idle", "blocked", "idle", "working", "idle", "idle"} {
+				ticks = append(ticks, scriptTick{sessions: []map[string]any{session("rpc-1", "d")}, states: map[string]any{"rpc-1": state(status, i)}})
+			}
+			path := shortSocket(t)
+			serveRPC(t, path, ticks)
+			t.Setenv("OMOSENSE_RPC_SOCK", path)
+			var b bytes.Buffer
+			c := rpcCtx(t, &b, "")
+			if mode == "flag" {
+				c.Flags["--all"] = true
+			} else {
+				v, err := core.ParseJSON([]byte(`{"rpc":{"all":true}}`))
+				if err != nil {
+					t.Fatal(err)
+				}
+				c.Cfg = &core.Cfg{Raw: v.(*core.OMap)}
+			}
+			// When the source observes every state over the real socket.
+			runTicks(t, c, len(ticks))
+			// Then count growth never completes unobserved or already completed work.
+			got := events(t, &b)
+			if len(got) != 2 || got[0]["event"] != "blocked" || !reflect.DeepEqual(got[0]["questions"], []any{"Which?"}) || got[1]["event"] != "done" || got[1]["from"] != "working" || got[1]["thread"] != nil {
+				t.Fatalf("events = %v; stdout %s", got, b.String())
+			}
+			t.Logf("Source.Run watch-all %s: %s", mode, b.String())
 		})
 	}
 }

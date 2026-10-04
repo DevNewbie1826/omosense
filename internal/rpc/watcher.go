@@ -26,7 +26,6 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 type record struct {
 	entry  entry
 	status string
-	count  int
 	active bool
 }
 
@@ -135,14 +134,14 @@ func (w *watcher) tick(ctx context.Context) {
 		switch {
 		case status == "blocked" && prev.status != "blocked":
 			w.emit("blocked", e, from, status)
-		case status == "idle" && prev.status != "" && (prev.active || ((prev.status == "idle" || prev.status == "blocked") && e.state.Count > prev.count)):
+		case status == "idle" && prev.active:
 			w.emit("done", e, from, status)
 			next.active = false
 		}
 		if status == "working" {
 			next.active = true
 		}
-		next.status, next.count = status, e.state.Count
+		next.status = status
 		if !w.first && !w.listed[id] {
 			w.emit("opened", e, nil, e.state.status())
 		}
