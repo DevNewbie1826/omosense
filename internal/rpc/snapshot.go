@@ -120,7 +120,7 @@ func (w *watcher) threads() map[string]string {
 }
 
 // snapshot never writes state and returns no list on whole-tick failure.
-func (w *watcher) snapshot(ctx context.Context) ([]sessionInfo, []entry, bool, error) {
+func (w *watcher) snapshot(ctx context.Context, once bool) ([]sessionInfo, []entry, bool, error) {
 	c, err := dial(ctx, w.socket)
 	if err != nil {
 		return nil, nil, false, err
@@ -136,7 +136,6 @@ func (w *watcher) snapshot(ctx context.Context) ([]sessionInfo, []entry, bool, e
 	if err := json.Unmarshal(data, &list); err != nil {
 		return nil, nil, false, err
 	}
-	delete(w.errs, "list")
 	threads := w.threads()
 	healthy := true
 	var entries []entry
@@ -153,11 +152,18 @@ func (w *watcher) snapshot(ctx context.Context) ([]sessionInfo, []entry, bool, e
 			e.thread = ptr(thread)
 		}
 		data, err := c.call(ctx, "get_state", s.Session)
+		var commandErr commandError
+		if err != nil && !errors.As(err, &commandErr) {
+			return nil, nil, false, err
+		}
 		if err == nil {
 			err = json.Unmarshal(data, &e.state)
 		}
 		if err != nil {
 			if !errors.Is(err, commandError("unknown_session")) {
+				if once {
+					return nil, nil, false, err
+				}
 				healthy = false
 				w.noteError(s.id(), err)
 			}
@@ -170,5 +176,6 @@ func (w *watcher) snapshot(ctx context.Context) ([]sessionInfo, []entry, bool, e
 	if err := ctx.Err(); err != nil {
 		return nil, nil, false, err
 	}
+	delete(w.errs, "list")
 	return list.Sessions, entries, healthy, nil
 }

@@ -22,6 +22,7 @@ type scriptTick struct {
 	sessions []map[string]any
 	states   map[string]any
 	err      string
+	drop     bool
 }
 
 type fakeRPC struct {
@@ -83,6 +84,10 @@ func serveRPC(t *testing.T, path string, ticks []scriptTick) *fakeRPC {
 					i = n - 1
 					if i >= len(ticks) {
 						i = len(ticks) - 1
+					}
+					if ticks[i].drop {
+						conn.Close()
+						continue
 					}
 					data = ticks[i].states[req.Session]
 					if s, ok := data.(string); ok {
@@ -265,7 +270,7 @@ func TestOpenedClosedAndDurableIdentity(t *testing.T) {
 	path := shortSocket(t)
 	serveRPC(t, path, []scriptTick{
 		{sessions: []map[string]any{session("rpc-1", "a")}, states: map[string]any{"rpc-1": state("working", 0)}},
-		{sessions: []map[string]any{session("rpc-7", "a"), session("rpc-2", "b")}, states: map[string]any{"rpc-7": state("idle", 0), "rpc-2": "unknown_session"}},
+		{sessions: []map[string]any{session("rpc-7", "a"), session("rpc-2", "b")}, states: map[string]any{"rpc-7": state("idle", 0), "rpc-2": state("idle", 0)}},
 		{sessions: []map[string]any{session("rpc-2", "b")}, states: map[string]any{"rpc-2": state("idle", 0)}},
 	})
 	t.Setenv("OMOSENSE_RPC_SOCK", path)
@@ -279,6 +284,130 @@ func TestOpenedClosedAndDurableIdentity(t *testing.T) {
 	}
 	if strings.Contains(b.String(), "unknown_session") {
 		t.Fatal(b.String())
+	}
+}
+
+func TestUnobservedSessionEvents(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		baseline bool
+		recovers bool
+	}{
+		{"new recovers", false, true},
+		{"new disappears", false, false},
+		{"baseline recovers", true, true},
+		{"baseline disappears", true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Given a listed session whose state cannot yet be observed.
+			failed := scriptTick{sessions: []map[string]any{session("rpc-1", "d")}, states: map[string]any{"rpc-1": "unknown_session"}}
+			ticks := []scriptTick{failed}
+			if !tc.baseline {
+				ticks = append([]scriptTick{{}}, ticks...)
+			}
+			last := scriptTick{}
+			if tc.recovers {
+				last = scriptTick{sessions: failed.sessions, states: map[string]any{"rpc-1": state("working", 0)}}
+			}
+			ticks = append(ticks, last)
+			path := shortSocket(t)
+			serveRPC(t, path, ticks)
+			t.Setenv("OMOSENSE_RPC_SOCK", path)
+			var b bytes.Buffer
+			c := rpcCtx(t, &b, "")
+			c.Flags["--all"] = true
+			w := newWatcher(c, c.Out)
+			// When the failed observation is followed by recovery or disappearance.
+			for i := range ticks {
+				w.tick(context.Background())
+				got := events(t, &b)
+				want := 0
+				if i == len(ticks)-1 && tc.recovers && !tc.baseline {
+					want = 1
+				}
+				// Then only a successful observation of a new session opens it.
+				if len(got) != want {
+					t.Fatalf("tick %d events = %v, want %d", i, got, want)
+				}
+				if want == 1 && (got[0]["event"] != "opened" || got[0]["to"] != "working" || got[0]["from"] != nil) {
+					t.Fatalf("opened = %v", got)
+				}
+			}
+		})
+	}
+}
+
+func TestFailedObservationPreservesRecord(t *testing.T) {
+	// Given a successful working observation followed by a changed handle and error.
+	path := shortSocket(t)
+	serveRPC(t, path, []scriptTick{
+		{sessions: []map[string]any{session("rpc-1", "d")}, states: map[string]any{"rpc-1": state("working", 3)}},
+		{sessions: []map[string]any{session("rpc-7", "d")}, states: map[string]any{"rpc-7": "unknown_session"}},
+		{},
+	})
+	t.Setenv("OMOSENSE_RPC_SOCK", path)
+	var b bytes.Buffer
+	c := rpcCtx(t, &b, "")
+	c.Flags["--all"] = true
+	w := newWatcher(c, c.Out)
+	w.tick(context.Background())
+	prev := w.seen["d"]
+	// When get_state fails and the session then disappears.
+	w.tick(context.Background())
+	if !reflect.DeepEqual(w.seen["d"], prev) || len(events(t, &b)) != 0 {
+		t.Fatalf("failed observation changed record: %#v, was %#v; %s", w.seen["d"], prev, b.String())
+	}
+	w.tick(context.Background())
+	// Then closed uses the last successfully observed metadata and state.
+	got := events(t, &b)
+	if len(got) != 1 || got[0]["event"] != "closed" || got[0]["session"] != "rpc-1" || got[0]["from"] != "working" {
+		t.Fatalf("closed = %v", got)
+	}
+}
+
+func TestTransportFailureSkipsTick(t *testing.T) {
+	// Given an observed session and two subsequent disconnects listing a different one.
+	path := shortSocket(t)
+	serveRPC(t, path, []scriptTick{
+		{sessions: []map[string]any{session("rpc-1", "a")}, states: map[string]any{"rpc-1": state("working", 0)}},
+		{sessions: []map[string]any{session("rpc-2", "b")}, drop: true},
+		{sessions: []map[string]any{session("rpc-2", "b")}, drop: true},
+		{sessions: []map[string]any{session("rpc-1", "a")}, states: map[string]any{"rpc-1": state("idle", 0)}},
+	})
+	t.Setenv("OMOSENSE_RPC_SOCK", path)
+	var b bytes.Buffer
+	c := rpcCtx(t, &b, "")
+	c.Flags["--all"] = true
+	// When the watcher disconnects and recovers.
+	runTicks(t, c, 4)
+	// Then the failed ticks neither close nor open anything, and the run survives.
+	got := events(t, &b)
+	if len(got) != 1 || got[0]["event"] != "done" || got[0]["id"] != "a" || got[0]["from"] != "working" {
+		t.Fatalf("transport changed baseline: %s", b.String())
+	}
+	if strings.Count(b.String(), "EOF") != 1 {
+		t.Fatalf("transport error not deduped: %s", b.String())
+	}
+}
+
+func TestMalformedStateSkipsOnlySession(t *testing.T) {
+	// Given two observed sessions, one with malformed state on the next tick.
+	path := shortSocket(t)
+	rows := []map[string]any{session("rpc-1", "a"), session("rpc-2", "b")}
+	serveRPC(t, path, []scriptTick{
+		{sessions: rows, states: map[string]any{"rpc-1": state("working", 0), "rpc-2": state("working", 0)}},
+		{sessions: rows, states: map[string]any{"rpc-1": []any{}, "rpc-2": state("idle", 0)}},
+	})
+	t.Setenv("OMOSENSE_RPC_SOCK", path)
+	var b bytes.Buffer
+	c := rpcCtx(t, &b, "")
+	c.Flags["--all"] = true
+	// When the watcher receives malformed state alongside a successful observation.
+	runTicks(t, c, 2)
+	// Then the healthy session still completes; the malformed one is skipped.
+	got := events(t, &b)
+	if len(got) != 1 || got[0]["event"] != "done" || got[0]["id"] != "b" || !strings.Contains(b.String(), "LOG rpc a json:") {
+		t.Fatalf("malformed state affected sibling: %s", b.String())
 	}
 }
 
@@ -484,5 +613,43 @@ func TestOnceMissingSocket(t *testing.T) {
 	c.Flags["--once"] = true
 	if code := Run(c, nil); code != 1 || !strings.HasPrefix(b.String(), "LOG rpc ") {
 		t.Fatalf("code/stdout = %d %q", code, b.String())
+	}
+}
+
+func TestOnceGetStateErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		tick scriptTick
+		code int
+		log  string
+	}{
+		{"disconnect", scriptTick{drop: true}, 1, "EOF"},
+		{"command failure", scriptTick{states: map[string]any{"rpc-1": "state_failed"}}, 1, "state_failed"},
+		{"malformed state", scriptTick{states: map[string]any{"rpc-1": []any{}}}, 1, "cannot unmarshal"},
+		{"unknown session", scriptTick{states: map[string]any{"rpc-1": "unknown_session"}}, 0, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Given a successful list followed by a get_state failure.
+			tc.tick.sessions = []map[string]any{session("rpc-1", "d")}
+			path := shortSocket(t)
+			serveRPC(t, path, []scriptTick{tc.tick})
+			t.Setenv("OMOSENSE_RPC_SOCK", path)
+			var b bytes.Buffer
+			c := rpcCtx(t, &b, "")
+			c.Flags["--once"], c.Flags["--all"] = true, true
+			// When the compat snapshot runs against the real socket.
+			code := Run(c, []string{"--once", "--all"})
+			// Then only unknown_session is a successful skip.
+			if code != tc.code || strings.Contains(b.String(), "SNAP ") {
+				t.Fatalf("code/stdout = %d %q, want %d", code, b.String(), tc.code)
+			}
+			if tc.log != "" && (!strings.HasPrefix(b.String(), "LOG rpc ") || !strings.Contains(b.String(), tc.log)) {
+				t.Fatalf("missing error log: %q", b.String())
+			}
+			if tc.code == 0 && b.Len() != 0 {
+				t.Fatalf("unknown_session logged: %q", b.String())
+			}
+			t.Logf("Run(--once,--all): exit=%d stdout=%q", code, b.String())
+		})
 	}
 }

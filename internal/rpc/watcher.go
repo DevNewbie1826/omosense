@@ -77,7 +77,7 @@ func (w *watcher) noteError(key string, err error) {
 }
 
 func (w *watcher) once(ctx context.Context) error {
-	_, entries, _, err := w.snapshot(ctx)
+	_, entries, _, err := w.snapshot(ctx, true)
 	if err != nil {
 		return err
 	}
@@ -97,7 +97,7 @@ func snapText(s *string) string {
 }
 
 func (w *watcher) tick(ctx context.Context) {
-	list, entries, healthy, err := w.snapshot(ctx)
+	list, entries, healthy, err := w.snapshot(ctx, false)
 	if ctx.Err() != nil {
 		return
 	}
@@ -106,44 +106,52 @@ func (w *watcher) tick(ctx context.Context) {
 		return
 	}
 	listed := make(map[string]bool, len(list))
+	present := make(map[string]bool, len(list))
 	for _, s := range list {
-		listed[s.id()] = true
+		id := s.id()
+		present[id] = true
+		// Baseline sessions are not new, even if their first state fails
+		// or they only become watched later.
+		if w.first || w.listed[id] {
+			listed[id] = true
+		}
 	}
 	seen := make(map[string]record, len(entries))
 	for _, e := range entries {
 		id := e.info.id()
-		prev := w.seen[id]
+		prev, observed := w.seen[id]
+		if !e.valid {
+			if observed {
+				seen[id] = prev
+			}
+			continue
+		}
+		listed[id] = true
 		next := prev
 		next.entry = e
-		if e.valid {
-			status := e.state.status()
-			var from *string
-			if prev.status != "" {
-				from = ptr(prev.status)
-			}
-			switch {
-			case status == "blocked" && prev.status != "blocked":
-				w.emit("blocked", e, from, status)
-			case status == "idle" && prev.status != "" && (prev.active || ((prev.status == "idle" || prev.status == "blocked") && e.state.Count > prev.count)):
-				w.emit("done", e, from, status)
-				next.active = false
-			}
-			if status == "working" {
-				next.active = true
-			}
-			next.status, next.count = status, e.state.Count
+		status := e.state.status()
+		var from *string
+		if prev.status != "" {
+			from = ptr(prev.status)
 		}
+		switch {
+		case status == "blocked" && prev.status != "blocked":
+			w.emit("blocked", e, from, status)
+		case status == "idle" && prev.status != "" && (prev.active || ((prev.status == "idle" || prev.status == "blocked") && e.state.Count > prev.count)):
+			w.emit("done", e, from, status)
+			next.active = false
+		}
+		if status == "working" {
+			next.active = true
+		}
+		next.status, next.count = status, e.state.Count
 		if !w.first && !w.listed[id] {
-			status := "idle"
-			if e.valid {
-				status = e.state.status()
-			}
-			w.emit("opened", e, nil, status)
+			w.emit("opened", e, nil, e.state.status())
 		}
 		seen[id] = next
 	}
 	for id, prev := range w.seen {
-		if !listed[id] {
+		if !present[id] {
 			var from *string
 			if prev.status != "" {
 				from = ptr(prev.status)
