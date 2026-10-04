@@ -17,10 +17,15 @@ type attachProcess struct {
 	done  chan error
 }
 
-func (f *processFixture) attach(version, profile string) *attachProcess {
+func (f *processFixture) attach(version, profile string, selection ...string) *attachProcess {
 	f.t.Helper()
 	a := &attachProcess{lines: make(chan string, 1024), done: make(chan error, 1)}
-	a.cmd = exec.Command(f.bin, "attach", "herdr", "--profile", profile)
+	if len(selection) == 0 {
+		selection = []string{"herdr"}
+	}
+	args := append([]string{"attach"}, selection...)
+	args = append(args, "--profile", profile)
+	a.cmd = exec.Command(f.bin, args...)
 	a.cmd.Env = append(f.env, "OMOSENSE_TEST_VERSION="+version)
 	stdout, err := a.cmd.StdoutPipe()
 	if err != nil {
@@ -28,7 +33,7 @@ func (f *processFixture) attach(version, profile string) *attachProcess {
 	}
 	var stderr bytes.Buffer
 	a.cmd.Stderr = &stderr
-	f.t.Logf("RUN %s attach herdr --profile %s (version %s)", f.bin, profile, version)
+	f.t.Logf("RUN %s %s (version %s)", f.bin, strings.Join(args, " "), version)
 	if err := a.cmd.Start(); err != nil {
 		f.t.Fatal(err)
 	}

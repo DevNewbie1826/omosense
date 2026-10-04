@@ -84,6 +84,14 @@ func wireClient(t *testing.T, s *server, h hello) (net.Conn, *framer, reply) {
 	if err := f.read(&r); err != nil {
 		t.Fatal(err)
 	}
+	if r.OK {
+		if err := writeFrame(conn, command{Cmd: "subscribe", Version: r.Version}); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.read(&r); err != nil {
+			t.Fatal(err)
+		}
+	}
 	return conn, f, r
 }
 

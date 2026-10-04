@@ -102,6 +102,9 @@ func TestSubprocessLifecycle(t *testing.T) {
 		}
 		f.stop(a, b)
 	})
+	t.Run("upgrade_replays_pending_remind_and_event_before_live_once", func(t *testing.T) {
+		testUpgradeJournalReplay(t, bin)
+	})
 	t.Run("unknown_profile_exits_two", func(t *testing.T) {
 		f := subprocessFixture(t, bin)
 		if out, code := f.run("attach", "herdr", "--profile", "nope"); code != 2 || !strings.Contains(out, "unknown profile nope") {

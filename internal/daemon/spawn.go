@@ -42,6 +42,29 @@ func handshake(ctx context.Context, p paths, h hello) (net.Conn, *framer, string
 	return conn, reader, r.Version, nil
 }
 
+// subscribe accepts the negotiated daemon version, which may differ from an
+// older peer's binary after an upgrade notice. Only this step enables replay.
+func subscribe(ctx context.Context, conn net.Conn, reader *framer, version string) (net.Conn, *framer, error) {
+	stopClose := context.AfterFunc(ctx, func() { conn.Close() })
+	defer stopClose()
+	end, _ := ctx.Deadline()
+	conn.SetDeadline(end)
+	err := writeFrame(conn, command{Cmd: "subscribe", Version: version})
+	if err == nil {
+		var r reply
+		err = reader.read(&r)
+		if err == nil && !r.OK {
+			err = &rejectedHello{r.Error}
+		}
+	}
+	if err != nil {
+		conn.Close()
+		return nil, nil, err
+	}
+	conn.SetDeadline(time.Time{})
+	return conn, reader, nil
+}
+
 func retryDelay(ctx context.Context, d time.Duration) error {
 	timer := time.NewTimer(d)
 	defer timer.Stop()
@@ -110,7 +133,7 @@ func ensureDaemon(parent context.Context, p paths, h hello, exe string) (net.Con
 	acceptDifferent, _ := parent.Value(acceptVersionKey{}).(bool)
 	conn, reader, v, err := handshake(ctx, p, h)
 	if err == nil && (v == h.Version || acceptDifferent) {
-		return conn, reader, nil
+		return subscribe(ctx, conn, reader, v)
 	}
 	if conn != nil {
 		conn.Close()
@@ -139,7 +162,7 @@ func ensureDaemon(parent context.Context, p paths, h hello, exe string) (net.Con
 		if err == nil {
 			if v == h.Version || acceptDifferent {
 				ready = true
-				return conn, reader, nil
+				return subscribe(ctx, conn, reader, v)
 			}
 			if upgraded {
 				conn.Close()

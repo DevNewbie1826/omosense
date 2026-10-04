@@ -31,8 +31,9 @@ type frame struct {
 }
 
 type command struct {
-	Cmd    string `json:"cmd"`
-	Reason string `json:"reason,omitempty"`
+	Cmd     string `json:"cmd"`
+	Reason  string `json:"reason,omitempty"`
+	Version string `json:"version,omitempty"`
 }
 
 type framer struct{ scanner *bufio.Scanner }
