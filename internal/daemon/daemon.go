@@ -12,19 +12,26 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/DevNewbie1826/omosense/internal/core"
+	"github.com/DevNewbie1826/omosense/internal/remind"
 )
 
 // DaemonHelp is the usage text printed by omosense daemon --help.
-const DaemonHelp = `Usage: omosense daemon [status|stop]
+const DaemonHelp = `Usage: omosense daemon [status|stop [--profile P]]
 
 Runs the resident daemon hosting every source of every profile as
 goroutines, streaming lines to attached clients over a unix socket.
 status prints the daemon state as one JSON line; stop stops a running
-daemon.
+daemon. stop --profile P stops only P's sources, cancels its pending
+reminders and discards queued replay, keeping the daemon and other
+profiles running. It works offline too and prints one JSON result line.
+The profile stays stopped across daemon restarts; the next attach of P
+re-enables it.
 `
 
 // AttachHelp is the usage text printed by omosense attach --help.
@@ -46,6 +53,30 @@ func RunDaemon(args []string) int {
 	}
 	if len(args) == 1 && (args[0] == "status" || args[0] == "stop") {
 		if err := daemonControl(ctx, p, args[0]); err != nil {
+			return report(err, 1)
+		}
+		return 0
+	}
+	if len(args) > 1 && args[0] == "stop" {
+		profile := ""
+		switch {
+		case len(args) == 3 && args[1] == "--profile":
+			profile = args[2]
+		case len(args) == 2 && strings.HasPrefix(args[1], "--profile="):
+			profile = strings.TrimPrefix(args[1], "--profile=")
+		}
+		if profile == "" || strings.HasPrefix(profile, "--") {
+			return report(fmt.Errorf("expected daemon stop --profile P"), 2)
+		}
+		result, err := daemonProfileStop(ctx, p, profile)
+		if err != nil {
+			var missing core.UnknownProfileError
+			if errors.As(err, &missing) {
+				return report(err, 2)
+			}
+			return report(err, 1)
+		}
+		if err := writeFrame(os.Stdout, result); err != nil {
 			return report(err, 1)
 		}
 		return 0
@@ -193,4 +224,120 @@ func daemonControl(parent context.Context, p paths, cmd string) error {
 		err = lock.Close()
 	}
 	return err
+}
+
+func daemonProfileStop(parent context.Context, p paths, profile string) (profileStopResult, error) {
+	ctx, cancel := context.WithTimeout(parent, 40*time.Second)
+	defer cancel()
+	result := profileStopResult{Profile: profile, Stopped: []string{}, Daemon: "offline"}
+	conn, err := (&net.Dialer{}).DialContext(ctx, "unix", p.socket)
+	if err == nil {
+		return onlineProfileStop(ctx, conn, profile)
+	}
+	if !errors.Is(err, syscall.ENOENT) && !errors.Is(err, syscall.ECONNREFUSED) {
+		return result, err
+	}
+	c, err := core.Load(core.ParseArgs([]string{"--profile", profile}), true)
+	if err != nil {
+		return result, err
+	}
+	spawn, err := acquireSpawn(ctx, p.spawn)
+	if err != nil {
+		return result, fmt.Errorf("profile stop spawn flock: %w", err)
+	}
+	defer spawn.Close()
+	// Do not use acquireLifetime: an offline operation must never write
+	// or remove a daemon pid file.
+	lifetime, err := os.OpenFile(p.lock, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return result, err
+	}
+	defer lifetime.Close()
+	err = syscall.Flock(int(lifetime.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+	if errors.Is(err, syscall.EWOULDBLOCK) {
+		lifetime.Close()
+		spawn.Close()
+		// A foreground daemon can own lifetime before its socket is bound.
+		// Release spawn so an auto-spawn owner can also complete readiness.
+		if err := testNotify("profile-stop-online-wait"); err != nil {
+			return result, err
+		}
+		readyCtx, readyCancel := context.WithTimeout(ctx, 30*time.Second)
+		defer readyCancel()
+		backoff := 50 * time.Millisecond
+		for {
+			conn, err := (&net.Dialer{}).DialContext(readyCtx, "unix", p.socket)
+			if err == nil {
+				return onlineProfileStop(ctx, conn, profile)
+			}
+			if !errors.Is(err, syscall.ENOENT) && !errors.Is(err, syscall.ECONNREFUSED) {
+				return result, err
+			}
+			if err := retryDelay(readyCtx, backoff); err != nil {
+				return result, fmt.Errorf("profile stop daemon readiness: %w", err)
+			}
+			backoff = min(backoff*2, time.Second)
+		}
+	}
+	if err != nil {
+		return result, fmt.Errorf("profile stop lifetime flock: %w", err)
+	}
+	registry := Registry
+	if os.Getenv("OMOSENSE_TEST_REGISTRY") == "fake" {
+		registry = fakeRegistry
+	}
+	for _, source := range registry(c) {
+		result.Stopped = append(result.Stopped, source.Name())
+	}
+	slices.Sort(result.Stopped)
+	stopErr := writeProfileMarker(c, time.Now())
+	// Lifetime ownership also excludes the daemon's journal writer. Discard
+	// pre-crash pending replay even if reminder cancellation is blocked.
+	journalPath := filepath.Join(c.State, "omosense-journal-"+profile+".jsonl")
+	if _, err := os.Stat(journalPath); err == nil {
+		j, err := openJournal(journalPath, time.Now())
+		if err != nil {
+			stopErr = errors.Join(stopErr, err)
+		} else {
+			stopErr = errors.Join(stopErr, j.discardPending(), j.close())
+		}
+	} else if !os.IsNotExist(err) {
+		stopErr = errors.Join(stopErr, err)
+	}
+	release, blocked, metadata, err := c.TryAcquire("remind-"+profile, "remind")
+	if err != nil {
+		return result, errors.Join(stopErr, err)
+	}
+	if blocked != "" {
+		b, err := metadata.Marshal()
+		if err != nil {
+			return result, errors.Join(stopErr, err)
+		}
+		return result, errors.Join(stopErr, fmt.Errorf("cancel reminders: locked by %s %s", blocked, b))
+	}
+	defer release()
+	result.CancelledReminders, err = remind.CancelPending(c, time.Now())
+	return result, errors.Join(stopErr, err)
+}
+
+func onlineProfileStop(ctx context.Context, conn net.Conn, profile string) (profileStopResult, error) {
+	defer conn.Close()
+	stopClose := context.AfterFunc(ctx, func() { conn.Close() })
+	defer stopClose()
+	end, _ := ctx.Deadline()
+	conn.SetDeadline(end)
+	if err := writeFrame(conn, command{Cmd: "stop", Profile: profile}); err != nil {
+		return profileStopResult{}, err
+	}
+	var r profileStopReply
+	if err := newFramer(conn).read(&r); err != nil {
+		return profileStopResult{}, err
+	}
+	if !r.OK {
+		if r.Error == "unknown profile "+profile {
+			return r.profileStopResult, core.UnknownProfileError{Name: profile}
+		}
+		return r.profileStopResult, fmt.Errorf("daemon stop: %s", r.Error)
+	}
+	return r.profileStopResult, nil
 }
