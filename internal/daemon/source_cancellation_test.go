@@ -46,6 +46,9 @@ func TestBlockedSourceCommand(t *testing.T) {
 	if err := json.NewEncoder(conn).Encode(processEvent{Event: event, PID: os.Getpid()}); err != nil {
 		os.Exit(2)
 	}
+	if event == "blocked" && os.Getenv("OS_CANCEL_MODE") == "parent-exits" {
+		os.Exit(0) // The child keeps the inherited pipes and its gate.
+	}
 	var b [1]byte
 	_, _ = conn.Read(b[:])
 	os.Exit(0)
@@ -72,6 +75,9 @@ func TestSourceCommandCancellation(t *testing.T) {
 		{"google", "zele", "watch-google-main", "escaped"},
 		{"herdr", "herdr", "watch-herdr-main", "escaped"},
 		{"tidy", "git", "memory-tidy-main", "escaped"},
+		{"google", "zele", "watch-google-main", "parent-exits"},
+		{"herdr", "herdr", "watch-herdr-main", "parent-exits"},
+		{"tidy", "git", "memory-tidy-main", "parent-exits"},
 	} {
 		t.Run(tc.source+"/"+tc.mode, func(t *testing.T) {
 			p := socketPaths(t)
@@ -173,6 +179,20 @@ func TestSourceCommandCancellation(t *testing.T) {
 				processes = append(processes, b)
 				t.Logf("BLOCKED %s %s pid=%d; gate will not be released", tc.command, b.kind, b.pid)
 			}
+			if tc.mode == "parent-exits" {
+				// The parent exits on its own; the source must reap the rest of
+				// its process group before any stop is requested.
+				for _, b := range processes {
+					if err := b.conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+						t.Fatal(err)
+					}
+					var data [1]byte
+					if n, err := b.conn.Read(data[:]); n != 0 || !errors.Is(err, io.EOF) {
+						t.Fatalf("%s %d outlived its exited parent: n=%d err=%v", b.kind, b.pid, n, err)
+					}
+				}
+				t.Log("PARENT-EXITS: parent and descendant both gone before stop")
+			}
 			run := func(args ...string) (string, error) {
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer cancel()
@@ -226,7 +246,7 @@ func TestSourceCommandCancellation(t *testing.T) {
 					// An escaped orphan is reaped asynchronously by init.
 					// EOF proves exit; a still-visible PID must be a zombie,
 					// not a live process. Do not poll or sleep for init.
-					if tc.mode != "escaped" || b.kind != "child" {
+					if (tc.mode != "escaped" && tc.mode != "parent-exits") || b.kind != "child" {
 						t.Fatalf("process %s still alive/not reaped: %v", strconv.Itoa(b.pid), err)
 					}
 					state, psErr := exec.Command("ps", "-p", strconv.Itoa(b.pid), "-o", "stat=").Output()

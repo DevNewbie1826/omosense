@@ -56,7 +56,7 @@ func zeleExec(ctx context.Context, args []string) zeleResult {
 	var out, errb bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &errb
-	if err := cmd.Run(); err != nil {
+	if err := core.RunSource(cmd); err != nil {
 		var ee *exec.ExitError
 		if errors.As(err, &ee) {
 			return zeleResult{stdout: out.String(), stderr: errb.String(), code: ee.ExitCode()}

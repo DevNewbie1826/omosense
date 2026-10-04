@@ -371,7 +371,7 @@ func execHerdr(ctx context.Context, args []string) (stdout, stderr string, code 
 	var out, errb bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &errb
-	err := cmd.Run()
+	err := core.RunSource(cmd)
 	if err == nil {
 		return out.String(), errb.String(), 0
 	}

@@ -17,7 +17,7 @@ func runGit(ctx context.Context, args ...string) (stdout, stderr string, code in
 	var out, errb bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &errb
-	if err := cmd.Run(); err != nil {
+	if err := core.RunSource(cmd); err != nil {
 		if ctx.Err() != nil {
 			return out.String(), errb.String(), 0, ctx.Err()
 		}
