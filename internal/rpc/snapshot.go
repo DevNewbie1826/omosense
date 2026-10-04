@@ -83,7 +83,7 @@ func watchAll(c *core.Ctx) bool {
 }
 
 // threads preserves object order and uses array indices as thread keys.
-func (w *watcher) threads() map[string]string {
+func (w *watcher) threads(sessions []sessionInfo) map[string]string {
 	out := map[string]string{}
 	b, err := os.ReadFile(filepath.Join(w.stateDir, "threads.json"))
 	if err != nil {
@@ -95,11 +95,18 @@ func (w *watcher) threads() map[string]string {
 	}
 	add := func(key string, v any) {
 		if m, ok := v.(*core.OMap); ok {
-			for _, field := range []string{"session_id", "session"} {
+			cwd, _ := m.Get("cwd")
+			threadCwd, _ := cwd.(string)
+			for _, field := range []string{"session_id", "session", "durable_session_id"} {
 				v, _ := m.Get(field)
 				if id, ok := v.(string); ok && id != "" {
-					if _, exists := out[id]; !exists {
-						out[id] = key
+					for _, s := range sessions {
+						matches := id == s.Durable || (id == s.Session && threadCwd != "" && s.Cwd != nil && *s.Cwd != "" && filepath.Clean(threadCwd) == filepath.Clean(*s.Cwd))
+						if matches {
+							if _, exists := out[s.id()]; !exists {
+								out[s.id()] = key
+							}
+						}
 					}
 				}
 			}
@@ -136,14 +143,11 @@ func (w *watcher) snapshot(ctx context.Context, once bool) ([]sessionInfo, []ent
 	if err := json.Unmarshal(data, &list); err != nil {
 		return nil, nil, false, err
 	}
-	threads := w.threads()
+	threads := w.threads(list.Sessions)
 	healthy := true
 	var entries []entry
 	for _, s := range list.Sessions {
 		thread, watched := threads[s.id()]
-		if !watched {
-			thread, watched = threads[s.Session]
-		}
 		if !w.all && !watched {
 			continue
 		}
