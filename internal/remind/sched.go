@@ -53,8 +53,67 @@ func newScheduler(c *core.Ctx, sink core.Sink) *scheduler {
 	return &scheduler{
 		c:    c,
 		sink: sink,
-		file: filepath.Join(c.State, "reminders-"+c.Profile.Name+".json"),
+		file: reminderFile(c),
 	}
+}
+
+func reminderFile(c *core.Ctx) string {
+	return filepath.Join(c.State, "reminders-"+c.Profile.Name+".json")
+}
+
+// CancelPending marks every pending reminder of c's profile with
+// "cancelled" set to core.ISO(now). An entry is pending when sent,
+// skipped, failed and cancelled are all missing or falsy. Unknown fields
+// and key order are preserved.
+//
+// The file is <State>/reminders-<profile>.json. A missing file returns
+// 0, nil. A parse error is returned and the file is left untouched. The
+// file is rewritten with marshalIndent2Array only when n > 0, where n is
+// the number of entries marked.
+//
+// CancelPending does not take any lock. The caller owns the remind lock
+// and must hold it across the call so a scheduler tick cannot race the
+// rewrite.
+func CancelPending(c *core.Ctx, now time.Time) (int, error) {
+	b, err := os.ReadFile(reminderFile(c))
+	if os.IsNotExist(err) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	v, err := core.ParseJSON(b)
+	if err != nil {
+		return 0, err
+	}
+	arr, ok := v.([]any)
+	if !ok {
+		return 0, fmt.Errorf("reminders: expected a JSON array")
+	}
+	iso := core.ISO(now)
+	n := 0
+	for _, ev := range arr {
+		r, ok := ev.(*core.OMap)
+		if !ok {
+			return 0, fmt.Errorf("reminders: entry is not a JSON object")
+		}
+		if !pendingEntry(r) {
+			continue
+		}
+		r.Set("cancelled", iso)
+		n++
+	}
+	if n == 0 {
+		return 0, nil
+	}
+	out, err := marshalIndent2Array(arr)
+	if err != nil {
+		return 0, err
+	}
+	if err := os.WriteFile(reminderFile(c), out, 0o644); err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
 // run prints the startup LOG and then loops tick/sleep, logging every tick
@@ -76,9 +135,9 @@ func (s *scheduler) run(ctx context.Context) error {
 }
 
 // tick is remind.ts's tick(): a missing file is a no-op; entries holding a
-// truthy sent, skipped or failed are skipped (failed is terminal, IS-8);
-// due entries send through the say executable; the file is rewritten in
-// the bun indent layout only when an entry changed.
+// truthy sent, skipped, failed or cancelled are skipped (failed and
+// cancelled are terminal); due entries send through the say executable;
+// the file is rewritten in the bun indent layout only when an entry changed.
 func (s *scheduler) tick(ctx context.Context) error {
 	b, err := os.ReadFile(s.file)
 	if os.IsNotExist(err) {
@@ -106,7 +165,7 @@ func (s *scheduler) tick(ctx context.Context) error {
 		if !ok {
 			return fmt.Errorf("reminders: entry is not a JSON object")
 		}
-		if doneEntry(r, "sent") || doneEntry(r, "skipped") || doneEntry(r, "failed") {
+		if !pendingEntry(r) {
 			continue
 		}
 		due, parsed := jsDateParse(fieldStr(r, "at"))
@@ -252,11 +311,17 @@ func marshalIndent2Array(arr []any) ([]byte, error) {
 }
 
 // doneEntry reports whether the terminal marker key holds a truthy value,
-// mirroring remind.ts's `if (r.sent || r.skipped) continue` plus the new
-// terminal failed marker.
+// mirroring remind.ts's `if (r.sent || r.skipped) continue` plus the
+// terminal failed and cancelled markers.
 func doneEntry(r *core.OMap, key string) bool {
 	v, ok := r.Get(key)
 	return ok && truthy(v)
+}
+
+// pendingEntry reports whether the reminder can still be sent. A truthy
+// sent, skipped, failed or cancelled field is terminal.
+func pendingEntry(r *core.OMap) bool {
+	return !doneEntry(r, "sent") && !doneEntry(r, "skipped") && !doneEntry(r, "failed") && !doneEntry(r, "cancelled")
 }
 
 // truthy is ECMAScript truthiness (null, "" and 0 are falsy).
