@@ -64,6 +64,41 @@ func assertProfileMarker(t *testing.T, state, profile string) {
 	}
 }
 
+func reminderClientsAttached(st status) bool {
+	for _, c := range st.Clients {
+		for _, source := range c.Sources {
+			if source == "remind" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// awaitReminderClientsDetached waits until status no longer lists a remind
+// subscriber. Conn.Close returns before the server read loop drops that client,
+// and an emit in between marks the line delivered.
+func awaitReminderClientsDetached(t *testing.T, s *server) {
+	t.Helper()
+	detached := make(chan struct{})
+	stop := make(chan struct{})
+	go func() {
+		defer close(detached)
+		for {
+			if !reminderClientsAttached(requestStatus(t, s)) {
+				return
+			}
+			select {
+			case <-stop:
+				return
+			default:
+			}
+		}
+	}()
+	defer close(stop)
+	await(t, detached)
+}
+
 func TestProfileStopKeepsMainRunningDiscardsJournalAndShutsClients(t *testing.T) {
 	// Given: both profiles have AlwaysOn and attach-driven sources.
 	s := serverFixture(t, fakeRegistry)
@@ -88,6 +123,7 @@ func TestProfileStopKeepsMainRunningDiscardsJournalAndShutsClients(t *testing.T)
 		}
 		c.Close()
 	}
+	awaitReminderClientsDetached(t, s)
 	s.emit("family", "remind", true, `REMIND failed {"id":"due"}`)
 	reminders := filepath.Join(s.base.State, "reminders-family.json")
 	if err := os.WriteFile(reminders, []byte(`[{"id":"future","at":"2030-01-01"},{"id":"sent","sent":"yes"}]`), 0o600); err != nil {
