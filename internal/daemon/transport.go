@@ -132,6 +132,10 @@ func (s *server) handle(conn net.Conn) {
 			return
 		}
 		if cmd.Cmd == "stop" {
+			if cmd.Profile != "" {
+				c.enqueue(reply{Error: "stop with profile is not supported; use stop-profile"})
+				continue
+			}
 			s.requestStop(stopReason(cmd))
 		}
 	}
@@ -178,19 +182,21 @@ func (s *server) control(conn net.Conn, c command) {
 		}
 		s.mu.Unlock()
 		writeFrame(conn, st)
+	case "stop-profile":
+		// Joining workers can take longer than the control write budget.
+		result, err := s.stopProfile(c.Profile)
+		conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		r := profileStopReply{reply: reply{OK: err == nil}, profileStopResult: result}
+		if err != nil {
+			r.Error = err.Error()
+		}
+		writeFrame(conn, r)
 	case "stop":
+		conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 		if c.Profile != "" {
-			// Joining workers can take longer than the control write budget.
-			result, err := s.stopProfile(c.Profile)
-			conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-			r := profileStopReply{reply: reply{OK: err == nil}, profileStopResult: result}
-			if err != nil {
-				r.Error = err.Error()
-			}
-			writeFrame(conn, r)
+			writeFrame(conn, reply{Error: "stop with profile is not supported; use stop-profile"})
 			return
 		}
-		conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 		writeFrame(conn, reply{OK: true, Version: s.options.version})
 		s.requestStop(stopReason(c))
 	default:

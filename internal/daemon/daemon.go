@@ -232,7 +232,7 @@ func daemonProfileStop(parent context.Context, p paths, profile string) (profile
 	result := profileStopResult{Profile: profile, Stopped: []string{}, Daemon: "offline"}
 	conn, err := (&net.Dialer{}).DialContext(ctx, "unix", p.socket)
 	if err == nil {
-		return onlineProfileStop(ctx, conn, p, profile)
+		return onlineProfileStop(ctx, conn, profile)
 	}
 	if !errors.Is(err, syscall.ENOENT) && !errors.Is(err, syscall.ECONNREFUSED) {
 		return result, err
@@ -268,7 +268,7 @@ func daemonProfileStop(parent context.Context, p paths, profile string) (profile
 		for {
 			conn, err := (&net.Dialer{}).DialContext(readyCtx, "unix", p.socket)
 			if err == nil {
-				return onlineProfileStop(ctx, conn, p, profile)
+				return onlineProfileStop(ctx, conn, profile)
 			}
 			if !errors.Is(err, syscall.ENOENT) && !errors.Is(err, syscall.ECONNREFUSED) {
 				return result, err
@@ -320,41 +320,30 @@ func daemonProfileStop(parent context.Context, p paths, profile string) (profile
 	return result, errors.Join(stopErr, err)
 }
 
-func onlineProfileStop(ctx context.Context, conn net.Conn, p paths, profile string) (profileStopResult, error) {
+func onlineProfileStop(ctx context.Context, conn net.Conn, profile string) (profileStopResult, error) {
 	defer conn.Close()
 	stopClose := context.AfterFunc(ctx, func() { conn.Close() })
 	defer stopClose()
 	end, _ := ctx.Deadline()
 	conn.SetDeadline(end)
-	// Probe on its own connection: old daemons treat every stop as a
-	// whole-daemon stop, even when the command contains a profile.
-	if err := writeFrame(conn, command{Cmd: "status"}); err != nil {
-		return profileStopResult{}, err
-	}
-	var st status
-	if err := newFramer(conn).read(&st); err != nil {
-		return profileStopResult{}, err
-	}
-	conn.Close()
-	if !slices.Contains(st.Features, "profile-stop") {
-		return profileStopResult{}, fmt.Errorf("omosense daemon (version %s) does not support stop --profile; upgrade the running daemon first (attach any source with the new binary, which negotiates the upgrade), then retry", st.Version)
-	}
-	stopConn, err := (&net.Dialer{}).DialContext(ctx, "unix", p.socket)
-	if err != nil {
-		return profileStopResult{}, err
-	}
-	defer stopConn.Close()
-	stopControlClose := context.AfterFunc(ctx, func() { stopConn.Close() })
-	defer stopControlClose()
-	stopConn.SetDeadline(end)
-	if err := writeFrame(stopConn, command{Cmd: "stop", Profile: profile}); err != nil {
+	// A legacy peer rejects this opcode rather than stopping the daemon.
+	// Keep the request and reply on this connection: no capability probe
+	// can protect a later connection from daemon replacement.
+	if err := writeFrame(conn, command{Cmd: "stop-profile", Profile: profile}); err != nil {
 		return profileStopResult{}, err
 	}
 	var r profileStopReply
-	if err := newFramer(stopConn).read(&r); err != nil {
+	if err := newFramer(conn).read(&r); err != nil {
 		return profileStopResult{}, err
 	}
 	if !r.OK {
+		if strings.Contains(r.Error, "unknown command") {
+			version := r.Version
+			if version == "" {
+				version = "unknown"
+			}
+			return r.profileStopResult, fmt.Errorf("omosense daemon (version %s) does not support stop --profile; upgrade the running daemon first (attach any source with the new binary, which negotiates the upgrade), then retry", version)
+		}
 		if r.Error == "unknown profile "+profile {
 			return r.profileStopResult, core.UnknownProfileError{Name: profile}
 		}
