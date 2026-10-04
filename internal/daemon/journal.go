@@ -103,6 +103,17 @@ func (j *journal) deliver(seq uint64) error {
 	return nil
 }
 
+func (j *journal) discardPending() error {
+	for _, e := range j.entries {
+		if !e.Delivered {
+			if err := j.deliver(e.Seq); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func (j *journal) compact(now time.Time) error {
 	cutoff := now.Add(-24 * time.Hour)
 	entries := make([]journalEntry, 0, len(j.entries))

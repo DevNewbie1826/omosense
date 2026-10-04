@@ -1,8 +1,8 @@
 // Package remind hosts the reminder scheduler: it reads the reminder file
 // every 20 seconds, sends due reminders through the say subcommand and
-// prints REMIND and LOG lines. A failed send is terminal: the entry
-// records failed and error and is never retried (plan IS-8), fixing
-// remind.ts, which retried failed sends on every tick.
+// prints REMIND and LOG lines. sent, skipped, failed and cancelled are
+// terminal. A failed send records failed and error and is never retried
+// (plan IS-8), fixing remind.ts, which retried failed sends on every tick.
 package remind
 
 import (
