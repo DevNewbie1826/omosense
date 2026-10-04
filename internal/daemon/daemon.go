@@ -32,7 +32,7 @@ const AttachHelp = `Usage: omosense attach <source> [--profile P] [--only PREFIX
 
 Streams a source's lines from the resident daemon to stdout, spawning
 the daemon first when its socket is missing or refuses connections.
-<source> is one of listen, google, remind, herdr, tidy, or all.
+<source> is one of listen, google, remind, herdr, rpc, tidy, or all.
 `
 
 // RunDaemon runs the resident daemon in the foreground; the status and

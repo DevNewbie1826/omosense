@@ -31,7 +31,8 @@ func TestProtocolAttachOptions(t *testing.T) {
 		t.Fatalf("hello: %+v", h)
 	}
 	all, err := parseAttach([]string{"all"}, "v1")
-	if err != nil || all.Name != "all-main" || all.Only != nil || len(all.Sources) != 6 {
+	if err != nil || all.Name != "all-main" || all.Only != nil ||
+		!reflect.DeepEqual(all.Sources, []string{"telegram", "discord", "google", "remind", "herdr", "rpc", "tidy"}) {
 		t.Fatalf("all: %+v, %v", all, err)
 	}
 	for _, args := range [][]string{{}, {"herdr", "--only"}, {"herdr", "--wat"}, {"herdr", "--profile"}, {"herdr", "extra"}} {
