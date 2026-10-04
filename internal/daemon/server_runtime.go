@@ -7,10 +7,12 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 
 	"github.com/DevNewbie1826/omosense/internal/core"
+	"github.com/DevNewbie1826/omosense/internal/remind"
 )
 
 type serverOptions struct {
@@ -21,8 +23,11 @@ type serverOptions struct {
 }
 
 type profileHost struct {
-	workers map[string]*worker
-	journal *journal
+	ctx      *core.Ctx
+	workers  map[string]*worker
+	journal  *journal
+	stopped  bool // Both lifecycle flags are guarded by server.mu.
+	stopping bool
 }
 
 type server struct {
@@ -30,6 +35,7 @@ type server struct {
 	paths    paths
 	options  serverOptions
 	profiles map[string]*profileHost
+	locks    *lockPool
 	mu       sync.Mutex
 	clients  map[*client]hello
 	conns    map[net.Conn]struct{}
@@ -49,6 +55,7 @@ func newServer(base *core.Ctx, p paths, opts serverOptions) (*server, error) {
 		names = base.Cfg.Profiles.Keys()
 	}
 	pool := &lockPool{held: make(map[string]*sharedLock)}
+	s.locks = pool
 	for _, name := range names {
 		prof, err := base.Cfg.Resolve(name)
 		if err != nil {
@@ -56,7 +63,7 @@ func newServer(base *core.Ctx, p paths, opts serverOptions) (*server, error) {
 		}
 		c := *base
 		c.Profile, c.Flags, c.Args = prof, map[string]bool{}, nil
-		host := &profileHost{workers: make(map[string]*worker)}
+		host := &profileHost{ctx: &c, workers: make(map[string]*worker)}
 		for _, source := range opts.registry(&c) {
 			src := source
 			host.workers[src.Name()] = newWorker(&c, src, pool, opts.clock, func(line string) {
@@ -75,6 +82,15 @@ func (s *server) serve(ctx context.Context) (err error) {
 	}
 	defer func() { err = errors.Join(err, owner.close()) }()
 	for name, p := range s.profiles {
+		if _, markerErr := os.Stat(profileMarker(p.ctx)); markerErr == nil {
+			p.stopped = true
+			for _, w := range p.workers {
+				w.halt()
+			}
+		} else if !os.IsNotExist(markerErr) {
+			err = fmt.Errorf("load profile %s stop marker: %w", name, markerErr)
+			break
+		}
 		p.journal, err = openJournal(filepath.Join(s.base.State, "omosense-journal-"+name+".jsonl"), s.options.clock.Now())
 		if err != nil {
 			break
@@ -181,7 +197,7 @@ func (s *server) emit(profile, source string, always bool, line string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	p := s.profiles[profile]
-	if p == nil {
+	if p == nil || p.stopped {
 		return
 	}
 	delivered := false
@@ -201,6 +217,66 @@ func (s *server) emit(profile, source string, always bool, line string) {
 			c.enqueue(frame{Line: line})
 		}
 	}
+}
+
+func (s *server) stopProfile(profile string) (profileStopResult, error) {
+	result := profileStopResult{Profile: profile, Stopped: []string{}, Daemon: "running"}
+	s.mu.Lock()
+	p := s.profiles[profile]
+	if p == nil {
+		s.mu.Unlock()
+		return result, core.UnknownProfileError{Name: profile}
+	}
+	if p.stopping {
+		s.mu.Unlock()
+		return result, fmt.Errorf("profile %s is already stopping", profile)
+	}
+	p.stopping, p.stopped = true, true
+	for c, h := range s.clients {
+		if h.Profile == profile {
+			c.enqueue(frame{Ctl: "shutdown", Reason: "stop"})
+			delete(s.clients, c)
+		}
+	}
+	acks := make([]<-chan struct{}, 0, len(p.workers))
+	for name, w := range p.workers {
+		result.Stopped = append(result.Stopped, name)
+		acks = append(acks, w.halt())
+	}
+	s.interestLocked(profile)
+	s.mu.Unlock()
+	slices.Sort(result.Stopped)
+
+	var stopErr error
+	deadline := s.options.clock.After(20 * time.Second)
+join:
+	for _, ack := range acks {
+		select {
+		case <-ack:
+		case <-deadline:
+			stopErr = fmt.Errorf("profile %s stop timeout waiting for workers", profile)
+			break join
+		}
+	}
+	// A timed-out Run still owns its source lock and may be writing the
+	// reminder file. Only cancel after every worker has joined.
+	if stopErr == nil {
+		release, blocked, err := s.locks.acquire(p.ctx, "remind-"+profile, "remind")
+		if err != nil {
+			stopErr = err
+		} else if blocked != "" {
+			stopErr = fmt.Errorf("cancel reminders: locked by %s", blocked)
+		} else {
+			result.CancelledReminders, stopErr = remind.CancelPending(p.ctx, s.options.clock.Now())
+			release()
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	stopErr = errors.Join(stopErr, p.journal.discardPending())
+	stopErr = errors.Join(stopErr, writeProfileMarker(p.ctx, s.options.clock.Now()))
+	p.stopping = false
+	return result, stopErr
 }
 
 func (s *server) compactLoop(ctx context.Context) {

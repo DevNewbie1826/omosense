@@ -10,10 +10,23 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/DevNewbie1826/omosense/internal/core"
 )
 
 type paths struct {
 	dir, socket, spawn, lock, pid, log string
+}
+
+func profileMarker(c *core.Ctx) string {
+	return filepath.Join(c.State, "omosense-profile-"+c.Profile.Name+".stopped")
+}
+
+func writeProfileMarker(c *core.Ctx, now time.Time) error {
+	if err := os.WriteFile(profileMarker(c), []byte(core.ISO(now)+"\n"), 0o600); err != nil {
+		return fmt.Errorf("profile stop marker: %w", err)
+	}
+	return nil
 }
 
 func pathsFor(dir, socket string) paths {

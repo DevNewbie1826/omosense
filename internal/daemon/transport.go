@@ -65,11 +65,23 @@ func (s *server) handle(conn net.Conn) {
 		rejection = "unknown profile " + h.Profile
 	} else if h.Hello != 1 || h.Version == "" {
 		rejection = "invalid hello"
+	} else if p.stopping {
+		rejection = "profile " + h.Profile + " is stopping"
 	} else {
 		for _, name := range h.Sources {
 			if !slices.Contains(selections["all"], name) {
 				rejection = "invalid source " + name
 				break
+			}
+		}
+	}
+	if rejection == "" && p.stopped {
+		if err := os.Remove(profileMarker(p.ctx)); err != nil && !os.IsNotExist(err) {
+			rejection = "remove profile stop marker: " + err.Error()
+		} else {
+			p.stopped = false
+			for _, w := range p.workers {
+				w.resume()
 			}
 		}
 	}
@@ -145,15 +157,19 @@ func stopReason(c command) string {
 }
 
 func (s *server) control(conn net.Conn, c command) {
-	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	switch c.Cmd {
 	case "status":
+		conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 		s.mu.Lock()
 		st := status{PID: os.Getpid(), Version: s.options.version,
 			Sources: []sourceStatus{}, Clients: []clientStatus{}}
 		for profile, p := range s.profiles {
 			for name, w := range p.workers {
-				st.Sources = append(st.Sources, sourceStatus{profile, name, w.state()})
+				state := w.state()
+				if p.stopped {
+					state = "stopped"
+				}
+				st.Sources = append(st.Sources, sourceStatus{profile, name, state})
 			}
 		}
 		for _, h := range s.clients {
@@ -162,9 +178,22 @@ func (s *server) control(conn net.Conn, c command) {
 		s.mu.Unlock()
 		writeFrame(conn, st)
 	case "stop":
+		if c.Profile != "" {
+			// Joining workers can take longer than the control write budget.
+			result, err := s.stopProfile(c.Profile)
+			conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+			r := profileStopReply{reply: reply{OK: err == nil}, profileStopResult: result}
+			if err != nil {
+				r.Error = err.Error()
+			}
+			writeFrame(conn, r)
+			return
+		}
+		conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 		writeFrame(conn, reply{OK: true, Version: s.options.version})
 		s.requestStop(stopReason(c))
 	default:
+		conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 		writeFrame(conn, reply{Error: fmt.Sprintf("unknown command %s", c.Cmd)})
 	}
 }
