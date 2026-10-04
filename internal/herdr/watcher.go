@@ -367,7 +367,7 @@ func (w *watcher) herdrJSON(ctx context.Context, args []string) (any, error) {
 }
 
 func execHerdr(ctx context.Context, args []string) (stdout, stderr string, code int) {
-	cmd := exec.CommandContext(ctx, "herdr", args...)
+	cmd := core.SourceCommand(ctx, "herdr", args...)
 	var out, errb bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &errb

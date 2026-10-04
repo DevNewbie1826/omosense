@@ -207,7 +207,7 @@ func (s *scheduler) sendViaSay(ctx context.Context, r *core.OMap) (code int, out
 			return 0, "", "", err
 		}
 	}
-	cmd := exec.CommandContext(ctx, bin, "say", fieldStr(r, "platform"), "send", string(j))
+	cmd := core.SourceCommand(ctx, bin, "say", fieldStr(r, "platform"), "send", string(j))
 	var ob, eb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &ob, &eb
 	if err := cmd.Run(); err != nil {

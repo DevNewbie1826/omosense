@@ -52,7 +52,7 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 }
 
 func zeleExec(ctx context.Context, args []string) zeleResult {
-	cmd := exec.CommandContext(ctx, "zele", args...)
+	cmd := core.SourceCommand(ctx, "zele", args...)
 	var out, errb bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &errb

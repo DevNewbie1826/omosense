@@ -5,13 +5,15 @@ import (
 	"context"
 	"errors"
 	"os/exec"
+
+	"github.com/DevNewbie1826/omosense/internal/core"
 )
 
 // runGit runs git, reporting a non-zero exit as code without an error and
 // a spawn-level failure as an "Error: ..." (which the TS $ shell throws,
 // so callers treat it as an abort).
 func runGit(ctx context.Context, args ...string) (stdout, stderr string, code int, err error) {
-	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd := core.SourceCommand(ctx, "git", args...)
 	var out, errb bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &errb

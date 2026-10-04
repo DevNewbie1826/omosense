@@ -2,8 +2,11 @@ package remind
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -20,6 +23,14 @@ func TestBlockedSayCommand(t *testing.T) {
 		os.Exit(2)
 	}
 	defer conn.Close()
+	if os.Getenv("OS_SAY_DESCENDANT") == "1" && os.Getenv("OS_SAY_CHILD") != "1" {
+		child := exec.Command(os.Args[0], "-test.run=^TestBlockedSayCommand$")
+		child.Env = append(os.Environ(), "OS_SAY_CHILD=1")
+		child.Stdout, child.Stderr = os.Stdout, os.Stderr
+		if err := child.Start(); err != nil {
+			os.Exit(2)
+		}
+	}
 	_ = json.NewEncoder(conn).Encode(os.Getpid())
 	var b [1]byte
 	_, _ = conn.Read(b[:])
@@ -27,6 +38,11 @@ func TestBlockedSayCommand(t *testing.T) {
 }
 
 func TestCancelledSend(t *testing.T) {
+	t.Run("direct", func(t *testing.T) { testCancelledSend(t, false) })
+	t.Run("descendant", func(t *testing.T) { testCancelledSend(t, true) })
+}
+
+func testCancelledSend(t *testing.T, descendant bool) {
 	c := loadCtx(t)
 	gatedir, err := os.MkdirTemp("/tmp", "os-say-")
 	if err != nil {
@@ -41,6 +57,13 @@ func TestCancelledSend(t *testing.T) {
 	defer ln.Close()
 	t.Setenv("OS_SAY_HELPER", "1")
 	t.Setenv("OS_SAY_GATE", gate)
+	t.Setenv("OS_SAY_CHILD", "")
+	t.Setenv("OS_SAY_DESCENDANT", "0")
+	count := 1
+	if descendant {
+		count = 2
+		t.Setenv("OS_SAY_DESCENDANT", "1")
+	}
 	exe, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
@@ -59,34 +82,31 @@ func TestCancelledSend(t *testing.T) {
 		pid  int
 		err  error
 	}
-	started := make(chan child, 1)
+	started := make(chan child, count)
 	go func() {
-		conn, err := ln.Accept()
-		if err != nil {
-			started <- child{err: err}
-			return
+		for range count {
+			conn, err := ln.Accept()
+			if err != nil {
+				started <- child{err: err}
+				return
+			}
+			var pid int
+			err = json.NewDecoder(conn).Decode(&pid)
+			started <- child{conn, pid, err}
 		}
-		var pid int
-		err = json.NewDecoder(conn).Decode(&pid)
-		started <- child{conn, pid, err}
 	}()
 	sink := newChanSink()
 	cancel, done := runSource(t, c, sink)
 	defer cancel()
-	var b child
-	select {
-	case b = <-started:
-	case <-time.After(10 * time.Second):
-		t.Fatal("fake say did not announce startup")
-	}
-	if b.err != nil {
-		t.Fatal(b.err)
-	}
-	defer b.conn.Close()
+	var processes []child
 	// Failure cleanup kills the blocked command so no scheduler is left.
 	joined := false
 	defer func() {
-		_ = syscall.Kill(b.pid, syscall.SIGKILL)
+		for _, b := range processes {
+			_ = syscall.Kill(b.pid, syscall.SIGKILL)
+			_ = b.conn.Close()
+		}
+		cancel()
 		if !joined {
 			// Unblock any unexpected second invocation only during failure cleanup.
 			ln.Close()
@@ -94,7 +114,19 @@ func TestCancelledSend(t *testing.T) {
 		}
 		t.Log("cleanup: source joined, fake say killed/reaped, listener closed, temporary gate removed")
 	}()
-	t.Logf("RUN real remind source with blocked fake say pid=%d; cancel source context", b.pid)
+	for range count {
+		select {
+		case b := <-started:
+			if b.err != nil {
+				t.Fatal(b.err)
+			}
+			processes = append(processes, b)
+			t.Logf("BLOCKED fake say process pid=%d", b.pid)
+		case <-time.After(10 * time.Second):
+			t.Fatal("fake say did not announce startup")
+		}
+	}
+	t.Log("RUN real remind source with blocked fake say; cancel source context")
 	cancel()
 	select {
 	case err := <-done:
@@ -105,9 +137,20 @@ func TestCancelledSend(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("source cancellation did not reap in-flight say")
 	}
-	if err := syscall.Kill(b.pid, 0); err == nil {
-		t.Fatal("cancelled say remains alive")
+	for _, b := range processes {
+		if err := b.conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		var data [1]byte
+		if _, err := b.conn.Read(data[:]); !errors.Is(err, io.EOF) {
+			t.Fatalf("fake say %d retained gate: %v", b.pid, err)
+		}
+		if err := syscall.Kill(b.pid, 0); !errors.Is(err, syscall.ESRCH) {
+			t.Fatalf("cancelled say %d remains alive: %v", b.pid, err)
+		}
+		_ = b.conn.Close()
 	}
+	processes = nil
 	if got := string(mustRead(t, remindersFile(c))); got != data {
 		t.Fatalf("cancelled send must not mark entries sent/failed or execute later sends: %s", got)
 	}
