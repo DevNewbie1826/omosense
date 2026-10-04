@@ -498,20 +498,56 @@ func TestErrorsAndRecovery(t *testing.T) {
 }
 
 func TestThreadsRereadLateObservation(t *testing.T) {
-	path := shortSocket(t)
-	serveRPC(t, path, []scriptTick{{sessions: []map[string]any{session("rpc-1", "d")}, states: map[string]any{"rpc-1": state("blocked", 0)}}})
-	t.Setenv("OMOSENSE_RPC_SOCK", path)
-	var b bytes.Buffer
-	c := rpcCtx(t, &b, "")
-	w := newWatcher(c, c.Out)
-	w.tick(context.Background())
-	if err := os.WriteFile(filepath.Join(c.State, "threads.json"), []byte(`{"later":{"session":"d"}}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	w.tick(context.Background())
-	got := events(t, &b)
-	if len(got) != 1 || got[0]["event"] != "blocked" || got[0]["from"] != nil || got[0]["thread"] != "later" {
-		t.Fatalf("late observation = %v", got)
+	for _, tc := range []struct {
+		name, status string
+		emptyFirst   bool
+	}{
+		{"baseline blocked", "blocked", false},
+		{"listed after baseline idle", "idle", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Given an unwatched session listed before thread registration.
+			listed := scriptTick{sessions: []map[string]any{session("rpc-1", "d")}, states: map[string]any{"rpc-1": state(tc.status, 0)}}
+			ticks := []scriptTick{listed, listed}
+			if tc.emptyFirst {
+				ticks = append([]scriptTick{{}}, ticks...)
+			}
+			path := shortSocket(t)
+			serveRPC(t, path, ticks)
+			t.Setenv("OMOSENSE_RPC_SOCK", path)
+			var b bytes.Buffer
+			c := rpcCtx(t, &b, "")
+			old := sleepFn
+			defer func() { sleepFn = old }()
+			n := 0
+			sleepFn = func(context.Context, time.Duration) error {
+				n++
+				if n == len(ticks) {
+					return context.Canceled
+				}
+				if n == len(ticks)-1 {
+					if err := os.WriteFile(filepath.Join(c.State, "threads.json"), []byte(`{"later":{"session":"d"}}`), 0o600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				return nil
+			}
+			// When the source rereads threads.json on the next successful list.
+			if err := Sources(c)[0].Run(context.Background(), c.Out); err != nil {
+				t.Fatal(err)
+			}
+			// Then first observation can block but never falsely opens it.
+			got := events(t, &b)
+			if tc.status == "blocked" {
+				if len(got) != 1 || got[0]["event"] != "blocked" || got[0]["from"] != nil || got[0]["thread"] != "later" {
+					t.Fatalf("late observation = %v", got)
+				}
+			} else if len(got) != 0 {
+				t.Fatalf("late registration of previously listed session emitted events: %v; stdout %s", got, b.String())
+			}
+			t.Logf("Source.Run late registration: %s", b.String())
+			t.Log("cleanup: test Cleanup closes and joins fake RPC, removes temporary socket/state, and restores environment and sleepFn")
+		})
 	}
 }
 

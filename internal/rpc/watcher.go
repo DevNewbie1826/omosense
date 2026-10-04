@@ -110,11 +110,7 @@ func (w *watcher) tick(ctx context.Context) {
 	for _, s := range list {
 		id := s.id()
 		present[id] = true
-		// Baseline sessions are not new, even if their first state fails
-		// or they only become watched later.
-		if w.first || w.listed[id] {
-			listed[id] = true
-		}
+		listed[id] = true
 	}
 	seen := make(map[string]record, len(entries))
 	for _, e := range entries {
@@ -123,10 +119,12 @@ func (w *watcher) tick(ctx context.Context) {
 		if !e.valid {
 			if observed {
 				seen[id] = prev
+			} else if !w.first && !w.listed[id] {
+				// Defer a new watched session until its first valid state.
+				delete(listed, id)
 			}
 			continue
 		}
-		listed[id] = true
 		next := prev
 		next.entry = e
 		status := e.state.status()
