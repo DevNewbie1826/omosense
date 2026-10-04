@@ -179,20 +179,6 @@ func TestSourceCommandCancellation(t *testing.T) {
 				processes = append(processes, b)
 				t.Logf("BLOCKED %s %s pid=%d; gate will not be released", tc.command, b.kind, b.pid)
 			}
-			if tc.mode == "parent-exits" {
-				// The parent exits on its own; the source must reap the rest of
-				// its process group before any stop is requested.
-				for _, b := range processes {
-					if err := b.conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
-						t.Fatal(err)
-					}
-					var data [1]byte
-					if n, err := b.conn.Read(data[:]); n != 0 || !errors.Is(err, io.EOF) {
-						t.Fatalf("%s %d outlived its exited parent: n=%d err=%v", b.kind, b.pid, n, err)
-					}
-				}
-				t.Log("PARENT-EXITS: parent and descendant both gone before stop")
-			}
 			run := func(args ...string) (string, error) {
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer cancel()
@@ -208,6 +194,20 @@ func TestSourceCommandCancellation(t *testing.T) {
 				t.Fatalf("status: %v %s", err, out)
 			}
 			daemonPID = st.PID
+			if tc.mode == "parent-exits" {
+				// The parent exits on its own; the source must reap the rest of
+				// its process group before any stop is requested.
+				for _, b := range processes {
+					if err := b.conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+						t.Fatal(err)
+					}
+					var data [1]byte
+					if n, err := b.conn.Read(data[:]); n != 0 || !errors.Is(err, io.EOF) {
+						t.Fatalf("%s %d outlived its exited parent: n=%d err=%v", b.kind, b.pid, n, err)
+					}
+				}
+				t.Log("PARENT-EXITS: parent and descendant both gone before stop")
+			}
 			lock := filepath.Join(state, tc.lock+".lock.json")
 			if _, err := os.Stat(lock); err != nil {
 				t.Fatalf("running source lock: %v", err)
