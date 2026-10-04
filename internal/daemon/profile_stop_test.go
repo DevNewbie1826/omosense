@@ -282,7 +282,10 @@ func TestProfileStopConcurrentNormalHellosBothSucceed(t *testing.T) {
 func foreignReminderLock(t *testing.T, state, name string) string {
 	t.Helper()
 	holder := exec.Command(os.Args[0], "-test.run=^TestSupervisorLockHolder$")
-	holder.Env = append(os.Environ(), "OMOSENSE_LOCK_HELPER=1")
+	sandbox := socketPaths(t)
+	holder.Env = append(os.Environ(), "OMOSENSE_LOCK_HELPER=1",
+		"HOME="+sandbox.dir, "OMOMEOW_DIR="+sandbox.dir,
+		"OMOMEOW_STATE="+state, "OMOSENSE_SOCK="+sandbox.socket)
 	stdin, err := holder.StdinPipe()
 	if err != nil {
 		t.Fatal(err)
