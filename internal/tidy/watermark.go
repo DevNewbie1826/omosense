@@ -1,6 +1,7 @@
 package tidy
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math"
@@ -108,7 +109,7 @@ type headRec struct {
 
 // heads lists HEAD of every non-EXCLUDE agent repo that has a repo/.git
 // entry. at is %ct*1000; a git log failure is logged per repo and skipped.
-func (t *tidyer) heads() ([]headRec, error) {
+func (t *tidyer) heads(ctx context.Context) ([]headRec, error) {
 	names, err := sortedAgents(t.agents)
 	if err != nil {
 		return nil, err
@@ -122,7 +123,7 @@ func (t *tidyer) heads() ([]headRec, error) {
 		if _, err := os.Stat(filepath.Join(repo, ".git")); err != nil {
 			continue
 		}
-		stdout, stderr, code, err := runGit("-C", repo, "log", "-1", "--format=%H%x20%ct")
+		stdout, stderr, code, err := runGit(ctx, "-C", repo, "log", "-1", "--format=%H%x20%ct")
 		if err != nil {
 			return nil, err
 		}
@@ -149,13 +150,13 @@ func (t *tidyer) heads() ([]headRec, error) {
 // comparison is a JS strict !== against the sha string, so a json.Number
 // or boolean watermark value always counts as changed; from is the raw
 // watermark value, null when absent.
-func (t *tidyer) changed() ([]change, error) {
+func (t *tidyer) changed(ctx context.Context) ([]change, error) {
 	w, err := t.readWatermark()
 	if err != nil {
 		return nil, err
 	}
 	repos := reposOf(w)
-	heads, err := t.heads()
+	heads, err := t.heads(ctx)
 	if err != nil {
 		return nil, err
 	}

@@ -63,7 +63,10 @@ func newScheduler(c *core.Ctx, sink core.Sink) *scheduler {
 func (s *scheduler) run(ctx context.Context) error {
 	s.sink.Log(fmt.Sprintf("reminder scheduler starting (profile %s)", s.c.Profile.Name))
 	for {
-		if err := s.tick(); err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
+		if err := s.tick(ctx); err != nil && ctx.Err() == nil {
 			s.sink.Log("remind " + err.Error())
 		}
 		if !hookSleep(ctx, tickInterval) {
@@ -76,7 +79,7 @@ func (s *scheduler) run(ctx context.Context) error {
 // truthy sent, skipped or failed are skipped (failed is terminal, IS-8);
 // due entries send through the say executable; the file is rewritten in
 // the bun indent layout only when an entry changed.
-func (s *scheduler) tick() error {
+func (s *scheduler) tick(ctx context.Context) error {
 	b, err := os.ReadFile(s.file)
 	if os.IsNotExist(err) {
 		return nil
@@ -96,6 +99,9 @@ func (s *scheduler) tick() error {
 	changed := false
 	var pending []pendingLine
 	for _, ev := range arr {
+		if ctx.Err() != nil {
+			break
+		}
 		r, ok := ev.(*core.OMap)
 		if !ok {
 			return fmt.Errorf("reminders: entry is not a JSON object")
@@ -117,7 +123,10 @@ func (s *scheduler) tick() error {
 		}
 		// An unparsed at is Date.parse NaN: remind.ts's two comparisons
 		// are both false on NaN, so the entry sends immediately.
-		code, out, errOut, err := s.sendViaSay(r)
+		code, out, errOut, err := s.sendViaSay(ctx, r)
+		if ctx.Err() != nil {
+			break
+		}
 		if err != nil {
 			return err
 		}
@@ -175,7 +184,7 @@ func entryLine(verb string, r *core.OMap) pendingLine {
 // object plus text, the same argument list remind.ts passed to say.ts. It
 // returns the exit code and the captured stdout/stderr; only a failure to
 // spawn is an error.
-func (s *scheduler) sendViaSay(r *core.OMap) (code int, out, errOut string, err error) {
+func (s *scheduler) sendViaSay(ctx context.Context, r *core.OMap) (code int, out, errOut string, err error) {
 	body := core.NewOMap()
 	if t, _ := getOMap(r, "target"); t != nil {
 		for _, k := range t.Keys() {
@@ -198,10 +207,13 @@ func (s *scheduler) sendViaSay(r *core.OMap) (code int, out, errOut string, err 
 			return 0, "", "", err
 		}
 	}
-	cmd := exec.Command(bin, "say", fieldStr(r, "platform"), "send", string(j))
+	cmd := exec.CommandContext(ctx, bin, "say", fieldStr(r, "platform"), "send", string(j))
 	var ob, eb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &ob, &eb
 	if err := cmd.Run(); err != nil {
+		if ctx.Err() != nil {
+			return 0, ob.String(), eb.String(), ctx.Err()
+		}
 		var ee *exec.ExitError
 		if errors.As(err, &ee) {
 			return ee.ExitCode(), ob.String(), eb.String(), nil

@@ -33,7 +33,7 @@ func Run(c *core.Ctx, args []string) int {
 			fmt.Fprintln(os.Stderr, "omosense:", err)
 			return 1
 		}
-		w.once()
+		w.once(context.Background())
 		return 0
 	}
 	name, legacy := lockNames(c.Profile.Name)

@@ -28,7 +28,7 @@ func TestBlockedEmittedOnFirstTick(t *testing.T) {
 
 	var buf bytes.Buffer
 	w := newWatcher(testCtx(t.TempDir(), "main", &buf), core.NewOut(&buf))
-	if err := w.tick(true); err != nil {
+	if err := w.tick(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
 	wantLines(t, linesOf(&buf),
@@ -45,7 +45,7 @@ func TestBlockedEmittedOnFirstTick(t *testing.T) {
 		{"pane_id":"p3","agent_status":"blocked"},
 		{"pane_id":"p4","display_agent":"","agent":"codex","agent_status":"blocked","terminal_title_stripped":""}
 	]}}`)
-	if err := w.tick(false); err != nil {
+	if err := w.tick(context.Background(), false); err != nil {
 		t.Fatal(err)
 	}
 	wantLines(t, linesOf(&buf),
@@ -77,11 +77,11 @@ func TestJobTransitionRules(t *testing.T) {
 	// watcher has no previous status on its first call.
 	writeFile(t, filepath.Join(dir, "local.out"), agents(ag("job", "working", "j")))
 	writeFile(t, filepath.Join(dir, "box.out"), `{"result":{"agents":[]}}`)
-	if err := w.tick(true); err != nil {
+	if err := w.tick(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
 	writeFile(t, filepath.Join(dir, "local.out"), agents(ag("job", "idle", "j")))
-	if err := w.tick(true); err != nil {
+	if err := w.tick(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
 	if got := linesOf(&buf); len(got) != 0 {
@@ -104,7 +104,7 @@ func TestJobTransitionRules(t *testing.T) {
 		ag("rjob", "working", ""),
 		ag("own", "blocked", "remote-own"),
 	))
-	if err := w.tick(true); err != nil {
+	if err := w.tick(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
 	wantLines(t, linesOf(&buf),
@@ -126,7 +126,7 @@ func TestJobTransitionRules(t *testing.T) {
 		ag("own", "blocked", "remote-own"),
 		ag("late", "idle", ""),
 	))
-	if err := w.tick(false); err != nil {
+	if err := w.tick(context.Background(), false); err != nil {
 		t.Fatal(err)
 	}
 	wantLines(t, linesOf(&buf),
@@ -146,7 +146,7 @@ func TestJobTransitionRules(t *testing.T) {
 		ag("own", "idle", ""),
 		ag("late", "working", ""),
 	))
-	if err := w.tick(false); err != nil {
+	if err := w.tick(context.Background(), false); err != nil {
 		t.Fatal(err)
 	}
 	wantLines(t, linesOf(&buf),
@@ -170,17 +170,17 @@ func TestHerdrErrorDedupe(t *testing.T) {
 		writeFile(t, filepath.Join(dir, "local.code"), "1\n")
 	}
 	fail("  boom \n")
-	if err := w.tick(true); err != nil {
+	if err := w.tick(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
-	if err := w.tick(false); err != nil {
+	if err := w.tick(context.Background(), false); err != nil {
 		t.Fatal(err)
 	}
 	wantLines(t, linesOf(&buf), "LOG herdr local Error: boom")
 
 	buf.Reset()
 	fail("other\n")
-	if err := w.tick(false); err != nil {
+	if err := w.tick(context.Background(), false); err != nil {
 		t.Fatal(err)
 	}
 	wantLines(t, linesOf(&buf), "LOG herdr local Error: other")
@@ -191,7 +191,7 @@ func TestHerdrErrorDedupe(t *testing.T) {
 	removeFile(t, filepath.Join(dir, "local.err"))
 	removeFile(t, filepath.Join(dir, "local.code"))
 	writeFile(t, filepath.Join(dir, "local.out"), `{"result":{"agents":[]}}`)
-	if err := w.tick(false); err != nil {
+	if err := w.tick(context.Background(), false); err != nil {
 		t.Fatal(err)
 	}
 	if got := linesOf(&buf); len(got) != 0 {
@@ -199,7 +199,7 @@ func TestHerdrErrorDedupe(t *testing.T) {
 	}
 	buf.Reset()
 	fail("  boom \n")
-	if err := w.tick(false); err != nil {
+	if err := w.tick(context.Background(), false); err != nil {
 		t.Fatal(err)
 	}
 	wantLines(t, linesOf(&buf), "LOG herdr local Error: boom")
@@ -215,10 +215,10 @@ func TestHerdrErrorShapes(t *testing.T) {
 		writeFile(t, filepath.Join(dir, "local.out"), "not-json\n")
 		var buf bytes.Buffer
 		w := newWatcher(testCtx(t.TempDir(), "main", &buf), core.NewOut(&buf))
-		if err := w.tick(true); err != nil {
+		if err := w.tick(context.Background(), true); err != nil {
 			t.Fatal(err)
 		}
-		if err := w.tick(false); err != nil {
+		if err := w.tick(context.Background(), false); err != nil {
 			t.Fatal(err)
 		}
 		got := linesOf(&buf)
@@ -234,7 +234,7 @@ func TestHerdrErrorShapes(t *testing.T) {
 		writeFile(t, filepath.Join(dir, "local.code"), "7\n")
 		var buf bytes.Buffer
 		w := newWatcher(testCtx(t.TempDir(), "main", &buf), core.NewOut(&buf))
-		if err := w.tick(true); err != nil {
+		if err := w.tick(context.Background(), true); err != nil {
 			t.Fatal(err)
 		}
 		wantLines(t, linesOf(&buf), "LOG herdr local Error: exit 7")
@@ -247,7 +247,7 @@ func TestHerdrErrorShapes(t *testing.T) {
 		writeFile(t, filepath.Join(dir, "local.code"), "1\n")
 		var buf bytes.Buffer
 		w := newWatcher(testCtx(t.TempDir(), "main", &buf), core.NewOut(&buf))
-		if err := w.tick(true); err != nil {
+		if err := w.tick(context.Background(), true); err != nil {
 			t.Fatal(err)
 		}
 		wantLines(t, linesOf(&buf), "LOG herdr local Error: "+strings.Repeat("😀", 200))
@@ -263,7 +263,7 @@ func TestHerdrErrorShapes(t *testing.T) {
 		removeFile(t, filepath.Join(dir, "calls"))
 		var buf bytes.Buffer
 		w := newWatcher(testCtx(t.TempDir(), "main", &buf), core.NewOut(&buf))
-		if err := w.tick(true); err != nil {
+		if err := w.tick(context.Background(), true); err != nil {
 			t.Fatal(err)
 		}
 		wantLines(t, linesOf(&buf),
@@ -367,7 +367,7 @@ func TestMachineListShapes(t *testing.T) {
 			}
 			var buf bytes.Buffer
 			w := newWatcher(testCtx(t.TempDir(), "main", &buf), core.NewOut(&buf))
-			if err := w.tick(true); err != nil {
+			if err := w.tick(context.Background(), true); err != nil {
 				t.Fatal(err)
 			}
 			if got := linesOf(&buf); len(got) != 0 {

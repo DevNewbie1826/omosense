@@ -109,7 +109,10 @@ func (t *tidyer) runLoop(ctx context.Context) error {
 	pendingSince := map[string]float64{}
 	emitted := map[string]emitRec{}
 	for {
-		if err := t.tick(t.nowMs(), pendingSince, emitted); err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
+		if err := t.tick(ctx, t.nowMs(), pendingSince, emitted); err != nil && ctx.Err() == nil {
 			t.sink.Log("memory-tidy " + err.Error())
 		}
 		if err := t.sleep(ctx, time.Duration(t.checkMs)*time.Millisecond); err != nil {
@@ -123,9 +126,12 @@ func (t *tidyer) runLoop(ctx context.Context) error {
 // repo was first seen, and not muted by the 6h re-emit guard), emit one
 // TIDY line for all ready repos, then run the daily backup. An error
 // aborts the rest of the pass, like the throw.
-func (t *tidyer) tick(now float64, pendingSince map[string]float64, emitted map[string]emitRec) error {
-	changes, err := t.changed()
+func (t *tidyer) tick(ctx context.Context, now float64, pendingSince map[string]float64, emitted map[string]emitRec) error {
+	changes, err := t.changed(ctx)
 	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	stillChanged := make(map[string]bool, len(changes))
@@ -157,7 +163,7 @@ func (t *tidyer) tick(now float64, pendingSince map[string]float64, emitted map[
 			emitted[x.repo] = emitRec{to: x.to, at: now}
 		}
 	}
-	_, err = t.backup(true)
+	_, err = t.backup(ctx, true)
 	return err
 }
 

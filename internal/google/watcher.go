@@ -29,7 +29,7 @@ type zeleResult struct {
 }
 
 // zeleFunc runs a zele command line; tests inject fakes here.
-type zeleFunc func(args []string) zeleResult
+type zeleFunc func(ctx context.Context, args []string) zeleResult
 
 var calArgs = []string{"cal", "events", "--all", "--days", "2", "--limit", "50"}
 var mailArgs = []string{"mail", "list", "--filter", "is:unread category:primary newer_than:1d", "--limit", "30"}
@@ -51,8 +51,8 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 	}
 }
 
-func zeleExec(args []string) zeleResult {
-	cmd := exec.Command("zele", args...)
+func zeleExec(ctx context.Context, args []string) zeleResult {
+	cmd := exec.CommandContext(ctx, "zele", args...)
 	var out, errb bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &errb
@@ -120,8 +120,14 @@ func newWatcher(c *core.Ctx, sink core.Sink, writable bool) (*watcher, error) {
 // logs "zele error <args>: <stderr truncated>" and yields an empty list,
 // exactly like the TS helper; a YAML parse error propagates to the caller
 // (the loop's try block).
-func (w *watcher) items(args []string) ([]any, error) {
-	r := w.zele(args)
+func (w *watcher) items(ctx context.Context, args []string) ([]any, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	r := w.zele(ctx, args)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if r.code != 0 {
 		w.sink.Log(fmt.Sprintf("zele error %s: %s", strings.Join(args, " "), core.Trunc(r.stderr, 200)))
 		return nil, nil
@@ -143,8 +149,8 @@ func (w *watcher) items(args []string) ([]any, error) {
 // calendar emits CAL for each unseen event (key cal:<id>@<Date.parse-ms>)
 // filtered by the profile's calendar allow-list, and SOON for events whose
 // year-corrected realStart falls inside the 30 minute window.
-func (w *watcher) calendar() error {
-	items, err := w.items(calArgs)
+func (w *watcher) calendar(ctx context.Context) error {
+	items, err := w.items(ctx, calArgs)
 	if err != nil {
 		return err
 	}
@@ -179,8 +185,8 @@ func (w *watcher) calendar() error {
 // MAIL {account,id,from?,subject?,snippet} unless the NOISE filter matched
 // or the pass is silent. Absent from/subject keys stay absent; the snippet
 // is always present, truncated to 200 runes.
-func (w *watcher) mail(silent bool) error {
-	items, err := w.items(mailArgs)
+func (w *watcher) mail(ctx context.Context, silent bool) error {
+	items, err := w.items(ctx, mailArgs)
 	if err != nil {
 		return err
 	}
@@ -245,12 +251,12 @@ func (w *watcher) save() error {
 
 // once is the read-only --once pass (IS-9): calendar plus non-silent mail
 // only when the profile reads mail; no lock, no starting LOG, no writes.
-func (w *watcher) once() {
-	if err := w.calendar(); err != nil {
+func (w *watcher) once(ctx context.Context) {
+	if err := w.calendar(ctx); err != nil {
 		w.sink.Log("google watcher " + err.Error())
 	}
 	if w.prof.Mail {
-		if err := w.mail(false); err != nil {
+		if err := w.mail(ctx, false); err != nil {
 			w.sink.Log("google watcher " + err.Error())
 		}
 	}
@@ -264,12 +270,18 @@ func (w *watcher) once() {
 func (w *watcher) run(ctx context.Context) error {
 	w.sink.Log(fmt.Sprintf("google watcher starting (profile %s)", w.prof.Name))
 	if w.prof.Mail {
-		if err := w.mail(w.firstRun); err != nil {
+		if err := w.mail(ctx, w.firstRun); err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
 			return err
 		}
 	}
 	for tick := 0; ; tick++ {
-		if err := w.tick(tick); err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
+		if err := w.tick(ctx, tick); err != nil && ctx.Err() == nil {
 			w.sink.Log("google watcher " + err.Error())
 		}
 		if err := w.sleep(ctx, time.Minute); err != nil {
@@ -280,16 +292,19 @@ func (w *watcher) run(ctx context.Context) error {
 
 // tick is one loop iteration; an error skips the rest of the iteration
 // (mail, prune, save), matching the single TS try block.
-func (w *watcher) tick(n int) error {
+func (w *watcher) tick(ctx context.Context, n int) error {
 	if n%5 == 0 {
-		if err := w.calendar(); err != nil {
+		if err := w.calendar(ctx); err != nil {
 			return err
 		}
 	}
 	if n > 0 && w.prof.Mail {
-		if err := w.mail(false); err != nil {
+		if err := w.mail(ctx, false); err != nil {
 			return err
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	w.prune()
 	return w.save()

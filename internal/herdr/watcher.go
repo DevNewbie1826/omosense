@@ -166,7 +166,10 @@ func (w *watcher) run(ctx context.Context) error {
 	w.sink.Log(fmt.Sprintf("herdr watcher starting (profile %s, every %ds, skip %s)", w.profile, int(interval/time.Second), skip))
 	first := true
 	for {
-		if err := w.tick(first); err != nil && ctx.Err() == nil {
+		if ctx.Err() != nil {
+			return nil
+		}
+		if err := w.tick(ctx, first); err != nil && ctx.Err() == nil {
 			w.sink.Log("herdr " + err.Error())
 		}
 		if ctx.Err() != nil {
@@ -182,8 +185,8 @@ func (w *watcher) run(ctx context.Context) error {
 // once is the read-only --once path: the same snapshot as a tick, printed
 // as SNAP lines, with no lock and no seen-state updates. Snapshot errors
 // still log, because --once calls snapshot() in the TS source too.
-func (w *watcher) once() {
-	for _, e := range w.snapshot() {
+func (w *watcher) once(ctx context.Context) {
+	for _, e := range w.snapshot(ctx) {
 		w.sink.Raw("SNAP", fmt.Sprintf("%s %s %s %s", e.key, statusOf(e.agent), snapAgent(e.agent), snapTitle(e.agent)))
 	}
 }
@@ -193,10 +196,13 @@ func (w *watcher) once() {
 // and working→done emit only for a job pane that is not the family pane
 // and not on the first tick. Status that did not change is quiet, even
 // when the title did. Panes that disappear are forgotten.
-func (w *watcher) tick(first bool) error {
+func (w *watcher) tick(ctx context.Context, first bool) error {
 	fam := w.familyPane()
 	jobs := w.jobPanes()
-	snap := w.snapshot()
+	snap := w.snapshot(ctx)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	inSnap := make(map[string]bool, len(snap))
 	for _, e := range snap {
 		inSnap[e.key] = true
@@ -242,15 +248,18 @@ func (w *watcher) emit(machine string, a agent, from *string, to string) {
 	})
 }
 
-func (w *watcher) snapshot() []snapEntry {
+func (w *watcher) snapshot(ctx context.Context) []snapEntry {
 	targets := []target{{machine: "local", args: []string{"agent", "list"}}}
-	for _, m := range w.machineNames() {
+	for _, m := range w.machineNames(ctx) {
 		targets = append(targets, target{machine: m, args: []string{"--machine", m, "agent", "list"}})
 	}
 	var out []snapEntry
 	index := map[string]int{}
 	for _, t := range targets {
-		w.collect(t, &out, index)
+		if ctx.Err() != nil {
+			break
+		}
+		w.collect(ctx, t, &out, index)
 	}
 	return out
 }
@@ -259,9 +268,12 @@ func (w *watcher) snapshot() []snapEntry {
 // position and takes the later payload, matching Map.set. An error is
 // logged once per distinct message until a later success clears it; the
 // TS source stringifies the thrown Error, which prefixes "Error: ".
-func (w *watcher) collect(t target, out *[]snapEntry, index map[string]int) {
-	v, err := w.herdrJSON(t.args)
+func (w *watcher) collect(ctx context.Context, t target, out *[]snapEntry, index map[string]int) {
+	v, err := w.herdrJSON(ctx, t.args)
 	if err != nil {
+		if ctx.Err() != nil {
+			return
+		}
 		w.noteError(t.machine, err)
 		return
 	}
@@ -301,8 +313,8 @@ func (w *watcher) noteError(machine string, err error) {
 // machineNames asks `herdr machine list --json` and swallows every failure
 // (non-zero exit, bad JSON, a non-object row). watch-herdr.ts returns []
 // in all of those cases and does not log.
-func (w *watcher) machineNames() []string {
-	v, err := w.herdrJSON([]string{"machine", "list", "--json"})
+func (w *watcher) machineNames(ctx context.Context) []string {
+	v, err := w.herdrJSON(ctx, []string{"machine", "list", "--json"})
 	if err != nil {
 		return nil
 	}
@@ -330,8 +342,14 @@ func (w *watcher) machineNames() []string {
 // `Error: <trimmed stderr>` (or `Error: exit N` when stderr is blank),
 // truncated to 200 runes. A parse failure becomes `SyntaxError: ...`,
 // which is what String(JSON.parse's throw) starts with.
-func (w *watcher) herdrJSON(args []string) (any, error) {
-	stdout, stderr, code := execHerdr(args)
+func (w *watcher) herdrJSON(ctx context.Context, args []string) (any, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	stdout, stderr, code := execHerdr(ctx, args)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if code != 0 {
 		msg := strings.TrimSpace(stderr)
 		if msg == "" {
@@ -348,8 +366,8 @@ func (w *watcher) herdrJSON(args []string) (any, error) {
 	return v, nil
 }
 
-func execHerdr(args []string) (stdout, stderr string, code int) {
-	cmd := exec.Command("herdr", args...)
+func execHerdr(ctx context.Context, args []string) (stdout, stderr string, code int) {
+	cmd := exec.CommandContext(ctx, "herdr", args...)
 	var out, errb bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &errb

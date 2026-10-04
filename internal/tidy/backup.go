@@ -4,6 +4,7 @@ package tidy
 // data (plan requirement).
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -45,7 +46,10 @@ func lastBackupDate(w *core.OMap) (string, bool) {
 // When the date already ran: quietIfDone returns silently, otherwise the
 // already-ran-today LOG line prints. The return reports whether every
 // bundle succeeded.
-func (t *tidyer) backup(quietIfDone bool) (bool, error) {
+func (t *tidyer) backup(ctx context.Context, quietIfDone bool) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	date := seoulDate(t.now())
 	w, err := t.readWatermark()
 	if err != nil {
@@ -76,20 +80,20 @@ func (t *tidyer) backup(quietIfDone bool) (bool, error) {
 		if _, err := os.Stat(repo); err != nil {
 			continue
 		}
-		if _, _, code, err := runGit("-C", repo, "rev-parse", "--git-dir"); err != nil {
+		if _, _, code, err := runGit(ctx, "-C", repo, "rev-parse", "--git-dir"); err != nil {
 			return false, err
 		} else if code != 0 {
 			continue
 		}
 		repos++
 		bundle := filepath.Join(dir, name+".bundle")
-		_, _, ccode, err := runGit("-C", repo, "bundle", "create", bundle, "--all")
+		_, _, ccode, err := runGit(ctx, "-C", repo, "bundle", "create", bundle, "--all")
 		if err != nil {
 			return false, err
 		}
 		verified := ccode == 0
 		if verified {
-			if _, _, vcode, err := runGit("-C", repo, "bundle", "verify", bundle); err != nil {
+			if _, _, vcode, err := runGit(ctx, "-C", repo, "bundle", "verify", bundle); err != nil {
 				return false, err
 			} else if vcode != 0 {
 				verified = false
@@ -105,6 +109,9 @@ func (t *tidyer) backup(quietIfDone bool) (bool, error) {
 			return false, errors.New("Error: " + err.Error())
 		}
 		bytes += fi.Size()
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
 	}
 	if err := pruneBackups(t.backups); err != nil {
 		return false, err

@@ -39,13 +39,13 @@ func Run(c *core.Ctx, args []string) int {
 
 	switch {
 	case c.Flags["--write-watermark"]:
-		if err := t.writeWatermarkCmd(args); err != nil {
+		if err := t.writeWatermarkCmd(context.Background(), args); err != nil {
 			fmt.Fprintln(os.Stderr, "omosense:", err)
 			return 1
 		}
 		return 0
 	case c.Flags["--backup-now"]:
-		allGood, err := t.backup(false)
+		allGood, err := t.backup(context.Background(), false)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "omosense:", err)
 			return 1
@@ -55,7 +55,7 @@ func Run(c *core.Ctx, args []string) int {
 		}
 		return 0
 	case c.Flags["--now"] || c.Flags["--once"]:
-		if err := t.nowOnce(); err != nil {
+		if err := t.nowOnce(context.Background()); err != nil {
 			fmt.Fprintln(os.Stderr, "omosense:", err)
 			return 1
 		}
@@ -75,7 +75,7 @@ func Run(c *core.Ctx, args []string) int {
 // heads as the repos map, lastRun is stamped, and the LOG line reports
 // the unique key count. The JS split("=", 2) limit drops any tail:
 // "a=b=c" sets repo "a" to "b".
-func (t *tidyer) writeWatermarkCmd(args []string) error {
+func (t *tidyer) writeWatermarkCmd(ctx context.Context, args []string) error {
 	w, err := t.readWatermark()
 	if err != nil {
 		return err
@@ -99,7 +99,7 @@ func (t *tidyer) writeWatermarkCmd(args []string) error {
 			}
 		}
 	} else {
-		heads, err := t.heads()
+		heads, err := t.heads(ctx)
 		if err != nil {
 			return err
 		}
@@ -120,8 +120,8 @@ func (t *tidyer) writeWatermarkCmd(args []string) error {
 
 // nowOnce is the read-only --now/--once check: print one TIDY line when
 // any repo changed; never lock and never write (IS-9).
-func (t *tidyer) nowOnce() error {
-	changes, err := t.changed()
+func (t *tidyer) nowOnce(ctx context.Context) error {
+	changes, err := t.changed(ctx)
 	if err != nil {
 		return err
 	}

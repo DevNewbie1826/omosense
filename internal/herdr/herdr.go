@@ -26,7 +26,7 @@ Flags:
 func Run(c *core.Ctx, args []string) int {
 	_ = args
 	if c.Flags["--once"] {
-		newWatcher(c, c.Out).once()
+		newWatcher(c, c.Out).once(context.Background())
 		return 0
 	}
 	release := c.Acquire("watch-herdr-"+c.Profile.Name, "")

@@ -15,7 +15,7 @@ import (
 )
 
 func fakeZele(cal, mail []byte, calls *[]string) zeleFunc {
-	return func(args []string) zeleResult {
+	return func(_ context.Context, args []string) zeleResult {
 		if calls != nil {
 			*calls = append(*calls, strings.Join(args, " "))
 		}
@@ -91,7 +91,7 @@ func TestCalendarOnceThenSeenKeys(t *testing.T) {
 	}
 	w.zele = fakeZele(fixture(t, "cal.yaml"), nil, nil)
 	w.now = func() time.Time { return time.Date(2026, 10, 6, 9, 10, 0, 0, time.Local) }
-	if err := w.calendar(); err != nil {
+	if err := w.calendar(context.Background()); err != nil {
 		t.Fatalf("calendar: %v", err)
 	}
 	cals := linesWith(&buf, "CAL")
@@ -110,7 +110,7 @@ func TestCalendarOnceThenSeenKeys(t *testing.T) {
 		t.Errorf("bun-compatible soon key missing for %v; have %v", soonID, w.seen.Keys())
 	}
 	buf.Reset()
-	if err := w.calendar(); err != nil {
+	if err := w.calendar(context.Background()); err != nil {
 		t.Fatalf("calendar 2: %v", err)
 	}
 	if n := len(linesOf(&buf)); n != 0 {
@@ -128,7 +128,7 @@ func soonFires(t *testing.T, dir string, now time.Time) int {
 	}
 	w.zele = fakeZele(fixture(t, "cal.yaml"), nil, nil)
 	w.now = func() time.Time { return now }
-	if err := w.calendar(); err != nil {
+	if err := w.calendar(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	return len(linesWith(&buf, "SOON"))
@@ -176,7 +176,7 @@ func TestMailSilentNoiseTrunc(t *testing.T) {
 		return w
 	}
 	w := mk()
-	if err := w.mail(true); err != nil {
+	if err := w.mail(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
 	if got := linesWith(&buf, "MAIL"); len(got) != 0 {
@@ -186,7 +186,7 @@ func TestMailSilentNoiseTrunc(t *testing.T) {
 		t.Fatalf("silent mail seeded %d seen keys, want 5: %v", n, w.seen.Keys())
 	}
 	w2 := mk()
-	if err := w2.mail(false); err != nil {
+	if err := w2.mail(context.Background(), false); err != nil {
 		t.Fatal(err)
 	}
 	mails := linesWith(&buf, "MAIL")
@@ -223,7 +223,7 @@ func TestMailFieldOmission(t *testing.T) {
 	}
 	w.zele = fakeZele(nil, []byte(doc), nil)
 	w.now = time.Now
-	if err := w.mail(false); err != nil {
+	if err := w.mail(context.Background(), false); err != nil {
 		t.Fatal(err)
 	}
 	mails := linesWith(&buf, "MAIL")
@@ -266,9 +266,9 @@ func TestZeleFailureLogs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	w.zele = func(args []string) zeleResult { return zeleResult{code: 2, stderr: long} }
+	w.zele = func(_ context.Context, args []string) zeleResult { return zeleResult{code: 2, stderr: long} }
 	w.now = time.Now
-	if err := w.calendar(); err != nil {
+	if err := w.calendar(context.Background()); err != nil {
 		t.Fatalf("calendar returned %v, want nil (zele failure is logged, not an error)", err)
 	}
 	logs := linesWith(&buf, "LOG")
@@ -299,7 +299,7 @@ func TestOnceReadOnly(t *testing.T) {
 	}
 	w.zele = fakeZele(fixture(t, "cal.yaml"), fixture(t, "mail.yaml"), nil)
 	w.now = func() time.Time { return time.Date(2026, 10, 3, 19, 0, 0, 0, time.Local) }
-	w.once()
+	w.once(context.Background())
 	if cals := len(linesWith(&buf, "CAL")); cals != 3 {
 		t.Fatalf("CAL lines = %d, want 3 (seeded key deduped):\n%s", cals, buf.String())
 	}
@@ -332,7 +332,7 @@ func TestOnceFamilyNoMail(t *testing.T) {
 	}
 	w.zele = fakeZele(fixture(t, "cal.yaml"), fixture(t, "mail.yaml"), &calls)
 	w.now = func() time.Time { return time.Date(2026, 10, 3, 19, 0, 0, 0, time.Local) }
-	w.once()
+	w.once(context.Background())
 	if cals := len(linesWith(&buf, "CAL")); cals != 4 {
 		t.Fatalf("CAL lines = %d, want 4:\n%s", cals, buf.String())
 	}
@@ -431,7 +431,7 @@ func TestLoopZeleParseErrorSkipsIteration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	w.zele = func(args []string) zeleResult {
+	w.zele = func(_ context.Context, args []string) zeleResult {
 		if args[0] == "cal" {
 			return zeleResult{stdout: "summary: x\nitems: [1, 2\n"}
 		}
@@ -494,7 +494,7 @@ items:
 	}
 	w.zele = fakeZele(doc, nil, nil)
 	w.now = func() time.Time { return time.Date(2026, 10, 6, 9, 10, 0, 0, loc) }
-	if err := w.calendar(); err != nil {
+	if err := w.calendar(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if cals := len(linesWith(&buf, "CAL")); cals != 3 {
@@ -548,7 +548,7 @@ func TestCalendarFilter(t *testing.T) {
 		}
 		w.zele = fakeZele(cal, nil, nil)
 		w.now = func() time.Time { return time.Date(2026, 10, 3, 19, 0, 0, 0, time.Local) }
-		if err := w.calendar(); err != nil {
+		if err := w.calendar(context.Background()); err != nil {
 			t.Fatal(err)
 		}
 		cals := linesWith(&buf, "CAL")
@@ -596,7 +596,7 @@ func TestSourcesMetadata(t *testing.T) {
 // that text.
 func TestZeleMissingBinaryLogsLikeBun(t *testing.T) {
 	t.Setenv("PATH", t.TempDir())
-	r := zeleExec(calArgs)
+	r := zeleExec(context.Background(), calArgs)
 	if r.code != 127 {
 		t.Errorf("exit code = %d, want 127", r.code)
 	}
