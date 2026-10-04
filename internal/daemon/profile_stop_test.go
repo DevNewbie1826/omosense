@@ -35,7 +35,7 @@ func sendProfileStop(t *testing.T, s *server, profile string) (net.Conn, *framer
 	}
 	t.Cleanup(func() { conn.Close() })
 	conn.SetDeadline(time.Now().Add(30 * time.Second))
-	if err := writeFrame(conn, map[string]string{"cmd": "stop", "profile": profile}); err != nil {
+	if err := writeFrame(conn, map[string]string{"cmd": "stop-profile", "profile": profile}); err != nil {
 		t.Fatal(err)
 	}
 	return conn, newFramer(conn)
@@ -499,7 +499,7 @@ func TestProfileStopDeadlinesAndTimeoutPersistStopped(t *testing.T) {
 				defer serverConn.Close()
 				defer peer.Close()
 				var cmd command
-				if err := json.Unmarshal([]byte(`{"cmd":"stop","profile":"family"}`), &cmd); err != nil {
+				if err := json.Unmarshal([]byte(`{"cmd":"stop-profile","profile":"family"}`), &cmd); err != nil {
 					t.Fatal(err)
 				}
 				controlled := make(chan struct{})
