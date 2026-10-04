@@ -64,8 +64,9 @@ var selections = map[string][]string{
 	"google": {"google"},
 	"remind": {"remind"},
 	"herdr":  {"herdr"},
+	"rpc":    {"rpc"},
 	"tidy":   {"tidy"},
-	"all":    {"telegram", "discord", "google", "remind", "herdr", "tidy"},
+	"all":    {"telegram", "discord", "google", "remind", "herdr", "rpc", "tidy"},
 }
 
 func parseAttach(args []string, version string) (hello, error) {

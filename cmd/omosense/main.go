@@ -16,6 +16,7 @@ import (
 	"github.com/DevNewbie1826/omosense/internal/herdr"
 	"github.com/DevNewbie1826/omosense/internal/listen"
 	"github.com/DevNewbie1826/omosense/internal/remind"
+	"github.com/DevNewbie1826/omosense/internal/rpc"
 	"github.com/DevNewbie1826/omosense/internal/say"
 	"github.com/DevNewbie1826/omosense/internal/tidy"
 )
@@ -48,7 +49,7 @@ func run(args []string) int {
 			return 0
 		}
 		return daemon.RunAttach(rest)
-	case "listen", "google", "remind", "herdr", "tidy", "say":
+	case "listen", "google", "remind", "herdr", "rpc", "tidy", "say":
 		if hasHelp(rest) {
 			fmt.Print(subHelp(sub))
 			return 0
@@ -76,6 +77,8 @@ func run(args []string) int {
 			return remind.Run(ctx, rest)
 		case "herdr":
 			return herdr.Run(ctx, rest)
+		case "rpc":
+			return rpc.Run(ctx, rest)
 		case "tidy":
 			return tidy.Run(ctx, rest)
 		default:
@@ -106,6 +109,8 @@ func subHelp(sub string) string {
 		return remind.Help
 	case "herdr":
 		return herdr.Help
+	case "rpc":
+		return rpc.Help
 	case "tidy":
 		return tidy.Help
 	default:
@@ -121,6 +126,7 @@ Subcommands:
   google    calendar and mail watcher (CAL, SOON, MAIL)
   remind    reminder scheduler (REMIND)
   herdr     herdr pane watcher (HERDR)
+  rpc       webchat rpc.sock session watcher (RPC)
   tidy      memory tidy watcher (TIDY)
   say       outbound message sender
   daemon    resident daemon hosting all sources

@@ -44,6 +44,7 @@ func TestRegistryProfiles(t *testing.T) {
 		{"google", []string{"CAL", "SOON", "MAIL"}, false, "watch-google-main", "watch-google"},
 		{"remind", []string{"REMIND"}, true, "remind-main", "remind"},
 		{"herdr", []string{"HERDR"}, false, "watch-herdr-main", ""},
+		{"rpc", []string{"RPC"}, false, "watch-rpc-main", ""},
 		{"tidy", []string{"TIDY"}, false, "memory-tidy-main", ""},
 	}
 	familyWant := []sourceExpect{
