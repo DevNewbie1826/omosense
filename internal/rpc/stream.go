@@ -281,7 +281,7 @@ func (w *watcher) resolveLookups(ctx context.Context, match func(string) bool, l
 				old.active, old.pollArmed, old.streamSeq = false, false, w.streamSeq
 				w.seen[turn.info.id()] = old
 			}
-			turn.info = info
+			turn.info, turn.seq = info, w.streamSeq
 		}
 		turn.lookup = ""
 		w.turns[handle] = turn

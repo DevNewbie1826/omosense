@@ -88,6 +88,7 @@ A snapshot never arms, concludes, re-statuses or erases a record that a stream i
 | I1d, I2 | `seq := w.streamSeq` before the I/O, then the `prev.streamSeq <= seq` guard |
 | I3a | `applyStream` `agent_start` (`streamTurn.seq`) and `resolveLookups`; `poll` does nothing to bindings while `w.streamUp && !reconcile` |
 | I3b | `poll`: `rebind` for listed handles when `reconcile \|\| !w.streamUp` and the binding is not newer than the request; the list loop removes another identity's binding; the entries loop binds a non-idle observation and removes on idle |
+| I3b (lookup) | `resolveLookups`: the lookup response that sets `turn.info` re-stamps `turn.seq` with its stream position, as `agent_start` does, so a poll requested before that response does not observe the handle (`TestStreamLookupBindingSurvivesOlderPoll`) |
 | I3c | `poll` touches bindings only for listed handles |
 | I3d | `settleStream`, `closeStream` |
 | I4 | `conclude`, `finishStream`, `poll`'s conclude condition |

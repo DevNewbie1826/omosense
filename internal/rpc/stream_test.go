@@ -854,6 +854,52 @@ func TestStreamStaleOutagePollKeepsBinding(t *testing.T) {
 	h.done(t, "A")
 }
 
+func TestStreamLookupBindingSurvivesOlderPoll(t *testing.T) {
+	q := newStreamFIFO()
+	lookup, err := json.Marshal(map[string]any{"sessions": []map[string]any{session("H", "A")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Server barrier: the poll's list predates H's durable assignment. While
+	// its snapshot is in flight, the start's FIFO lookup observes durable A,
+	// then the connection ends.
+	older := tickFor("H", "", "working")
+	older.beforeState = func() {
+		q.append(streamItem{frame: streamFrame{Type: "response", ID: "l1", Success: true, Data: lookup}})
+		q.append(streamItem{err: io.EOF})
+	}
+	h := newStreamHarness(t, tickFor("H", "", "idle"), older, scriptTick{})
+	store := newPendingStore(h.w.stateDir, h.w.profile)
+	record := h.w.record
+	h.w.record = func(id string, ev rpcEvent) {
+		record(id, ev)
+		if _, err := store.Record(id, ev); err != nil {
+			t.Error(err)
+		}
+	}
+	// Given H's start, without a durable id, applied before a poll's request.
+	h.w.tick(context.Background())
+	h.connected()
+	h.frame("agent_start", "H")
+	h.w.queue = q
+	// When the start's lookup binds A during that poll's I/O, and A settles
+	// on the new connection, then leaves before its reconciliation list is
+	// served.
+	h.w.tick(context.Background())
+	q.append(streamItem{up: true})
+	q.append(streamItem{frame: streamFrame{Type: "agent_settled", Session: "H"}})
+	h.w.drainStream(context.Background())
+	// Then the older poll did not discard the lookup's newer binding.
+	entries, err := store.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].ID != "A" || entries[0].Seq != 1 || entries[0].Count != 1 {
+		t.Errorf("pending entries = %+v, want A seq 1 count 1", entries)
+	}
+	h.done(t, "A")
+}
+
 func awaitStream[T any](t *testing.T, ch <-chan T) T {
 	t.Helper()
 	select {
