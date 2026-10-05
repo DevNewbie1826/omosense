@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -61,6 +62,13 @@ func (q *streamFIFO) detach() []streamItem {
 	q.items = nil
 	q.mu.Unlock()
 	return items
+}
+
+// requeue returns unapplied items to the head of the queue, in order.
+func (q *streamFIFO) requeue(items []streamItem) {
+	q.mu.Lock()
+	q.items = slices.Concat(items, q.items)
+	q.mu.Unlock()
 }
 
 func (w *watcher) streamLoop(ctx context.Context, q *streamFIFO) {
@@ -169,7 +177,12 @@ func (w *watcher) drainStream(ctx context.Context) {
 		if len(items) == 0 || ctx.Err() != nil {
 			return
 		}
-		for _, item := range items {
+		for i, item := range items {
+			if item.up && w.snapshotHeld {
+				// The waiting older snapshot applies before this connect.
+				w.queue.requeue(items[i:])
+				return
+			}
 			w.applyStream(ctx, item)
 		}
 	}
@@ -181,11 +194,9 @@ func (w *watcher) applyStream(ctx context.Context, item streamItem) {
 		w.streamEpoch++
 		w.streamUp = true
 		w.sink.Log("rpc stream connected")
-		if w.snapshotHeld {
-			w.upHeld = true
-		} else {
-			w.poll(ctx, true)
-		}
+		// Run inside the drain, the reconciliation applies its snapshot and
+		// turn bindings before any later record of this connection.
+		w.poll(ctx, true)
 	case item.err != nil:
 		w.streamUp = false
 		msg := item.err.Error()
@@ -215,16 +226,6 @@ func (w *watcher) applyStream(ctx context.Context, item streamItem) {
 		case "session_closed", "session_parked":
 			w.closeStream(f.Session)
 		}
-	}
-}
-
-// reconcileHeld runs the reconciliation of a connect that was drained while
-// an older snapshot waited, once that snapshot has been applied.
-func (w *watcher) reconcileHeld(ctx context.Context) {
-	held := w.upHeld
-	w.upHeld = false
-	if held && ctx.Err() == nil {
-		w.poll(ctx, true)
 	}
 }
 

@@ -46,7 +46,7 @@ type watcher struct {
 	deferred                  map[string][]deferredDone
 	streamErrors              map[string]bool
 	streamUp, draining        bool
-	snapshotHeld, upHeld      bool
+	snapshotHeld              bool
 	streamEpoch               int
 	streamSeq                 uint64
 	queue                     *streamFIFO
@@ -154,13 +154,13 @@ func (w *watcher) poll(ctx context.Context, reconcile bool) {
 	w.expireDeferred()
 	seq := w.streamSeq
 	list, entries, healthy, err := w.snapshot(ctx, false)
-	// A connect drained while this older snapshot waits reconciles only after
-	// it is applied: snapshots apply in the order they were taken, so this one
-	// neither re-arms what the reconciliation concludes nor is dropped.
+	// Records read during the I/O apply first, up to a connect. This snapshot
+	// was requested before that connect, so it applies before it; the
+	// connect's reconciliation and every later record follow, in order.
 	w.snapshotHeld = true
 	w.drainStream(ctx)
 	w.snapshotHeld = false
-	defer w.reconcileHeld(ctx)
+	defer w.drainStream(ctx)
 	if ctx.Err() != nil {
 		return
 	}
@@ -169,6 +169,10 @@ func (w *watcher) poll(ctx context.Context, reconcile bool) {
 		return
 	}
 	w.refreshHandles(list)
+	if reconcile {
+		// Turn bindings of ended connections give way to this snapshot.
+		w.turns = map[string]streamTurn{}
+	}
 	listed := make(map[string]bool, len(list))
 	present := make(map[string]bool, len(list))
 	for _, s := range list {
@@ -209,10 +213,10 @@ func (w *watcher) poll(ctx context.Context, reconcile bool) {
 			if status == "working" && !next.active && (!w.streamUp || reconcile || (e.state.Compacting && !e.state.Streaming)) {
 				next.active, next.activeEpoch = true, w.streamEpoch
 				next.pollArmed = w.streamUp && e.state.Compacting && !e.state.Streaming
-				if reconcile {
-					// Bindings seen here belong to ended connections.
-					w.turns[e.info.Session] = streamTurn{info: e.info}
-				}
+			}
+			if reconcile && status == "working" {
+				// Bound even when a poll armed it during the outage.
+				w.turns[e.info.Session] = streamTurn{info: e.info}
 			}
 			next.status = status
 		}

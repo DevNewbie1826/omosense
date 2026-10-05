@@ -407,11 +407,19 @@ func TestStreamStaleListDeferral(t *testing.T) {
 }
 
 func TestStreamReconciliationIdentity(t *testing.T) {
-	h := newStreamHarness(t, tickFor("H", "A", "working"))
-	h.w.applyStream(context.Background(), streamItem{up: true})
-	h.list("s0", session("H", "B"))
-	h.frame("agent_settled", "H")
-	h.done(t, "A")
+	for _, outage := range []bool{false, true} {
+		t.Run(fmt.Sprint(outage), func(t *testing.T) {
+			h := newStreamHarness(t, tickFor("H", "A", "working"))
+			if outage {
+				// A poll armed the turn while the stream was down.
+				h.w.tick(context.Background())
+			}
+			h.w.applyStream(context.Background(), streamItem{up: true})
+			h.list("s0", session("H", "B"))
+			h.frame("agent_settled", "H")
+			h.done(t, "A")
+		})
+	}
 }
 
 func TestStreamReconciliationOnce(t *testing.T) {
@@ -547,6 +555,90 @@ func TestStreamFlappingPollFallback(t *testing.T) {
 		t.Errorf("pending entries = %+v, want D7 seq 1 count 1", entries)
 	}
 	h.done(t, "D7")
+}
+
+func TestStreamHeldReconciliationRebindsTurn(t *testing.T) {
+	q := newStreamFIFO()
+	// Server barriers: the reconnect is queued while an ordinary poll's
+	// working snapshot is in flight, and B's settle while the
+	// reconciliation's working snapshot is in flight.
+	outer := tickFor("H", "B", "working")
+	outer.beforeState = func() {
+		q.append(streamItem{up: true})
+	}
+	reconcile := tickFor("H", "B", "working")
+	reconcile.beforeState = func() {
+		q.append(streamItem{frame: streamFrame{Type: "agent_settled", Session: "H"}})
+	}
+	h := newStreamHarness(t, tickFor("H", "A", "idle"), outer, reconcile, tickFor("H", "B", "idle"))
+	store := newPendingStore(h.w.stateDir, h.w.profile)
+	record := h.w.record
+	h.w.record = func(id string, ev rpcEvent) {
+		record(id, ev)
+		if _, err := store.Record(id, ev); err != nil {
+			t.Error(err)
+		}
+	}
+	h.w.queue = q
+	// Given A's turn bound on a connection that ended before A settled.
+	h.w.tick(context.Background())
+	h.connected()
+	h.frame("agent_start", "H")
+	h.list("l1", session("H", "A"))
+	h.w.applyStream(context.Background(), streamItem{err: io.EOF})
+	// When H runs B at the reconnect and B settles during the
+	// reconciliation's snapshot I/O.
+	h.w.tick(context.Background())
+	h.w.tick(context.Background())
+	// Then the settle is attributed to B, bound by the reconciliation.
+	entries, err := store.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].ID != "B" || entries[0].Seq != 1 || entries[0].Count != 1 {
+		t.Errorf("pending entries = %+v, want B seq 1 count 1", entries)
+	}
+	h.done(t, "B")
+}
+
+func TestStreamReconciliationDropsEndedTurn(t *testing.T) {
+	q := newStreamFIFO()
+	// Server barrier: the reconnect and B's settle are queued while an
+	// ordinary poll's working snapshot is in flight.
+	outer := tickFor("H", "B", "working")
+	outer.beforeState = func() {
+		q.append(streamItem{up: true})
+		q.append(streamItem{frame: streamFrame{Type: "agent_settled", Session: "H"}})
+	}
+	h := newStreamHarness(t, tickFor("H", "A", "idle"), outer, tickFor("H", "B", "idle"))
+	store := newPendingStore(h.w.stateDir, h.w.profile)
+	record := h.w.record
+	h.w.record = func(id string, ev rpcEvent) {
+		record(id, ev)
+		if _, err := store.Record(id, ev); err != nil {
+			t.Error(err)
+		}
+	}
+	h.w.queue = q
+	// Given A's turn bound on a connection that ended before A settled.
+	h.w.tick(context.Background())
+	h.connected()
+	h.frame("agent_start", "H")
+	h.list("l1", session("H", "A"))
+	h.w.applyStream(context.Background(), streamItem{err: io.EOF})
+	// When H runs B and B settles right after the reconnect, so the
+	// reconciliation sees B idle.
+	h.w.tick(context.Background())
+	h.w.tick(context.Background())
+	// Then B is reported once, and A's ended binding takes no settle.
+	entries, err := store.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].ID != "B" || entries[0].Seq != 1 || entries[0].Count != 1 {
+		t.Errorf("pending entries = %+v, want B seq 1 count 1", entries)
+	}
+	h.done(t, "B")
 }
 
 func awaitStream[T any](t *testing.T, ch <-chan T) T {
