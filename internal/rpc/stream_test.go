@@ -759,21 +759,32 @@ func TestStreamOverflow(t *testing.T) {
 		t.Fatal(err)
 	}
 	b.Close()
-	// Drive actual owner wakes, not a poll or sleep. The second dial observes
-	// completion only after streamDown's acknowledgment releases the reader.
-drive:
+	// The owner stays wedged until the reader queues streamDown: a pipe write
+	// returns once the reader buffered its bytes, not once it queued their
+	// items, and an earlier drain would keep the FIFO under the bound. Every
+	// append after a consumed wake re-arms it, so this cannot miss streamDown.
+wedged:
 	for {
 		select {
 		case <-q.wake:
-			h.w.drainStream(ctx)
-		case count := <-reconnecting:
-			if count != 1 {
-				t.Fatalf("reconnect overtook queued completion: count=%d", count)
+			q.mu.Lock()
+			n := len(q.items)
+			down := n > 0 && q.items[n-1].err != nil
+			q.mu.Unlock()
+			if down {
+				break wedged
 			}
-			break drive
+		case count := <-reconnecting:
+			t.Fatalf("reconnect overtook queued completion: count=%d", count)
 		case <-time.After(5 * time.Second):
-			t.Fatal("overflow did not reconnect")
+			t.Fatal("reader did not queue streamDown")
 		}
+	}
+	// The second dial observes completion only after streamDown's
+	// acknowledgment releases the reader.
+	h.w.drainStream(ctx)
+	if count := awaitStream(t, reconnecting); count != 1 {
+		t.Fatalf("reconnect overtook queued completion: count=%d", count)
 	}
 	h.done(t, "D7")
 	text := h.out.String()
