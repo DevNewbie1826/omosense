@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -19,10 +20,11 @@ import (
 )
 
 type scriptTick struct {
-	sessions []map[string]any
-	states   map[string]any
-	err      string
-	drop     bool
+	sessions    []map[string]any
+	states      map[string]any
+	err         string
+	drop        bool
+	beforeState func()
 }
 
 type fakeRPC struct {
@@ -34,7 +36,7 @@ type fakeRPC struct {
 	done     chan struct{}
 }
 
-// Each accepted connection is one tick. Responses include an unsolicited
+// Each non-observe connection is one tick. Responses include an unsolicited
 // record and an unrelated response, proving correlation at the wire boundary.
 func serveRPC(t *testing.T, path string, ticks []scriptTick) *fakeRPC {
 	t.Helper()
@@ -43,6 +45,14 @@ func serveRPC(t *testing.T, path string, ticks []scriptTick) *fakeRPC {
 		t.Fatal(err)
 	}
 	f := &fakeRPC{listener: ln, path: path, done: make(chan struct{})}
+	// Legacy poll tests keep the stream unavailable. A cancellable pending dial
+	// avoids sharing their finite synchronous sleep scripts with reconnects.
+	oldStreamDial := streamDialFn
+	streamDialFn = func(ctx context.Context, _ string) (*client, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	t.Cleanup(func() { streamDialFn = oldStreamDial })
 	go func() {
 		defer close(f.done)
 		n := 0
@@ -55,15 +65,22 @@ func serveRPC(t *testing.T, path string, ticks []scriptTick) *fakeRPC {
 			f.conn = conn
 			f.mu.Unlock()
 			scan := bufio.NewScanner(conn)
+			first := true
 			for scan.Scan() {
 				var req struct {
 					ID      string `json:"id"`
 					Type    string `json:"type"`
 					Session string `json:"sessionId"`
+					Observe bool   `json:"observe"`
 				}
 				if err := json.Unmarshal(scan.Bytes(), &req); err != nil {
 					return
 				}
+				if first && req.Type == "list_sessions" && req.Observe {
+					// Unavailable stream: never consume or count a tick script.
+					break
+				}
+				first = false
 				f.mu.Lock()
 				f.calls = append(f.calls, req.Type+" "+req.Session)
 				f.mu.Unlock()
@@ -89,6 +106,9 @@ func serveRPC(t *testing.T, path string, ticks []scriptTick) *fakeRPC {
 						conn.Close()
 						continue
 					}
+					if ticks[i].beforeState != nil {
+						ticks[i].beforeState()
+					}
 					data = ticks[i].states[req.Session]
 					if s, ok := data.(string); ok {
 						failure = s
@@ -107,6 +127,9 @@ func serveRPC(t *testing.T, path string, ticks []scriptTick) *fakeRPC {
 				if enc.Encode(map[string]any{"type": "response", "id": req.ID, "command": req.Type, "success": failure == "", "error": failure, "data": data}) != nil {
 					break
 				}
+			}
+			if err := scan.Err(); err != nil && !errors.Is(err, net.ErrClosed) {
+				t.Errorf("fake RPC scan: %v", err)
 			}
 			conn.Close()
 			f.mu.Lock()
