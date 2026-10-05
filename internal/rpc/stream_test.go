@@ -424,6 +424,42 @@ func TestStreamReconciliationOnce(t *testing.T) {
 	h.done(t, "D7")
 }
 
+func TestStreamNestedReconciliation(t *testing.T) {
+	q := newStreamFIFO()
+	outer := tickFor("H", "D7", "working")
+	// Server barrier: connect and disconnect are queued while the outer
+	// poll's working snapshot is in flight, so its drain reconciles first.
+	outer.beforeState = func() {
+		q.append(streamItem{up: true})
+		q.append(streamItem{err: io.EOF})
+	}
+	h := newStreamHarness(t, tickFor("H", "D7", "working"), outer, tickFor("H", "D7", "idle"))
+	store := newPendingStore(h.w.stateDir, h.w.profile)
+	record := h.w.record
+	h.w.record = func(id string, ev rpcEvent) {
+		record(id, ev)
+		if _, err := store.Record(id, ev); err != nil {
+			t.Error(err)
+		}
+	}
+	h.w.queue = q
+	// Given D7 armed by a poll while the stream is down.
+	h.w.tick(context.Background())
+	// When reconciliation concludes it inside the outer poll's drain, and
+	// the next poll sees idle.
+	h.w.tick(context.Background())
+	h.w.tick(context.Background())
+	// Then the older working snapshot cannot re-arm the completed turn.
+	entries, err := store.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Seq != 1 || entries[0].Count != 1 {
+		t.Errorf("pending entries = %+v, want D7 seq 1 count 1", entries)
+	}
+	h.done(t, "D7")
+}
+
 func awaitStream[T any](t *testing.T, ch <-chan T) T {
 	t.Helper()
 	select {

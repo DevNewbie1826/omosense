@@ -151,10 +151,12 @@ func (w *watcher) tick(ctx context.Context) {
 func (w *watcher) poll(ctx context.Context, reconcile bool) {
 	w.drainStream(ctx)
 	w.expireDeferred()
-	seq := w.streamSeq
+	seq, epoch := w.streamSeq, w.streamEpoch
 	list, entries, healthy, err := w.snapshot(ctx, false)
 	w.drainStream(ctx)
-	if ctx.Err() != nil {
+	// A connect drained here already ran its reconciliation with a newer
+	// snapshot; this older one must not re-arm what that concluded.
+	if ctx.Err() != nil || w.streamEpoch != epoch {
 		return
 	}
 	if err != nil {
