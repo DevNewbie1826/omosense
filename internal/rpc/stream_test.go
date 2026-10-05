@@ -675,6 +675,185 @@ func TestStreamReconnectRemovedKnownTurn(t *testing.T) {
 	h.done(t, "A")
 }
 
+func TestStreamOutageReplacementRemoved(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		before string   // H's identity before the outage
+		start  bool     // a turn of that identity was bound on the ended connection
+		outage []string // B's status at each outage poll
+	}{
+		{"bound A, B seen working", "A", true, []string{"working"}},
+		{"bound A, B seen idle then working", "A", true, []string{"idle", "working"}},
+		{"unbound B seen working", "B", false, []string{"working"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ticks := []scriptTick{tickFor("H", tc.before, "idle")}
+			for _, status := range tc.outage {
+				ticks = append(ticks, tickFor("H", "B", status))
+			}
+			h := newStreamHarness(t, append(ticks, scriptTick{})...)
+			store := newPendingStore(h.w.stateDir, h.w.profile)
+			record := h.w.record
+			h.w.record = func(id string, ev rpcEvent) {
+				record(id, ev)
+				if _, err := store.Record(id, ev); err != nil {
+					t.Error(err)
+				}
+			}
+			// Given a connection that ended, with or without a bound turn.
+			h.w.tick(context.Background())
+			h.connected()
+			if tc.start {
+				h.frame("agent_start", "H")
+				h.list("l1", session("H", tc.before))
+			}
+			h.w.applyStream(context.Background(), streamItem{err: io.EOF})
+			// When outage polls see B behind H, and B settles on the new
+			// connection, then leaves before its reconciliation list is served.
+			for range tc.outage {
+				h.w.tick(context.Background())
+			}
+			h.w.queue = newStreamFIFO()
+			h.w.queue.append(streamItem{up: true})
+			h.w.queue.append(streamItem{frame: streamFrame{Type: "agent_settled", Session: "H"}})
+			h.w.drainStream(context.Background())
+			// Then B's completion is attributed to B, once.
+			entries, err := store.List()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != 1 || entries[0].ID != "B" || entries[0].Seq != 1 || entries[0].Count != 1 {
+				t.Errorf("pending entries = %+v, want B seq 1 count 1", entries)
+			}
+			h.done(t, "B")
+		})
+	}
+}
+
+func TestStreamOutagePollKeepsKnownTurn(t *testing.T) {
+	for _, status := range []string{"working", "blocked"} {
+		t.Run(status, func(t *testing.T) {
+			h := newStreamHarness(t, tickFor("H", "A", "idle"), tickFor("H", "A", status), scriptTick{})
+			store := newPendingStore(h.w.stateDir, h.w.profile)
+			record := h.w.record
+			h.w.record = func(id string, ev rpcEvent) {
+				record(id, ev)
+				if _, err := store.Record(id, ev); err != nil {
+					t.Error(err)
+				}
+			}
+			// Given A's turn bound on a connection that ended, and an outage
+			// poll that still sees that turn in progress.
+			h.w.tick(context.Background())
+			h.connected()
+			h.frame("agent_start", "H")
+			h.list("l1", session("H", "A"))
+			h.w.applyStream(context.Background(), streamItem{err: io.EOF})
+			h.w.tick(context.Background())
+			// When A settles on the new connection, then leaves before its
+			// reconciliation list is served.
+			h.w.queue = newStreamFIFO()
+			h.w.queue.append(streamItem{up: true})
+			h.w.queue.append(streamItem{frame: streamFrame{Type: "agent_settled", Session: "H"}})
+			h.w.drainStream(context.Background())
+			// Then the known turn's completion is still recorded once.
+			entries, err := store.List()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != 1 || entries[0].ID != "A" || entries[0].Seq != 1 || entries[0].Count != 1 {
+				t.Errorf("pending entries = %+v, want A seq 1 count 1", entries)
+			}
+			h.done(t, "A")
+		})
+	}
+}
+
+func TestStreamReconciliationBindsBeforeLaterSettle(t *testing.T) {
+	q := newStreamFIFO()
+	// Server barrier: B's settle is queued while the reconciliation's B/working
+	// snapshot is in flight, and no outage poll saw B before the reconnect.
+	reconcile := tickFor("H", "B", "working")
+	reconcile.beforeState = func() {
+		q.append(streamItem{frame: streamFrame{Type: "agent_settled", Session: "H"}})
+	}
+	h := newStreamHarness(t, tickFor("H", "A", "idle"), reconcile, tickFor("H", "B", "idle"))
+	store := newPendingStore(h.w.stateDir, h.w.profile)
+	record := h.w.record
+	h.w.record = func(id string, ev rpcEvent) {
+		record(id, ev)
+		if _, err := store.Record(id, ev); err != nil {
+			t.Error(err)
+		}
+	}
+	// Given A's turn bound on a connection that ended before A settled.
+	h.w.tick(context.Background())
+	h.connected()
+	h.frame("agent_start", "H")
+	h.list("l1", session("H", "A"))
+	h.w.applyStream(context.Background(), streamItem{err: io.EOF})
+	// When H runs B at the reconnect and B settles during the
+	// reconciliation's snapshot I/O.
+	h.w.queue = q
+	q.append(streamItem{up: true})
+	h.w.drainStream(context.Background())
+	h.w.tick(context.Background())
+	// Then the reconciliation bound B before the settle was consumed.
+	entries, err := store.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].ID != "B" || entries[0].Seq != 1 || entries[0].Count != 1 {
+		t.Errorf("pending entries = %+v, want B seq 1 count 1", entries)
+	}
+	h.done(t, "B")
+}
+
+func TestStreamStaleOutagePollKeepsBinding(t *testing.T) {
+	q := newStreamFIFO()
+	// Server barrier: while a poll's H=Z snapshot is in flight, H's next turn
+	// starts as A (Z was replaced) and the connection ends.
+	stale := tickFor("H", "Z", "idle")
+	stale.beforeState = func() {
+		data, err := json.Marshal(map[string]any{"sessions": []map[string]any{session("H", "A")}})
+		if err != nil {
+			panic(err)
+		}
+		q.append(streamItem{frame: streamFrame{Type: "agent_start", Session: "H"}, lookup: "l1"})
+		q.append(streamItem{frame: streamFrame{Type: "response", ID: "l1", Success: true, Data: data}})
+		q.append(streamItem{err: io.EOF})
+	}
+	h := newStreamHarness(t, tickFor("H", "Z", "idle"), stale, scriptTick{})
+	store := newPendingStore(h.w.stateDir, h.w.profile)
+	record := h.w.record
+	h.w.record = func(id string, ev rpcEvent) {
+		record(id, ev)
+		if _, err := store.Record(id, ev); err != nil {
+			t.Error(err)
+		}
+	}
+	h.w.queue = q
+	// Given a poll requested before A's start, applied after that connection
+	// ended.
+	h.w.tick(context.Background())
+	h.connected()
+	h.w.tick(context.Background())
+	// When A settles on the new connection, then leaves before its
+	// reconciliation list is served.
+	q.append(streamItem{up: true})
+	q.append(streamItem{frame: streamFrame{Type: "agent_settled", Session: "H"}})
+	h.w.drainStream(context.Background())
+	// Then the older poll did not discard A's newer binding.
+	entries, err := store.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].ID != "A" || entries[0].Seq != 1 || entries[0].Count != 1 {
+		t.Errorf("pending entries = %+v, want A seq 1 count 1", entries)
+	}
+	h.done(t, "A")
+}
+
 func awaitStream[T any](t *testing.T, ch <-chan T) T {
 	t.Helper()
 	select {

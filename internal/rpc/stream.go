@@ -159,6 +159,7 @@ type streamTurn struct {
 	info    sessionInfo
 	lookup  string
 	settled bool
+	seq     uint64 // stream position or poll request that bound the turn
 }
 
 type deferredDone struct {
@@ -216,7 +217,7 @@ func (w *watcher) applyStream(ctx context.Context, item streamItem) {
 		case "response":
 			w.streamList(ctx, f)
 		case "agent_start":
-			turn := streamTurn{info: w.handles[f.Session], lookup: item.lookup}
+			turn := streamTurn{info: w.handles[f.Session], lookup: item.lookup, seq: w.streamSeq}
 			w.turns[f.Session] = turn
 			w.armStream(turn.info)
 		case "agent_settled":

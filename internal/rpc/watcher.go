@@ -149,10 +149,11 @@ func (w *watcher) tick(ctx context.Context) {
 	w.poll(ctx, false)
 }
 
-// poll applies one snapshot under the watcher's ordering rule: every
-// observation applies once, in arrival order, and replaces only the state of
-// the keys it observes, when it is newer than what set that state. A list's
-// silence about a handle never discards a known turn's completion.
+// poll applies one snapshot under the watcher's ordering rule (INVARIANTS.md):
+// every observation applies once, in arrival order, and replaces only the
+// state of the keys it observes, when it is newer than what set that state. A
+// list's silence about a handle never discards a known turn's completion, and
+// a live connection's stream owns every turn binding.
 func (w *watcher) poll(ctx context.Context, reconcile bool) {
 	w.drainStream(ctx)
 	w.expireDeferred()
@@ -173,17 +174,23 @@ func (w *watcher) poll(ctx context.Context, reconcile bool) {
 		return
 	}
 	w.refreshHandles(list)
+	// With no live connection owning the bindings (a reconciliation, or the
+	// stream down), this list is the newest observation of each handle it
+	// shows, unless a stream item bound that handle after the request. A handle
+	// it omits keeps its binding for a settle queued after the connect.
+	rebind := map[string]bool{}
 	listed := make(map[string]bool, len(list))
 	present := make(map[string]bool, len(list))
 	for _, s := range list {
 		id := s.id()
 		present[id] = true
 		listed[id] = true
-		if reconcile {
-			// The newest observation of this handle replaces its binding from an
-			// ended connection; it is bound again below while working. A handle
-			// this list omits keeps its binding for a settle queued after the connect.
-			delete(w.turns, s.Session)
+		if turn, bound := w.turns[s.Session]; (reconcile || !w.streamUp) && (!bound || turn.seq <= seq) {
+			rebind[s.Session] = true
+			if bound && turn.info.id() != id {
+				// The host never replaces a session mid-turn: that turn ended.
+				delete(w.turns, s.Session)
+			}
 		}
 	}
 	seen := make(map[string]record, len(entries))
@@ -220,9 +227,13 @@ func (w *watcher) poll(ctx context.Context, reconcile bool) {
 				next.active, next.activeEpoch = true, w.streamEpoch
 				next.pollArmed = w.streamUp && e.state.Compacting && !e.state.Streaming
 			}
-			if reconcile && status == "working" {
-				// Bound even when a poll armed it during the outage.
-				w.turns[e.info.Session] = streamTurn{info: e.info}
+			if rebind[e.info.Session] {
+				// A turn ends only at idle, so a blocked turn stays bound.
+				if status == "idle" {
+					delete(w.turns, e.info.Session)
+				} else {
+					w.turns[e.info.Session] = streamTurn{info: e.info, seq: seq}
+				}
 			}
 			next.status = status
 		}
