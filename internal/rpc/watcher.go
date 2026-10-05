@@ -149,6 +149,10 @@ func (w *watcher) tick(ctx context.Context) {
 	w.poll(ctx, false)
 }
 
+// poll applies one snapshot under the watcher's ordering rule: every
+// observation applies once, in arrival order, and replaces only the state of
+// the keys it observes, when it is newer than what set that state. A list's
+// silence about a handle never discards a known turn's completion.
 func (w *watcher) poll(ctx context.Context, reconcile bool) {
 	w.drainStream(ctx)
 	w.expireDeferred()
@@ -169,16 +173,18 @@ func (w *watcher) poll(ctx context.Context, reconcile bool) {
 		return
 	}
 	w.refreshHandles(list)
-	if reconcile {
-		// Turn bindings of ended connections give way to this snapshot.
-		w.turns = map[string]streamTurn{}
-	}
 	listed := make(map[string]bool, len(list))
 	present := make(map[string]bool, len(list))
 	for _, s := range list {
 		id := s.id()
 		present[id] = true
 		listed[id] = true
+		if reconcile {
+			// The newest observation of this handle replaces its binding from an
+			// ended connection; it is bound again below while working. A handle
+			// this list omits keeps its binding for a settle queued after the connect.
+			delete(w.turns, s.Session)
+		}
 	}
 	seen := make(map[string]record, len(entries))
 	for _, e := range entries {

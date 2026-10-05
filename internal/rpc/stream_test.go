@@ -641,6 +641,40 @@ func TestStreamReconciliationDropsEndedTurn(t *testing.T) {
 	h.done(t, "B")
 }
 
+func TestStreamReconnectRemovedKnownTurn(t *testing.T) {
+	h := newStreamHarness(t, tickFor("H", "A", "idle"), scriptTick{})
+	store := newPendingStore(h.w.stateDir, h.w.profile)
+	record := h.w.record
+	h.w.record = func(id string, ev rpcEvent) {
+		record(id, ev)
+		if _, err := store.Record(id, ev); err != nil {
+			t.Error(err)
+		}
+	}
+	// Given A's start and durable identity were observed before disconnect.
+	h.w.tick(context.Background())
+	h.connected()
+	h.frame("agent_start", "H")
+	h.list("l1", session("H", "A"))
+	h.w.applyStream(context.Background(), streamItem{err: io.EOF})
+	// When A settles on the new connection, then disappears before its
+	// reconciliation list is served. The owner receives both queued items
+	// before running that list, exactly as a busy owner may observe them.
+	h.w.queue = newStreamFIFO()
+	h.w.queue.append(streamItem{up: true})
+	h.w.queue.append(streamItem{frame: streamFrame{Type: "agent_settled", Session: "H"}})
+	h.w.drainStream(context.Background())
+	// Then the known turn's completion remains attributable and durable.
+	entries, err := store.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].ID != "A" || entries[0].Seq != 1 || entries[0].Count != 1 {
+		t.Errorf("pending entries = %+v, want A seq 1 count 1", entries)
+	}
+	h.done(t, "A")
+}
+
 func awaitStream[T any](t *testing.T, ch <-chan T) T {
 	t.Helper()
 	select {
