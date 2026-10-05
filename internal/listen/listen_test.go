@@ -103,6 +103,10 @@ func TestTelegramPollPersistsOffsetAndEventShape(t *testing.T) {
 	defer cancel()
 	requests := make(chan map[string]any, 2)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/botfake-test-token/getFile" {
+			fmt.Fprint(w, `{"ok":false,"description":"fixture unavailable"}`)
+			return
+		}
 		if r.Method != "POST" || r.URL.Path != "/botfake-test-token/getUpdates" || r.Header.Get("Content-Type") != "application/json" {
 			t.Errorf("unexpected wire request %s %s", r.Method, r.URL.Path)
 		}
@@ -113,7 +117,7 @@ func TestTelegramPollPersistsOffsetAndEventShape(t *testing.T) {
 		}
 		requests <- body
 		if body["offset"] == float64(41) {
-			fmt.Fprint(w, `{"ok":true,"result":[{"update_id":41,"message":{"message_id":7,"chat":{"id":9,"type":"private"},"text":"" ,"caption":"not text"}},{"update_id":42,"edited_message":{"message_id":8,"chat":{"id":9,"type":"supergroup"},"message_thread_id":2,"from":{"id":12,"username":"user"},"caption":"caption","forward_origin":{},"quote":{"text":"q"},"reply_to_message":{"message_id":6,"from":{"first_name":"missing username"},"caption":"reply"},"photo":[],"document":{}}},{"update_id":43,"stopped_message_generation":{"message_id":10}}]}`)
+			fmt.Fprint(w, `{"ok":true,"result":[{"update_id":41,"message":{"message_id":7,"chat":{"id":9,"type":"private"},"text":"" ,"caption":"not text"}},{"update_id":42,"edited_message":{"message_id":8,"chat":{"id":9,"type":"supergroup"},"message_thread_id":2,"from":{"id":12,"username":"user"},"caption":"caption","forward_origin":{},"quote":{"text":"q"},"reply_to_message":{"message_id":6,"from":{"first_name":"missing username"},"caption":"reply"},"photo":[{"file_id":"photo-id","file_unique_id":"unique-photo","width":640,"height":480,"file_size":12}],"document":{"file_id":"document-id","file_name":"report.PDF","mime_type":"application/pdf","file_size":24}}},{"update_id":43,"stopped_message_generation":{"message_id":10}}]}`)
 		} else {
 			<-ctx.Done()
 		}
@@ -157,7 +161,11 @@ func TestTelegramPollPersistsOffsetAndEventShape(t *testing.T) {
 		t.Fatalf("event got %#v want %#v", events["message"], want)
 	}
 	edit := events["edited"]
-	if edit["role"] != "owner" || edit["text"] != "caption" || edit["from"] != "user" || edit["from_id"] != float64(12) || edit["forwarded"] != true || edit["quote"] != "q" || edit["thread_id"] != float64(2) || !reflect.DeepEqual(edit["attachments"], []any{"photo", "document"}) {
+	wantAttachments := []any{
+		map[string]any{"kind": "photo", "file_id": "photo-id", "name": "tg-test-9-8.jpg", "type": "image/jpeg", "size": float64(12), "error": "getFile error fixture unavailable"},
+		map[string]any{"kind": "document", "file_id": "document-id", "name": "report.PDF", "type": "application/pdf", "size": float64(24), "error": "getFile error fixture unavailable"},
+	}
+	if edit["role"] != "owner" || edit["text"] != "caption" || edit["from"] != "user" || edit["from_id"] != float64(12) || edit["forwarded"] != true || edit["quote"] != "q" || edit["thread_id"] != float64(2) || !reflect.DeepEqual(edit["attachments"], wantAttachments) {
 		t.Fatal(edit)
 	}
 	reply := edit["reply_to"].(map[string]any)

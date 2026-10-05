@@ -13,6 +13,19 @@ type telegramUser struct {
 	Username  *string `json:"username"`
 	FirstName *string `json:"first_name"`
 }
+type telegramPhotoSize struct {
+	FileID       string `json:"file_id"`
+	FileUniqueID string `json:"file_unique_id"`
+	Width        int64  `json:"width"`
+	Height       int64  `json:"height"`
+	FileSize     int64  `json:"file_size"`
+}
+type telegramFile struct {
+	FileID   string `json:"file_id"`
+	FileName string `json:"file_name"`
+	MIMEType string `json:"mime_type"`
+	FileSize int64  `json:"file_size"`
+}
 type telegramMessage struct {
 	ID   int64 `json:"message_id"`
 	Chat struct {
@@ -27,14 +40,12 @@ type telegramMessage struct {
 	Quote   *struct {
 		Text *string `json:"text"`
 	} `json:"quote"`
-	Reply    *telegramMessage `json:"reply_to_message"`
-	Photo    json.RawMessage  `json:"photo"`
-	Document json.RawMessage  `json:"document"`
-	Video    json.RawMessage  `json:"video"`
-	Voice    *struct {
-		FileID string `json:"file_id"`
-	} `json:"voice"`
-	Audio     json.RawMessage `json:"audio"`
+	Reply     *telegramMessage    `json:"reply_to_message"`
+	Photo     []telegramPhotoSize `json:"photo"`
+	Document  *telegramFile       `json:"document"`
+	Video     *telegramFile       `json:"video"`
+	Voice     *telegramFile       `json:"voice"`
+	Audio     *telegramFile       `json:"audio"`
 	VideoNote *struct {
 		FileID string `json:"file_id"`
 	} `json:"video_note"`
@@ -74,7 +85,7 @@ func (s src) tgHandle(ctx context.Context, sink core.Sink, bot string, api teleg
 		}
 		return nil
 	}
-	ev := map[string]any{"platform": "telegram", "bot": bot, "kind": kind, "chat_id": m.Chat.ID, "chat_type": m.Chat.Type, "thread_id": m.Thread, "message_id": m.ID, "role": "other", "text": textOr(m.Text, m.Caption), "forwarded": present(m.Forward), "quote": nil, "reply_to": nil, "attachments": []string{}}
+	ev := map[string]any{"platform": "telegram", "bot": bot, "kind": kind, "chat_id": m.Chat.ID, "chat_type": m.Chat.Type, "thread_id": m.Thread, "message_id": m.ID, "role": "other", "text": textOr(m.Text, m.Caption), "forwarded": present(m.Forward), "quote": nil, "reply_to": nil}
 	if m.From != nil {
 		if m.From.ID != nil {
 			ev["from_id"] = *m.From.ID
@@ -94,22 +105,57 @@ func (s src) tgHandle(ctx context.Context, sink core.Sink, bot string, api teleg
 		}
 		ev["reply_to"] = reply
 	}
-	attachments := []string{}
-	for _, a := range []struct {
-		name string
-		has  bool
-	}{{"photo", present(m.Photo)}, {"document", present(m.Document)}, {"video", present(m.Video)}, {"voice", m.Voice != nil}, {"audio", present(m.Audio)}} {
-		if a.has {
-			attachments = append(attachments, a.name)
+	var photo *telegramFile
+	if len(m.Photo) > 0 {
+		largest := m.Photo[0]
+		for _, p := range m.Photo[1:] {
+			area, best := p.Width*p.Height, largest.Width*largest.Height
+			if area > best || (area == best && p.FileSize >= largest.FileSize) {
+				largest = p
+			}
 		}
+		photo = &telegramFile{FileID: largest.FileID, MIMEType: "image/jpeg", FileSize: largest.FileSize}
+	}
+	attachments := []map[string]any{}
+	for _, a := range []struct {
+		kind string
+		file *telegramFile
+	}{{"photo", photo}, {"document", m.Document}, {"video", m.Video}, {"voice", m.Voice}, {"audio", m.Audio}} {
+		if a.file == nil {
+			continue
+		}
+		item := map[string]any{"kind": a.kind, "file_id": a.file.FileID}
+		if a.file.MIMEType != "" {
+			item["type"] = a.file.MIMEType
+		}
+		if a.file.FileSize != 0 {
+			item["size"] = a.file.FileSize
+		}
+		if a.kind != "voice" {
+			name := telegramBasename(bot, m, a.kind, *a.file)
+			item["name"] = name
+			if a.file.FileName != "" {
+				item["name"] = a.file.FileName
+			}
+			path, err := s.telegramDownload(ctx, api, a.file.FileID, name)
+			if err != nil {
+				item["error"] = redact(err, api.token)
+			} else {
+				item["path"] = path
+			}
+		}
+		attachments = append(attachments, item)
 	}
 	ev["attachments"] = attachments
-	voice := m.Voice
-	if voice == nil {
-		voice = m.VideoNote
+	voiceID := ""
+	hasVoice := m.Voice != nil || m.VideoNote != nil
+	if m.Voice != nil {
+		voiceID = m.Voice.FileID
+	} else if m.VideoNote != nil {
+		voiceID = m.VideoNote.FileID
 	}
-	if voice != nil {
-		text, err := telegramVoice(ctx, api, voice.FileID)
+	if hasVoice {
+		text, err := telegramVoice(ctx, api, voiceID)
 		if err != nil {
 			ev["transcribe_error"] = redact(err, api.token)
 		} else {
