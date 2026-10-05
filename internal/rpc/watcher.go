@@ -46,6 +46,7 @@ type watcher struct {
 	deferred                  map[string][]deferredDone
 	streamErrors              map[string]bool
 	streamUp, draining        bool
+	snapshotHeld, upHeld      bool
 	streamEpoch               int
 	streamSeq                 uint64
 	queue                     *streamFIFO
@@ -151,12 +152,16 @@ func (w *watcher) tick(ctx context.Context) {
 func (w *watcher) poll(ctx context.Context, reconcile bool) {
 	w.drainStream(ctx)
 	w.expireDeferred()
-	seq, epoch := w.streamSeq, w.streamEpoch
+	seq := w.streamSeq
 	list, entries, healthy, err := w.snapshot(ctx, false)
+	// A connect drained while this older snapshot waits reconciles only after
+	// it is applied: snapshots apply in the order they were taken, so this one
+	// neither re-arms what the reconciliation concludes nor is dropped.
+	w.snapshotHeld = true
 	w.drainStream(ctx)
-	// A connect drained here already ran its reconciliation with a newer
-	// snapshot; this older one must not re-arm what that concluded.
-	if ctx.Err() != nil || w.streamEpoch != epoch {
+	w.snapshotHeld = false
+	defer w.reconcileHeld(ctx)
+	if ctx.Err() != nil {
 		return
 	}
 	if err != nil {

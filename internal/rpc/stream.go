@@ -181,7 +181,11 @@ func (w *watcher) applyStream(ctx context.Context, item streamItem) {
 		w.streamEpoch++
 		w.streamUp = true
 		w.sink.Log("rpc stream connected")
-		w.poll(ctx, true)
+		if w.snapshotHeld {
+			w.upHeld = true
+		} else {
+			w.poll(ctx, true)
+		}
 	case item.err != nil:
 		w.streamUp = false
 		msg := item.err.Error()
@@ -211,6 +215,16 @@ func (w *watcher) applyStream(ctx context.Context, item streamItem) {
 		case "session_closed", "session_parked":
 			w.closeStream(f.Session)
 		}
+	}
+}
+
+// reconcileHeld runs the reconciliation of a connect that was drained while
+// an older snapshot waited, once that snapshot has been applied.
+func (w *watcher) reconcileHeld(ctx context.Context) {
+	held := w.upHeld
+	w.upHeld = false
+	if held && ctx.Err() == nil {
+		w.poll(ctx, true)
 	}
 }
 

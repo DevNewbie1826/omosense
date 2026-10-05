@@ -460,6 +460,95 @@ func TestStreamNestedReconciliation(t *testing.T) {
 	h.done(t, "D7")
 }
 
+func TestStreamFlappingPollFallback(t *testing.T) {
+	q := newStreamFIFO()
+	connect := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	// Server barrier: each flapping get_state admits one stream connection
+	// and answers only once that connection's EOF reached the owner's FIFO.
+	flap := func() {
+		select {
+		case connect <- struct{}{}:
+		case <-ctx.Done():
+			return
+		}
+		for {
+			select {
+			case <-q.wake:
+				q.mu.Lock()
+				n := len(q.items)
+				down := n > 0 && q.items[n-1].err != nil
+				q.mu.Unlock()
+				if down {
+					return
+				}
+			case <-time.After(5 * time.Second):
+				t.Error("stream EOF was not queued")
+				return
+			}
+		}
+	}
+	working, quiet := tickFor("H", "D7", "working"), tickFor("H", "D7", "idle")
+	working.beforeState, quiet.beforeState = flap, flap
+	h := newStreamHarness(t, working, tickFor("H", "D7", "idle"), quiet, tickFor("H", "D7", "idle"))
+	store := newPendingStore(h.w.stateDir, h.w.profile)
+	record := h.w.record
+	h.w.record = func(id string, ev rpcEvent) {
+		record(id, ev)
+		if _, err := store.Record(id, ev); err != nil {
+			t.Error(err)
+		}
+	}
+	h.w.queue = q
+	h.w.sleep = func(ctx context.Context, _ time.Duration) error { return ctx.Err() }
+	var hosts sync.WaitGroup
+	oldDial := streamDialFn
+	streamDialFn = func(ctx context.Context, _ string) (*client, error) {
+		select {
+		case <-connect:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		a, b := net.Pipe()
+		hosts.Add(1)
+		go func() {
+			defer hosts.Done()
+			// The host reads the observe request and hangs up at once.
+			if _, err := bufio.NewReader(b).ReadBytes('\n'); err != nil && ctx.Err() == nil {
+				t.Errorf("observe request: %v", err)
+			}
+			b.Close()
+		}()
+		return &client{conn: a, scan: bufio.NewScanner(a), stop: context.AfterFunc(ctx, func() { a.Close() })}, nil
+	}
+	readerDone := make(chan struct{})
+	go func() { defer close(readerDone); h.w.streamLoop(ctx, q) }()
+	t.Cleanup(func() {
+		cancel()
+		awaitStream(t, readerDone)
+		hosts.Wait()
+		streamDialFn = oldDial
+		t.Log("cleanup: stream reader and pipe hosts joined, stream dial restored")
+	})
+	// Given polls that see working then idle while every stream connection
+	// ends right after it connects.
+	h.w.tick(context.Background())
+	h.w.tick(context.Background())
+	h.w.tick(context.Background())
+	// Then the poll fallback reports the turn exactly once.
+	if h.w.streamEpoch != 2 || h.w.streamUp {
+		t.Fatalf("stream epoch %d up %v, want two ended connections", h.w.streamEpoch, h.w.streamUp)
+	}
+	entries, err := store.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].ID != "D7" || entries[0].Seq != 1 || entries[0].Count != 1 {
+		t.Errorf("pending entries = %+v, want D7 seq 1 count 1", entries)
+	}
+	h.done(t, "D7")
+}
+
 func awaitStream[T any](t *testing.T, ch <-chan T) T {
 	t.Helper()
 	select {
