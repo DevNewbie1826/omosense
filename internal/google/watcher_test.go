@@ -615,7 +615,7 @@ func TestRunOnceCompatReadOnly(t *testing.T) {
 	if err := os.MkdirAll(state, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	cfg := []byte(`{"telegram":{"bot":"t"},"profiles":{"family":{"discord":true,"telegram":["t"],"mail":false}}}`)
+	cfg := []byte(`{"profiles":{"family":{"telegram":{"bots":["t"]},"discord":{},"mail":false}}}`)
 	if err := os.WriteFile(filepath.Join(dir, "config.json"), cfg, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -624,8 +624,8 @@ func TestRunOnceCompatReadOnly(t *testing.T) {
 	if err := os.WriteFile(seenPath, seed, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("OMOMEOW_DIR", dir)
-	t.Setenv("OMOMEOW_STATE", state)
+	t.Setenv("OMOSENSE_DIR", dir)
+	t.Setenv("OMOSENSE_STATE", state)
 	pa := core.ParseArgs([]string{"--profile", "family", "--once"})
 	ctx, err := core.Load(pa, false)
 	if err != nil {

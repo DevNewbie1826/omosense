@@ -17,12 +17,12 @@ import (
 	"github.com/DevNewbie1826/omosense/internal/core"
 )
 
-// testEnv points HOME, OMOMEOW_DIR and OMOMEOW_STATE at temp dirs with a
+// testEnv points HOME, OMOSENSE_DIR and OMOSENSE_STATE at temp dirs with a
 // config.json and fake agent-messenger credentials (obviously fake tokens).
 func testEnv(t *testing.T) (home, dir, state string) {
 	t.Helper()
 	home = t.TempDir()
-	dir = filepath.Join(home, ".omomeow")
+	dir = filepath.Join(home, ".omosense")
 	state = filepath.Join(dir, "state")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
@@ -31,7 +31,7 @@ func testEnv(t *testing.T) (home, dir, state string) {
 	if err := os.MkdirAll(creds, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(`{"telegram":{"bot":"b1","dm_bot":"b2"},"discord":{"bot":"d1"}}`), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(`{"profiles":{"main":{"telegram":{"bots":["b1","b2"]},"discord":{"bots":["d1"]}}}}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(creds, "telegrambot-credentials.json"), []byte(`{"bots":{"b1":{"token":"TGTOK1"},"dm2":{"token":"TGTOK2"}}}`), 0o644); err != nil {
@@ -41,8 +41,8 @@ func testEnv(t *testing.T) (home, dir, state string) {
 		t.Fatal(err)
 	}
 	t.Setenv("HOME", home)
-	t.Setenv("OMOMEOW_DIR", dir)
-	t.Setenv("OMOMEOW_STATE", state)
+	t.Setenv("OMOSENSE_DIR", dir)
+	t.Setenv("OMOSENSE_STATE", state)
 	return home, dir, state
 }
 

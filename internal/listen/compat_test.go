@@ -61,7 +61,7 @@ func compatConfig(t *testing.T, c *core.Ctx, telegram bool) {
 	if telegram {
 		bots = `["test"]`
 	}
-	cfg := fmt.Sprintf(`{"telegram":{"owner":"12"},"profiles":{"test":{"discord":false,"telegram":%s}}}`, bots)
+	cfg := fmt.Sprintf(`{"profiles":{"test":{"telegram":{"bots":%s,"roles":{"12":"owner"}},"discord":{"bots":[],"roles":{}}}}}`, bots)
 	if err := os.WriteFile(filepath.Join(c.Dir, "config.json"), []byte(cfg), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -69,7 +69,7 @@ func compatConfig(t *testing.T, c *core.Ctx, telegram bool) {
 
 func TestCompatDryRunAndSourcePolicies(t *testing.T) {
 	c := testCtx(t)
-	c.Profile.Discord = true
+	c.Profile.Discord.Bots = []string{"d1"}
 	sources := Sources(c)
 	if len(sources) != 2 || sources[0].Name() != "telegram" || sources[0].AlwaysOn() || sources[1].Name() != "discord" || !sources[1].AlwaysOn() {
 		t.Fatal("source run policy")
@@ -80,7 +80,7 @@ func TestCompatDryRunAndSourcePolicies(t *testing.T) {
 			t.Fatal("shared lock or prefix", lock, legacy, source.Prefixes())
 		}
 	}
-	c.Profile.Discord = false
+	c.Profile.Discord.Bots = nil
 	if len(Sources(c)) != 1 {
 		t.Fatal("discord enabled for a disabled profile")
 	}

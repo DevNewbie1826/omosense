@@ -54,7 +54,7 @@ func run(ctx *core.Ctx, stdout, stderr io.Writer) int {
 		return e.fail(err)
 	}
 	if platform == "telegram" {
-		bot := ctx.Cfg.Telegram.Bot
+		bot := firstBot(ctx.Profile.Telegram.Bots)
 		if v, ok := a.Get("bot"); ok {
 			if s, is := v.(string); is {
 				bot = s
@@ -63,7 +63,16 @@ func run(ctx *core.Ctx, stdout, stderr io.Writer) int {
 		a.Delete("bot")
 		return e.telegram(action, a, bot)
 	}
-	return e.discord(action, a, ctx.Cfg.Discord.Bot)
+	return e.discord(action, a, firstBot(ctx.Profile.Discord.Bots))
+}
+
+// firstBot returns the profile's default bot for a platform: the first
+// entry of its bots list, or "" when the list is empty.
+func firstBot(bots []string) string {
+	if len(bots) == 0 {
+		return ""
+	}
+	return bots[0]
 }
 
 func positionals(argv []string) (platform, action, raw string) {

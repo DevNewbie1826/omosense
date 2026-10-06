@@ -96,6 +96,9 @@ func testUpgradeJournalReplay(t *testing.T, bin string) {
 func testUpgradeJournalReplayFrom(t *testing.T, bin, oldBin string) {
 	// Given a real old-version daemon with both always-on prefixes pending.
 	f := subprocessFixture(t, bin)
+	if oldBin != bin {
+		stageOldBinaryEnv(t, f)
+	}
 	f.bin = oldBin
 	peer := f.attach("v1", "main")
 	f.bin = bin
@@ -104,8 +107,8 @@ func testUpgradeJournalReplayFrom(t *testing.T, bin, oldBin string) {
 	f.waitEvent("source:main:discord", old)
 	var state string
 	for _, value := range f.env {
-		if strings.HasPrefix(value, "OMOMEOW_STATE=") {
-			state = strings.TrimPrefix(value, "OMOMEOW_STATE=")
+		if strings.HasPrefix(value, "OMOSENSE_STATE=") {
+			state = strings.TrimPrefix(value, "OMOSENSE_STATE=")
 		}
 	}
 	data, err := os.ReadFile(filepath.Join(state, "omosense-journal-main.jsonl"))
@@ -130,6 +133,9 @@ func testUpgradeJournalReplayFrom(t *testing.T, bin, oldBin string) {
 		t.Fatalf("pending fixture=%q, want REMIND and EVENT", expected)
 	}
 	t.Logf("PENDING seq order: %q", expected)
+	if oldBin != bin {
+		stageNewConfig(t, f)
+	}
 
 	// When a new-version real attach upgrades and subscribes to both prefixes.
 	a := f.attach("v2", "main", "all", "--only", "REMIND,EVENT")

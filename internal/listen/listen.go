@@ -29,11 +29,11 @@ Flags:
 // under the listen lock with the TS stdout grammar and exit semantics.
 func Run(ctx *core.Ctx, args []string) int {
 	if ctx.Flags["--dry-run"] || core.ParseArgs(args).Flags["--dry-run"] {
-		bots := ctx.Profile.Telegram
+		bots := ctx.Profile.Telegram.Bots
 		if bots == nil {
 			bots = []string{}
 		}
-		ctx.Out.Emit("PLAN", map[string]any{"profile": ctx.Profile.Name, "discord": ctx.Profile.Discord, "telegram": bots, "lock": "listen-" + ctx.Profile.Name, "state": ctx.State})
+		ctx.Out.Emit("PLAN", map[string]any{"profile": ctx.Profile.Name, "discord": len(ctx.Profile.Discord.Bots) > 0, "telegram": bots, "lock": "listen-" + ctx.Profile.Name, "state": ctx.State})
 		return 0
 	}
 	release := ctx.Acquire("listen-"+ctx.Profile.Name, "listen")
@@ -77,7 +77,7 @@ func Sources(ctx *core.Ctx) []core.Source {
 			legacy:   "listen",
 		},
 	}
-	if ctx.Profile.Discord {
+	if len(ctx.Profile.Discord.Bots) > 0 {
 		result = append(result, src{
 			cfg:      ctx,
 			sleep:    sleep,

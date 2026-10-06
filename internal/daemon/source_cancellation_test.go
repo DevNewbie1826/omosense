@@ -90,7 +90,7 @@ func TestSourceCommandCancellation(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			config := `{"profiles":{"main":{"discord":false,"telegram":[],"calendars":null,"mail":false}}}`
+			config := `{"profiles":{"main":{"telegram":{"bots":[]},"discord":{"bots":[]},"calendars":null,"mail":false}}}`
 			if err := os.WriteFile(filepath.Join(p.dir, "config.json"), []byte(config), 0o600); err != nil {
 				t.Fatal(err)
 			}
@@ -127,8 +127,8 @@ func TestSourceCommandCancellation(t *testing.T) {
 					blocked <- blockedCommand{conn: conn, pid: e.PID, kind: e.Event, err: err}
 				}
 			}()
-			env := append(os.Environ(), "HOME="+root, "OMOMEOW_DIR="+p.dir,
-				"OMOMEOW_STATE="+state, "OMOSENSE_SOCK="+p.socket, "OMO_MEMORY_AGENTS="+agents,
+			env := append(os.Environ(), "HOME="+root, "OMOSENSE_DIR="+p.dir,
+				"OMOSENSE_STATE="+state, "OMOSENSE_SOCK="+p.socket, "OMO_MEMORY_AGENTS="+agents,
 				"PATH="+bindir+":"+os.Getenv("PATH"), "OS_CANCEL_HELPER=1", "OS_CANCEL_GATE="+gate,
 				"OS_CANCEL_MODE="+tc.mode, "OS_CANCEL_CHILD=",
 				"OMOSENSE_TEST_REGISTRY=", "OMOSENSE_TEST_EVENTS=", "OMOSENSE_TEST_VERSION=",

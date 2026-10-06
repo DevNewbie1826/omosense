@@ -325,7 +325,7 @@ func TestTelegramFailureThresholdAndRecovery(t *testing.T) {
 
 func TestTelegramBotsPollIndependently(t *testing.T) {
 	c := testCtx(t)
-	c.Profile.Telegram = []string{"test", "test"}
+	c.Profile.Telegram.Bots = []string{"test", "test"}
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	calls := make(chan struct{}, 2)

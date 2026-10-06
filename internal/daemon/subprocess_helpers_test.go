@@ -39,13 +39,13 @@ func subprocessFixture(t *testing.T, bin string) *processFixture {
 	f := &processFixture{t: t, bin: bin, p: p, events: make(chan processEvent, 1024)}
 	f.spawns = filepath.Join(root, "spawns")
 	f.env = append(os.Environ(),
-		"HOME="+root, "OMOMEOW_DIR="+p.dir, "OMOMEOW_STATE="+filepath.Join(root, "state"),
+		"HOME="+root, "OMOSENSE_DIR="+p.dir, "OMOSENSE_STATE="+filepath.Join(root, "state"),
 		"OMOSENSE_SOCK="+p.socket, "OMOSENSE_TEST_REGISTRY=fake",
 		"OMOSENSE_TEST_VERSION=v1", "OMOSENSE_TEST_READY_GATE=",
 		"OMOSENSE_TEST_SPAWN_LOG="+f.spawns,
 		"OMOSENSE_TEST_EVENTS="+filepath.Join(p.dir, "events.sock"))
 	if err := os.WriteFile(filepath.Join(p.dir, "config.json"),
-		[]byte(`{"profiles":{"main":{"discord":true},"family":{"discord":false}}}`), 0o600); err != nil {
+		[]byte(`{"profiles":{"main":{"discord":{"bots":["d1"]}},"family":{"discord":{"bots":[]}}}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	var err error

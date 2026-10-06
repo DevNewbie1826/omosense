@@ -36,7 +36,7 @@ func profileStopCompatDaemon(t *testing.T, replacement bool, stopReply map[strin
 	})
 	socket := filepath.Join(dir, "d.sock")
 	t.Setenv("OMOSENSE_SOCK", socket)
-	t.Setenv("OMOMEOW_DIR", dir)
+	t.Setenv("OMOSENSE_DIR", dir)
 	listener, err := net.Listen("unix", socket)
 	if err != nil {
 		t.Fatal(err)

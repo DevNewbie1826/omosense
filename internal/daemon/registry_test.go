@@ -17,18 +17,18 @@ import (
 // Prefixes are the IS-3 grammar prefixes each source emits.
 func TestRegistryProfiles(t *testing.T) {
 	home := t.TempDir()
-	dir := filepath.Join(home, "omomeow")
+	dir := filepath.Join(home, "omosense")
 	state := filepath.Join(home, "state")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("HOME", home)
-	t.Setenv("OMOMEOW_DIR", dir)
-	t.Setenv("OMOMEOW_STATE", state)
+	t.Setenv("OMOSENSE_DIR", dir)
+	t.Setenv("OMOSENSE_STATE", state)
 	const cfg = `{
   "profiles": {
-    "main": {"discord": true, "telegram": ["x"], "mail": true},
-    "family": {"discord": false}
+    "main": {"telegram": {"bots": ["x"]}, "discord": {"bots": ["d1"]}, "mail": true},
+    "family": {"discord": {"bots": []}}
   }
 }`
 	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(cfg), 0o644); err != nil {
@@ -74,6 +74,37 @@ func loadProfile(t *testing.T, name string) *core.Ctx {
 		t.Fatalf("load %s: %v", name, err)
 	}
 	return ctx
+}
+
+// TestEnvironmentPathsOmosenseDir pins the daemon's directory resolution:
+// start, attach and status derive every socket, lock and spawn path from
+// OMOSENSE_DIR, with the same default as every subcommand.
+func TestEnvironmentPathsOmosenseDir(t *testing.T) {
+	home := t.TempDir()
+	dir := filepath.Join(home, "run")
+	t.Setenv("HOME", home)
+	t.Setenv("OMOSENSE_DIR", dir)
+	t.Setenv("OMOSENSE_SOCK", "")
+	p, err := environmentPaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.dir != dir || p.socket != filepath.Join(dir, "omosense.sock") {
+		t.Fatalf("paths = %+v, want dir %s and its default socket", p, dir)
+	}
+}
+
+// TestEnvironmentPathsStaleOmomeow guards against a stale OMOMEOW_DIR
+// silently pointing the daemon at a different directory.
+func TestEnvironmentPathsStaleOmomeow(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("OMOSENSE_DIR", "")
+	t.Setenv("OMOMEOW_DIR", filepath.Join(home, "omomeow"))
+	_, err := environmentPaths()
+	if err == nil || err.Error() != "OMOMEOW_DIR is no longer read; set OMOSENSE_DIR" {
+		t.Fatalf("err = %v, want OMOMEOW_DIR stale error", err)
+	}
 }
 
 func checkProfileSources(t *testing.T, got []core.Source, want []sourceExpect, alwaysOn []string) {

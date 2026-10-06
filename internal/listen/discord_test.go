@@ -151,7 +151,7 @@ func ready(t *testing.T, p *gatewayPeer, kind string) {
 }
 func startDiscord(t *testing.T, cfg *core.Ctx, cl *fakeClock) (*recordingSink, <-chan error, context.CancelFunc) {
 	t.Helper()
-	cfg.Profile.Discord = true
+	cfg.Profile.Discord.Bots = []string{"test"}
 	s := Sources(cfg)[1].(src)
 	s.clock = cl
 	// Reconnect is released explicitly by the test, never by timing luck.

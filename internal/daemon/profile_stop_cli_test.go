@@ -16,7 +16,7 @@ import (
 func profileCLIState(t *testing.T, f *processFixture) string {
 	t.Helper()
 	for _, e := range f.env {
-		if state, ok := strings.CutPrefix(e, "OMOMEOW_STATE="); ok {
+		if state, ok := strings.CutPrefix(e, "OMOSENSE_STATE="); ok {
 			if err := os.MkdirAll(state, 0o700); err != nil {
 				t.Fatal(err)
 			}

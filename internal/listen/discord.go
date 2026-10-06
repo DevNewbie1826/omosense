@@ -82,7 +82,10 @@ func (s src) discord(ctx context.Context, sink core.Sink) error {
 		discordActive.outage = nil
 		discordActive.Unlock()
 	}()
-	token, err := core.Cred(os.Getenv("HOME"), "discordbot-credentials.json", s.cfg.Cfg.Discord.Bot)
+	if len(s.cfg.Profile.Discord.Bots) == 0 {
+		return errors.New("discord source registered without bots")
+	}
+	token, err := core.Cred(os.Getenv("HOME"), "discordbot-credentials.json", s.cfg.Profile.Discord.Bots[0])
 	if err != nil {
 		return err
 	}

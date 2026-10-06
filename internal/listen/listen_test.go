@@ -68,8 +68,8 @@ func testCtx(t *testing.T) *core.Ctx {
 	t.Helper()
 	home := t.TempDir()
 	t.Setenv("HOME", home)
-	t.Setenv("OMOMEOW_DIR", filepath.Join(home, "omomeow"))
-	t.Setenv("OMOMEOW_STATE", filepath.Join(home, "state"))
+	t.Setenv("OMOSENSE_DIR", filepath.Join(home, "omosense"))
+	t.Setenv("OMOSENSE_STATE", filepath.Join(home, "state"))
 	t.Setenv("OMOSENSE_TELEGRAM_API", "http://127.0.0.1:1")
 	t.Setenv("OMOSENSE_DISCORD_API", "http://127.0.0.1:1")
 	dir := filepath.Join(home, ".config", "agent-messenger")
@@ -81,15 +81,17 @@ func testCtx(t *testing.T) *core.Ctx {
 			t.Fatal(err)
 		}
 	}
-	state := os.Getenv("OMOMEOW_STATE")
+	state := os.Getenv("OMOSENSE_STATE")
 	if err := os.MkdirAll(state, 0700); err != nil {
 		t.Fatal(err)
 	}
-	raw, err := core.ParseJSON([]byte(`{"telegram":{"owner":"12","wife":"13"},"discord":{"owner":"owner","wife":"wife"}}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	return &core.Ctx{State: state, Dir: os.Getenv("OMOMEOW_DIR"), Profile: core.Profile{Name: "test", Telegram: []string{"test"}}, Cfg: &core.Cfg{Raw: raw.(*core.OMap), Discord: core.DiscordCfg{Bot: "test"}}, Flags: map[string]bool{}, Out: core.NewOut(os.Stdout)}
+	profiles := core.NewOMap()
+	profiles.Set("test", core.NewOMap())
+	return &core.Ctx{State: state, Dir: os.Getenv("OMOSENSE_DIR"), Profile: core.Profile{
+		Name:     "test",
+		Telegram: core.PlatformCfg{Bots: []string{"test"}, Roles: map[string]string{"12": "owner", "13": "wife"}},
+		Discord:  core.PlatformCfg{Bots: []string{"test"}, Roles: map[string]string{"owner": "owner", "wife": "wife"}},
+	}, Cfg: &core.Cfg{Raw: core.NewOMap(), Profiles: profiles}, Flags: map[string]bool{}, Out: core.NewOut(os.Stdout)}
 }
 
 func TestTelegramPollPersistsOffsetAndEventShape(t *testing.T) {

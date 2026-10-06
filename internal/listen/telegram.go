@@ -63,8 +63,8 @@ func (s src) telegram(ctx context.Context, sink core.Sink) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var wg sync.WaitGroup
-	errs := make(chan error, len(s.cfg.Profile.Telegram))
-	for _, bot := range s.cfg.Profile.Telegram {
+	errs := make(chan error, len(s.cfg.Profile.Telegram.Bots))
+	for _, bot := range s.cfg.Profile.Telegram.Bots {
 		token, err := core.Cred(os.Getenv("HOME"), "telegrambot-credentials.json", bot)
 		if err != nil {
 			cancel()
@@ -157,16 +157,12 @@ func (s src) poll(ctx context.Context, sink core.Sink, bot string, api telegramA
 }
 
 func (s src) role(platform, id string) string {
-	section, _ := s.cfg.Cfg.Raw.Get(platform)
-	m, ok := section.(*core.OMap)
-	if !ok {
-		return "other"
+	roles := s.cfg.Profile.Telegram.Roles
+	if platform != "telegram" {
+		roles = s.cfg.Profile.Discord.Roles
 	}
-	if owner, ok := m.Get("owner"); ok && fmt.Sprint(owner) == id {
-		return "owner"
-	}
-	if wife, ok := m.Get("wife"); ok && wife != nil && fmt.Sprint(wife) == id {
-		return "wife"
+	if r, ok := roles[id]; ok && r != "" {
+		return r
 	}
 	return "other"
 }

@@ -90,7 +90,7 @@ func TestDiscordOutageReadyResumedAndShortRecovery(t *testing.T) {
 
 func TestDiscordGatewaySecondOutageResetAndResume(t *testing.T) {
 	c, cl := testCtx(t), newClock()
-	c.Profile.Discord = true
+	c.Profile.Discord.Bots = []string{"test"}
 	peers, cleanup := fakeGateway(t)
 	t.Cleanup(cleanup)
 	ctx, cancel := context.WithCancel(t.Context())

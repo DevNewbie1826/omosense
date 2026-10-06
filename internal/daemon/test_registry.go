@@ -128,7 +128,7 @@ func fakeRegistry(c *core.Ctx) []core.Source {
 		{"herdr", "HERDR", "watch-herdr", "", false},
 		{"tidy", "TIDY", "memory-tidy", "", false},
 	} {
-		if spec.name == "discord" && !c.Profile.Discord {
+		if spec.name == "discord" && len(c.Profile.Discord.Bots) == 0 {
 			continue
 		}
 		sources = append(sources, &fakeSource{name: spec.name, prefix: spec.prefix,

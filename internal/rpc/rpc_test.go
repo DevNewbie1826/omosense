@@ -86,8 +86,8 @@ func integrationFixture(t *testing.T) (string, *fakeDelivery) {
 	deliveryWrite(t, filepath.Join(dir, "config.json"), `{"profiles":{"main":{},"family":{}}}`)
 	deliveryWrite(t, filepath.Join(stateDir, "sessions.json"), `{"main":{"session_id":"MAINQA"},"family":{"session_id":"FAMILYQA"}}`)
 	t.Setenv("HOME", dir)
-	t.Setenv("OMOMEOW_DIR", dir)
-	t.Setenv("OMOMEOW_STATE", stateDir)
+	t.Setenv("OMOSENSE_DIR", dir)
+	t.Setenv("OMOSENSE_STATE", stateDir)
 	t.Setenv("OMOSENSE_RPC_SOCK", filepath.Join(dir, "absent.sock"))
 	t.Setenv("OMOSENSE_SOCK", filepath.Join(dir, "absent-daemon.sock"))
 	return stateDir, f

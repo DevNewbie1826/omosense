@@ -17,7 +17,7 @@ import (
 
 var fixedTime = time.Date(2026, 10, 3, 10, 5, 0, 0, time.UTC)
 
-// testEnv points HOME, OMOMEOW_DIR and OMOMEOW_STATE at temp dirs with a
+// testEnv points HOME, OMOSENSE_DIR and OMOSENSE_STATE at temp dirs with a
 // minimal config.json.
 func testEnv(t *testing.T) (dir, state string) {
 	t.Helper()
@@ -27,12 +27,12 @@ func testEnv(t *testing.T) (dir, state string) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(`{"telegram":{"bot":"b1"},"discord":{"bot":"d1"}}`), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(`{"profiles":{"main":{"telegram":{"bots":["b1"]},"discord":{"bots":["d1"]}}}}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("HOME", home)
-	t.Setenv("OMOMEOW_DIR", dir)
-	t.Setenv("OMOMEOW_STATE", state)
+	t.Setenv("OMOSENSE_DIR", dir)
+	t.Setenv("OMOSENSE_STATE", state)
 	return dir, state
 }
 
