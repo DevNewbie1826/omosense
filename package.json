@@ -1,6 +1,6 @@
 {
   "name": "omosense",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "omosense - messenger/agent monitor daemon and CLI (prebuilt Go binaries for macOS and Linux)",
   "license": "MIT",
   "repository": {
