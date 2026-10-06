@@ -1,0 +1,122 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install npm 11.19.0
+        run: npm install --global npm@11.19.0
+
+      - name: Gate tag against package.json version
+        shell: bash
+        run: |
+          set -eu
+          if ! test "v$(node -p "require('./package.json').version")" = "$GITHUB_REF_NAME"; then
+            echo "tag ${GITHUB_REF_NAME} does not match package.json version v$(node -p "require('./package.json').version")" >&2
+            exit 1
+          fi
+
+      - name: Pack npm tarball
+        run: npm pack
+
+      - name: Smoke test packed CLI
+        shell: bash
+        run: |
+          set -eu
+          tgz=""
+          for f in omosense-*.tgz; do
+            if [ -n "$tgz" ]; then
+              echo "expected exactly one omosense-*.tgz" >&2
+              exit 1
+            fi
+            tgz="$f"
+          done
+          if [ -z "$tgz" ] || [ ! -f "$tgz" ]; then
+            echo "npm pack did not produce omosense-*.tgz" >&2
+            exit 1
+          fi
+          abs_tgz="$(pwd)/${tgz}"
+          smoke_dir="$(mktemp -d)"
+          trap 'rm -rf "$smoke_dir"' EXIT
+          (
+            cd "$smoke_dir"
+            npm init -y
+            npm install "$abs_tgz"
+            help_out="$(./node_modules/.bin/omosense --help)"
+            printf '%s\n' "$help_out"
+            case "$help_out" in
+              *"Usage: omosense"*) ;;
+              *)
+                echo "smoke failed: stdout does not contain 'Usage: omosense'" >&2
+                exit 1
+                ;;
+            esac
+          )
+
+      - name: Upload npm package
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-package
+          path: omosense-*.tgz
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: npm-release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: https://registry.npmjs.org
+
+      - name: Install npm 11.19.0
+        run: npm install --global npm@11.19.0
+
+      - name: Download npm package
+        uses: actions/download-artifact@v4
+        with:
+          name: npm-package
+          path: .
+
+      - name: Publish to npm or skip if already published
+        shell: bash
+        run: |
+          set -eu
+          VERSION="${GITHUB_REF_NAME#v}"
+          if npm view "omosense@${VERSION}" version; then
+            echo "omosense@${VERSION} already published, skipping"
+            exit 0
+          fi
+          npm publish "./omosense-${VERSION}.tgz" --access public --provenance

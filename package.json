@@ -1,0 +1,36 @@
+{
+  "name": "omosense",
+  "version": "0.0.1",
+  "description": "omosense - messenger/agent monitor daemon and CLI (prebuilt Go binaries for macOS and Linux)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/DevNewbie1826/omosense.git"
+  },
+  "homepage": "https://github.com/DevNewbie1826/omosense#readme",
+  "bugs": {
+    "url": "https://github.com/DevNewbie1826/omosense/issues"
+  },
+  "bin": {
+    "omosense": "npm/omosense.js"
+  },
+  "files": [
+    "npm/omosense.js",
+    "npm/dist/"
+  ],
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "cpu": [
+    "arm64",
+    "x64"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build:npm": "sh scripts/build-npm.sh",
+    "prepack": "sh scripts/build-npm.sh"
+  }
+}

@@ -1,1 +1,3 @@
 bin/
+npm/dist/
+*.tgz
