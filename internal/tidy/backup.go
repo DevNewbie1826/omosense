@@ -38,8 +38,9 @@ func lastBackupDate(w *core.OMap) (string, bool) {
 }
 
 // backup runs the daily git-bundle backup (memory-tidy.ts:43-80): every
-// agent repo under AGENTS — INCLUDING the EXCLUDE set, qualified by
-// `git rev-parse --git-dir` rather than a .git entry — is bundled and
+// agent repo under AGENTS, including the profile memory repo and names in
+// tidy.exclude (heads() skips those; backup does not), qualified by
+// `git rev-parse --git-dir` rather than a .git entry, is bundled and
 // verified into ~/.omo/memory-backups/<Seoul date>/ (mode 0700); failed
 // bundles are removed and named in failed=, only the newest 14 date dirs
 // survive, and lastBackupDate is stamped through a FRESH watermark read.

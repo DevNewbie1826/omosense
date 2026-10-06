@@ -68,7 +68,7 @@ func runProbe(t *testing.T, args []string, stdin *strings.Reader, env ...string)
 
 func TestAcquireExits3OnLiveHolder(t *testing.T) {
 	_, dir, state := cliEnv(t)
-	writeCliConfig(t, dir, cliFallbackCfg)
+	writeCliConfig(t, dir, cliProfilesCfg)
 	pid := liveCliSleeper(t)
 	writeCliLock(t, state, "listen-main", cliHeldJSON(pid))
 
@@ -90,7 +90,7 @@ func TestAcquireExits3OnLiveHolder(t *testing.T) {
 
 func TestAcquireExits3OnLiveLegacyHolder(t *testing.T) {
 	_, dir, state := cliEnv(t)
-	writeCliConfig(t, dir, cliFallbackCfg)
+	writeCliConfig(t, dir, cliProfilesCfg)
 	pid := liveCliSleeper(t)
 	writeCliLock(t, state, "listen", cliHeldJSON(pid))
 
@@ -105,7 +105,7 @@ func TestAcquireExits3OnLiveLegacyHolder(t *testing.T) {
 
 func TestAcquireUnparsableLockExits1(t *testing.T) {
 	_, dir, state := cliEnv(t)
-	writeCliConfig(t, dir, cliFallbackCfg)
+	writeCliConfig(t, dir, cliProfilesCfg)
 	writeCliLock(t, state, "listen-main", "{oops")
 
 	stdOut, stderr, code := runProbe(t, []string{"--profile", "main"}, nil, "PROBE_LOCK=listen-main")
@@ -119,7 +119,7 @@ func TestAcquireUnparsableLockExits1(t *testing.T) {
 
 func TestAcquireReleasesOnStdinEOF(t *testing.T) {
 	_, dir, state := cliEnv(t)
-	writeCliConfig(t, dir, cliFallbackCfg)
+	writeCliConfig(t, dir, cliProfilesCfg)
 
 	stdOut, _, code := runProbe(t, []string{"--profile", "main"}, strings.NewReader(""), "PROBE_LOCK=listen-main", "PROBE_LEGACY=listen")
 	if code != 0 || stdOut != "acquired\n" {
@@ -132,7 +132,7 @@ func TestAcquireReleasesOnStdinEOF(t *testing.T) {
 
 func TestAcquireReleasesOnSignal(t *testing.T) {
 	_, dir, state := cliEnv(t)
-	writeCliConfig(t, dir, cliFallbackCfg)
+	writeCliConfig(t, dir, cliProfilesCfg)
 	buildBinaries(t)
 
 	cmd := exec.Command(probePath, "--profile", "main")

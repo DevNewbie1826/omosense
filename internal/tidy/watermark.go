@@ -13,10 +13,6 @@ import (
 	"github.com/DevNewbie1826/omosense/internal/core"
 )
 
-// exclude is the EXCLUDE set: agent memory dirs whose tidiness is not
-// watched (they are still backed up).
-var exclude = map[string]bool{"owo-mode-57b805e5": true, "owo-family-bccd4b63": true}
-
 func (t *tidyer) watermarkPath() string {
 	return filepath.Join(t.state, "memory-tidy.json")
 }
@@ -107,8 +103,11 @@ type headRec struct {
 	at   float64
 }
 
-// heads lists HEAD of every non-EXCLUDE agent repo that has a repo/.git
-// entry. at is %ct*1000; a git log failure is logged per repo and skipped.
+// heads lists HEAD of every agent repo that has a repo/.git entry, after
+// skips in order: (1) the profile's own memory repo, (2) tidy.exclude,
+// (3) every remaining repo when learnOthers is false. Excluded repos are
+// still omitted when learnOthers is true. at is %ct*1000; a git log
+// failure is logged per repo and skipped.
 func (t *tidyer) heads(ctx context.Context) ([]headRec, error) {
 	names, err := sortedAgents(t.agents)
 	if err != nil {
@@ -116,7 +115,13 @@ func (t *tidyer) heads(ctx context.Context) ([]headRec, error) {
 	}
 	var out []headRec
 	for _, name := range names {
-		if exclude[name] {
+		if name == t.memory {
+			continue
+		}
+		if t.exclude[name] {
+			continue
+		}
+		if !t.learnOthers {
 			continue
 		}
 		repo := filepath.Join(t.agents, name, "repo")

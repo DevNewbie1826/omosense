@@ -59,7 +59,7 @@ func TestCLIHelpBeatsBadProfile(t *testing.T) {
 
 func TestSourceMetadata(t *testing.T) {
 	_, dir, _ := cliEnv(t)
-	writeCliConfig(t, dir, cliFallbackCfg)
+	writeCliConfig(t, dir, cliProfilesCfg)
 	ctx, err := core.Load(core.ParseArgs(nil), false)
 	if err != nil {
 		t.Fatalf("load: %v", err)

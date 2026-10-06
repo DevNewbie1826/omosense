@@ -17,12 +17,12 @@ import (
 	"github.com/DevNewbie1826/omosense/internal/core"
 )
 
-// testEnv points HOME, OMOMEOW_DIR and OMOMEOW_STATE at temp dirs with a
+// testEnv points HOME, OMOSENSE_DIR and OMOSENSE_STATE at temp dirs with a
 // config.json and fake agent-messenger credentials (obviously fake tokens).
 func testEnv(t *testing.T) (home, dir, state string) {
 	t.Helper()
 	home = t.TempDir()
-	dir = filepath.Join(home, ".omomeow")
+	dir = filepath.Join(home, ".omosense")
 	state = filepath.Join(dir, "state")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
@@ -31,18 +31,18 @@ func testEnv(t *testing.T) (home, dir, state string) {
 	if err := os.MkdirAll(creds, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(`{"telegram":{"bot":"b1","dm_bot":"b2"},"discord":{"bot":"d1"}}`), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(`{"profiles":{"main":{"telegram":{"bots":["b1","b2"]},"discord":{"bots":["d1"]}},"family":{"telegram":{"bots":["f1"]}},"bare":{"telegram":{"bots":[]},"discord":{"bots":[]}}}}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(creds, "telegrambot-credentials.json"), []byte(`{"bots":{"b1":{"token":"TGTOK1"},"dm2":{"token":"TGTOK2"}}}`), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(creds, "telegrambot-credentials.json"), []byte(`{"bots":{"b1":{"token":"TGTOK1"},"dm2":{"token":"TGTOK2"},"f1":{"token":"TGTOKFAM"}}}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(creds, "discordbot-credentials.json"), []byte(`{"bots":{"d1":{"token":"DCTOK1"}}}`), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(creds, "discordbot-credentials.json"), []byte(`{"bots":{"d1":{"token":"DCTOK1"},"d2":{"token":"DCTOK2"}}}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("HOME", home)
-	t.Setenv("OMOMEOW_DIR", dir)
-	t.Setenv("OMOMEOW_STATE", state)
+	t.Setenv("OMOSENSE_DIR", dir)
+	t.Setenv("OMOSENSE_STATE", state)
 	return home, dir, state
 }
 
@@ -286,6 +286,60 @@ func TestMissingJSONArgDefaultsToEmptyObject(t *testing.T) {
 		t.Errorf("path = %s, want sendMessage", r.path)
 	}
 	jsonEqual(t, r.body, `{}`)
+	if code != 0 {
+		t.Errorf("exit = %d, want 0", code)
+	}
+}
+
+// IS-7: a profile with no bots for the platform and no {"bot":...}
+// override is a usage error (exit 2), not a cred lookup failure.
+func TestNoBotsErrorsExits2(t *testing.T) {
+	for _, platform := range []string{"telegram", "discord"} {
+		stdout, stderr, code := runSay(t, "--profile", "bare", platform, "send", `{"chat_id":1,"text":"x"}`)
+		if code != 2 {
+			t.Errorf("%s: exit = %d, want 2", platform, code)
+		}
+		if want := "no bot: profile bare has no " + platform + " bots; pass {\"bot\":\"name\"} to choose one\n"; stderr != want {
+			t.Errorf("%s: stderr = %q, want %q", platform, stderr, want)
+		}
+		if stdout != "" {
+			t.Errorf("%s: stdout = %q, want empty", platform, stdout)
+		}
+	}
+}
+
+// An explicit {"bot":...} override still sends when the profile lists no
+// bots for the platform.
+func TestBotOverrideRescuesEmptyBots(t *testing.T) {
+	rec := &recorder{}
+	srv := httptest.NewServer(rec.handler(jsonResponder(200, `{"ok":true}`)))
+	t.Cleanup(srv.Close)
+	t.Setenv("OMOSENSE_TELEGRAM_API", srv.URL)
+
+	_, _, code := runSay(t, "--profile", "bare", "telegram", "send", `{"bot":"b1","chat_id":1,"text":"x"}`)
+	r := rec.last(t)
+	if r.path != "/botTGTOK1/sendMessage" {
+		t.Errorf("path = %s, want the override token (/botTGTOK1/sendMessage)", r.path)
+	}
+	jsonEqual(t, r.body, `{"chat_id":1,"text":"x"}`)
+	if code != 0 {
+		t.Errorf("exit = %d, want 0", code)
+	}
+}
+
+// IS-7: --profile selects the profile whose bots list provides the
+// default bot (family's first bot, not main's).
+func TestProfileSelectsDefaultBot(t *testing.T) {
+	rec := &recorder{}
+	srv := httptest.NewServer(rec.handler(jsonResponder(200, `{"ok":true}`)))
+	t.Cleanup(srv.Close)
+	t.Setenv("OMOSENSE_TELEGRAM_API", srv.URL)
+
+	_, _, code := runSay(t, "--profile", "family", "telegram", "send", `{"chat_id":1,"text":"x"}`)
+	r := rec.last(t)
+	if r.path != "/botTGTOKFAM/sendMessage" {
+		t.Errorf("path = %s, want family's first bot (/botTGTOKFAM/sendMessage)", r.path)
+	}
 	if code != 0 {
 		t.Errorf("exit = %d, want 0", code)
 	}

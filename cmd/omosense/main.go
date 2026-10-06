@@ -1,4 +1,4 @@
-// Command omosense is the Go rewrite of the ~/.omomeow bun monitors
+// Command omosense is the Go rewrite of the bun monitors
 // (listen, watch-google, remind, watch-herdr, memory-tidy, say). Each
 // subcommand runs one source in-process with the TS stdout grammar; the
 // resident daemon and its attach clients are the default long-term mode.

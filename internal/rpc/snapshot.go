@@ -66,20 +66,10 @@ func socketPath() string {
 	return filepath.Join(dir, "rpc", "rpc.sock")
 }
 
+// watchAll reports whole-daemon mode: the --all flag or the profile's
+// rpc.all setting watches every session, not only threads.json handles.
 func watchAll(c *core.Ctx) bool {
-	if c.Flags["--all"] {
-		return true
-	}
-	if c.Cfg == nil || c.Cfg.Raw == nil {
-		return false
-	}
-	v, _ := c.Cfg.Raw.Get("rpc")
-	m, ok := v.(*core.OMap)
-	if !ok {
-		return false
-	}
-	v, _ = m.Get("all")
-	return v == true
+	return c.Flags["--all"] || c.Profile.RPC.All
 }
 
 // threads preserves object order and uses array indices as thread keys.

@@ -20,8 +20,8 @@ func TestChangedDetectionNow(t *testing.T) {
 	shaA := commitAt(t, repoA, 1750000000, "a1")
 	repoB := makeRepo(t, agents, "beta")
 	shaB := commitAt(t, repoB, 1750000100, "b1")
-	excluded := makeRepo(t, agents, "owo-mode-57b805e5")
-	commitAt(t, excluded, 1750000200, "e1")             // EXCLUDE set: never observed by heads()
+	excluded := makeRepo(t, agents, "skipped-repo")
+	commitAt(t, excluded, 1750000200, "e1")             // tidy.exclude: never observed by heads()
 	mkdirAll(t, filepath.Join(agents, "norepo"))        // no repo/ subdir
 	mkdirAll(t, filepath.Join(agents, "nogit", "repo")) // repo/ without .git
 	// alpha has a stale sha (from = that sha); beta is null in the watermark
@@ -30,6 +30,7 @@ func TestChangedDetectionNow(t *testing.T) {
 
 	var buf bytes.Buffer
 	c := testCtx(state, "main", &buf)
+	c.Profile.Tidy.Exclude = []string{"skipped-repo"}
 	c.Flags["--now"] = true
 	if code := Run(c, []string{"--now"}); code != 0 {
 		t.Fatalf("Run --now = %d, want 0", code)
@@ -103,13 +104,14 @@ func TestWriteWatermarkPreservesFieldsAndOrder(t *testing.T) {
 	sha1 := commitAt(t, repoR1, 1750000000, "one")
 	repoR2 := makeRepo(t, agents, "r2")
 	sha2 := commitAt(t, repoR2, 1750000100, "two")
-	excluded := makeRepo(t, agents, "owo-family-bccd4b63")
-	commitAt(t, excluded, 1750000200, "x") // EXCLUDE set: heads() skips it
+	excluded := makeRepo(t, agents, "skipped-repo")
+	commitAt(t, excluded, 1750000200, "x") // tidy.exclude: heads() skips it
 	wm := filepath.Join(state, "memory-tidy.json")
 	writeFile(t, wm, `{"note":"x","repos":{"b":"B0"},"extra":1}`)
 
 	var buf bytes.Buffer
 	c := testCtx(state, "main", &buf)
+	c.Profile.Tidy.Exclude = []string{"skipped-repo"}
 	c.Flags["--write-watermark"] = true
 	// "r3=a=b" locks the JS split("=", 2) limit: the value is "a", not "a=b".
 	if code := Run(c, []string{"--write-watermark", "r1=AAA", "r3=a=b"}); code != 0 {
@@ -133,7 +135,7 @@ func TestWriteWatermarkPreservesFieldsAndOrder(t *testing.T) {
 	}
 
 	// Without pairs the watermark defaults to current heads: r1 keeps its
-	// position with the new sha, r2 is appended, the EXCLUDE repo is absent.
+	// position with the new sha, r2 is appended, the excluded repo is absent.
 	buf.Reset()
 	if code := Run(c, []string{"--write-watermark"}); code != 0 {
 		t.Fatalf("Run --write-watermark (no pairs) = %d, want 0", code)
@@ -358,7 +360,7 @@ func TestSourceRunStopsOnCancel(t *testing.T) {
 
 func TestSourcesPausable(t *testing.T) {
 	for _, prof := range []string{"main", "family"} {
-		srcs := Sources(&core.Ctx{Profile: core.Profile{Name: prof}})
+		srcs := Sources(&core.Ctx{Profile: core.Profile{Name: prof, Tidy: core.TidyCfg{Enabled: true}}})
 		if len(srcs) != 1 {
 			t.Fatalf("profile %s: Sources = %d, want 1", prof, len(srcs))
 		}
@@ -379,12 +381,99 @@ func TestSourcesPausable(t *testing.T) {
 	}
 }
 
+func TestTidySkipRules(t *testing.T) {
+	_, agents, state := sandbox(t)
+	commitAt(t, makeRepo(t, agents, "self"), 1750000000, "self")
+	shaX := commitAt(t, makeRepo(t, agents, "x"), 1750000100, "x")
+	shaY := commitAt(t, makeRepo(t, agents, "y"), 1750000200, "y")
+	onlyY := fmt.Sprintf(`TIDY {"changed":[{"repo":"y","from":null,"to":%q}]}`, shaY)
+
+	t.Run("own memory", func(t *testing.T) {
+		var buf bytes.Buffer
+		c := testCtx(state, "main", &buf)
+		c.Profile.Memory = "self"
+		c.Flags["--now"] = true
+		if code := Run(c, []string{"--now"}); code != 0 {
+			t.Fatalf("Run --now = %d, want 0", code)
+		}
+		wantLines(t, linesOf(&buf),
+			fmt.Sprintf(`TIDY {"changed":[{"repo":"x","from":null,"to":%q},{"repo":"y","from":null,"to":%q}]}`, shaX, shaY))
+	})
+	t.Run("exclude beats learnOthers", func(t *testing.T) {
+		var buf bytes.Buffer
+		c := testCtx(state, "main", &buf)
+		c.Profile.Memory = "self"
+		c.Profile.Tidy.Exclude = []string{"x"}
+		c.Flags["--now"] = true
+		if code := Run(c, []string{"--now"}); code != 0 {
+			t.Fatalf("Run --now = %d, want 0", code)
+		}
+		wantLines(t, linesOf(&buf), onlyY)
+	})
+	t.Run("learnOthers false", func(t *testing.T) {
+		var buf bytes.Buffer
+		c := testCtx(state, "main", &buf)
+		c.Profile.Memory = "self"
+		c.Profile.Tidy.Exclude = []string{"x"}
+		c.Profile.Tidy.LearnOthers = false
+		c.Flags["--now"] = true
+		if code := Run(c, []string{"--now"}); code != 0 {
+			t.Fatalf("Run --now = %d, want 0", code)
+		}
+		if buf.Len() != 0 {
+			t.Fatalf("stdout = %q, want no lines", buf.String())
+		}
+	})
+}
+
+func TestDisabledProfileOneShot(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		flag string
+		args []string
+	}{
+		{"now", "--now", []string{"--now"}},
+		{"write-watermark", "--write-watermark", []string{"--write-watermark", "y=abc"}},
+		{"backup-now", "--backup-now", []string{"--backup-now"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, agents, state := sandbox(t)
+			commitAt(t, makeRepo(t, agents, "y"), 1750000000, "y")
+			var buf bytes.Buffer
+			c := testCtx(state, "family", &buf)
+			c.Profile.Tidy.Enabled = false
+			c.Profile.Tidy.LearnOthers = true
+			c.Flags[tc.flag] = true
+			if code := Run(c, tc.args); code != 0 {
+				t.Fatalf("Run = %d, want 0", code)
+			}
+			wantLines(t, linesOf(&buf), "LOG tidy disabled for profile family")
+			if _, err := os.Stat(filepath.Join(state, "memory-tidy.json")); !os.IsNotExist(err) {
+				t.Fatal("disabled tidy wrote a watermark")
+			}
+			if _, err := os.Stat(backupsOf(t)); !os.IsNotExist(err) {
+				t.Fatal("disabled tidy wrote a backup")
+			}
+		})
+	}
+}
+
+func TestSourcesDisabled(t *testing.T) {
+	srcs := Sources(&core.Ctx{Profile: core.Profile{Name: "family"}})
+	if len(srcs) != 0 {
+		t.Fatalf("Sources = %d, want none when tidy is disabled", len(srcs))
+	}
+}
+
 func testCtx(state, profile string, buf *bytes.Buffer) *core.Ctx {
 	return &core.Ctx{
-		State:   state,
-		Profile: core.Profile{Name: profile},
-		Flags:   map[string]bool{},
-		Out:     core.NewOut(buf),
+		State: state,
+		Profile: core.Profile{
+			Name: profile,
+			Tidy: core.TidyCfg{Enabled: true, LearnOthers: true},
+		},
+		Flags: map[string]bool{},
+		Out:   core.NewOut(buf),
 	}
 }
 

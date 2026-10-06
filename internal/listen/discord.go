@@ -3,10 +3,12 @@ package listen
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -16,19 +18,23 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// Logger is global and Op7 has no session identity. Install one immutable,
-// silent dispatcher, and guard the single active source for this process.
+// Logger is global and the SDK carries no session identity. Install one
+// immutable, silent dispatcher, and guard the bots active in this process
+// by name so the same bot never opens two gateway sessions.
 var discordActive struct {
 	sync.Mutex
-	outage *outage
+	bots map[string]*outage
 }
 
 func init() {
+	discordActive.bots = map[string]*outage{}
 	discordgo.Logger = func(_, _ int, format string, args ...any) {
 		discordActive.Lock()
 		defer discordActive.Unlock()
-		if discordActive.outage != nil {
-			discordActive.outage.capture(format, args...)
+		// One process-global logger, many sessions: every active outage
+		// sees the line and keeps its own close code.
+		for _, o := range discordActive.bots {
+			o.capture(format, args...)
 		}
 	}
 }
@@ -63,26 +69,56 @@ func (g *gatewaySocket) close() {
 	}
 }
 
+// discord runs one gateway session per configured bot, concurrently; the
+// first failure cancels the rest, exactly like the telegram fan-out.
 func (s src) discord(ctx context.Context, sink core.Sink) error {
+	if len(s.cfg.Profile.Discord.Bots) == 0 {
+		return errors.New("discord source registered without bots")
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var wg sync.WaitGroup
+	errs := make(chan error, len(s.cfg.Profile.Discord.Bots))
+	for _, bot := range s.cfg.Profile.Discord.Bots {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := s.discordBot(ctx, sink, bot); err != nil {
+				errs <- err
+				cancel()
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		return err
+	}
+	return nil
+}
+
+// discordBot owns one bot's gateway session for the whole process: the
+// registry entry makes a second session for the same bot name impossible.
+func (s src) discordBot(ctx context.Context, sink core.Sink, bot string) error {
 	cl := s.clock
 	if cl == nil {
 		cl = wallClock{}
 	}
-	o := &outage{clock: cl, sink: sink}
+	o := &outage{clock: cl, sink: sink, bot: bot}
 	discordActive.Lock()
-	if discordActive.outage != nil {
+	if _, active := discordActive.bots[bot]; active {
 		discordActive.Unlock()
-		return errors.New("discord source already active in this process")
+		return fmt.Errorf("discord bot %s already active in this process", bot)
 	}
-	discordActive.outage = o
+	discordActive.bots[bot] = o
 	discordActive.Unlock()
 	defer func() {
 		o.stop()
 		discordActive.Lock()
-		discordActive.outage = nil
+		delete(discordActive.bots, bot)
 		discordActive.Unlock()
 	}()
-	token, err := core.Cred(os.Getenv("HOME"), "discordbot-credentials.json", s.cfg.Cfg.Discord.Bot)
+	token, err := core.Cred(os.Getenv("HOME"), "discordbot-credentials.json", bot)
 	if err != nil {
 		return err
 	}
@@ -97,9 +133,9 @@ func (s src) discord(ctx context.Context, sink core.Sink) error {
 	// unbounded reconnect loop. Reusing this session preserves resume state.
 	session.ShouldReconnectOnError = false
 	session.Identify.Intents = 1 | 512 | 4096 | 32768
-	session.Identify.Properties.OS = "darwin"
-	session.Identify.Properties.Browser = "omomeow"
-	session.Identify.Properties.Device = "omomeow"
+	session.Identify.Properties.OS = runtime.GOOS
+	session.Identify.Properties.Browser = "omosense"
+	session.Identify.Properties.Device = "omosense"
 	session.Client = &http.Client{Timeout: 20 * time.Second, Transport: gatewayTransport{ctx, strings.TrimRight(os.Getenv("OMOSENSE_DISCORD_API"), "/")}}
 	socket := &gatewaySocket{}
 	defer socket.close()
@@ -156,7 +192,7 @@ func (s src) discord(ctx context.Context, sink core.Sink) error {
 		handlers.Add(1)
 		go func() {
 			defer handlers.Done()
-			if err := s.dcHandle(ctx, sink, e.RawData); err != nil && ctx.Err() == nil {
+			if err := s.dcHandle(ctx, sink, bot, e.RawData); err != nil && ctx.Err() == nil {
 				sink.Log("dc handle " + redact(err, token))
 			}
 		}()

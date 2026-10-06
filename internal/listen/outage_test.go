@@ -15,7 +15,7 @@ import (
 
 func TestDiscordCaptureResetForUntypedTransportFailure(t *testing.T) {
 	cl, sink := newClock(), newSink()
-	o := &outage{clock: cl, sink: sink}
+	o := &outage{clock: cl, sink: sink, bot: "test"}
 	defer o.stop()
 	o.ready("first", false)
 	await(t, sink.signal)
@@ -24,7 +24,7 @@ func TestDiscordCaptureResetForUntypedTransportFailure(t *testing.T) {
 	first := await(t, cl.armed)
 	cl.advance(3 * time.Minute)
 	first.fire()
-	if r := await(t, sink.signal); r.value != "discord down 3m+ (last close 1005), still reconnecting" {
+	if r := await(t, sink.signal); r.value != "discord test down 3m+ (last close 1005), still reconnecting" {
 		t.Fatal(r)
 	}
 	o.ready("second", false)
@@ -35,7 +35,7 @@ func TestDiscordCaptureResetForUntypedTransportFailure(t *testing.T) {
 	second := await(t, cl.armed)
 	cl.advance(3 * time.Minute)
 	second.fire()
-	if r := await(t, sink.signal); r.value != "discord down 3m+ (last close 1006), still reconnecting" {
+	if r := await(t, sink.signal); r.value != "discord test down 3m+ (last close 1006), still reconnecting" {
 		t.Fatal("stale close code after Connect", r)
 	}
 }
@@ -44,7 +44,7 @@ func TestDiscordOutageReadyResumedAndShortRecovery(t *testing.T) {
 	for _, mode := range []string{"initial", "recovery", "resumed", "short", "resumed-first", "stopped"} {
 		t.Run(mode, func(t *testing.T) {
 			cl, sink := newClock(), newSink()
-			o := &outage{clock: cl, sink: sink}
+			o := &outage{clock: cl, sink: sink, bot: "test"}
 			if mode != "initial" && mode != "resumed-first" {
 				o.ready("first", false)
 				await(t, sink.signal)
@@ -66,7 +66,7 @@ func TestDiscordOutageReadyResumedAndShortRecovery(t *testing.T) {
 			}
 			cl.advance(210 * time.Second)
 			tm.fire()
-			if r := await(t, sink.signal); r.value != "discord down 3m+ (last close 4001), still reconnecting" {
+			if r := await(t, sink.signal); r.value != "discord test down 3m+ (last close 4001), still reconnecting" {
 				t.Fatal(r)
 			}
 			o.ready("second", mode == "resumed" || mode == "resumed-first")
@@ -75,9 +75,9 @@ func TestDiscordOutageReadyResumedAndShortRecovery(t *testing.T) {
 					t.Fatal(sink.snapshot())
 				}
 			} else {
-				want := "discord recovered after 4m down"
+				want := "discord test recovered after 4m down"
 				if mode == "initial" {
-					want = "discord ready as second"
+					want = "discord test ready as second"
 				}
 				if r := await(t, sink.signal); r.value != want {
 					t.Fatal(r)
@@ -90,7 +90,7 @@ func TestDiscordOutageReadyResumedAndShortRecovery(t *testing.T) {
 
 func TestDiscordGatewaySecondOutageResetAndResume(t *testing.T) {
 	c, cl := testCtx(t), newClock()
-	c.Profile.Discord = true
+	c.Profile.Discord.Bots = []string{"test"}
 	peers, cleanup := fakeGateway(t)
 	t.Cleanup(cleanup)
 	ctx, cancel := context.WithCancel(t.Context())
@@ -133,7 +133,7 @@ func TestDiscordGatewaySecondOutageResetAndResume(t *testing.T) {
 	await(t, backoff)
 	cl.advance(3 * time.Minute)
 	tm.fire()
-	if r := await(t, sink.signal); r.value != "discord down 3m+ (last close 4000), still reconnecting" {
+	if r := await(t, sink.signal); r.value != "discord test down 3m+ (last close 4000), still reconnecting" {
 		t.Fatal(r)
 	}
 	reopen <- struct{}{}
@@ -144,7 +144,7 @@ func TestDiscordGatewaySecondOutageResetAndResume(t *testing.T) {
 		t.Fatal("resume session", err)
 	}
 	ready(t, second, "RESUMED")
-	if r := await(t, sink.signal); r.value != "discord recovered after 3m down" {
+	if r := await(t, sink.signal); r.value != "discord test recovered after 3m down" {
 		t.Fatal(r)
 	}
 	// Connect has reset capture before the reader can process this TCP drop.
@@ -152,7 +152,7 @@ func TestDiscordGatewaySecondOutageResetAndResume(t *testing.T) {
 	tm = await(t, cl.armed)
 	cl.advance(3 * time.Minute)
 	tm.fire()
-	if r := await(t, sink.signal); r.value != "discord down 3m+ (last close 1006), still reconnecting" {
+	if r := await(t, sink.signal); r.value != "discord test down 3m+ (last close 1006), still reconnecting" {
 		t.Fatal("stale close code", r)
 	}
 	cancel()
@@ -166,6 +166,7 @@ func TestDiscordVoiceFlagTranscription(t *testing.T) {
 	for _, mode := range []string{"voice", "unflagged", "failed"} {
 		t.Run(mode, func(t *testing.T) {
 			c := testCtx(t)
+			c.Profile.Discord.Roles = map[string]string{"20": "wife"}
 			fail := ""
 			if mode == "failed" {
 				fail = "ffmpeg"
@@ -181,12 +182,13 @@ func TestDiscordVoiceFlagTranscription(t *testing.T) {
 			if mode == "unflagged" {
 				flags = 0
 			}
-			raw := []byte(fmt.Sprintf(`{"id":"v","channel_id":"ch","guild_id":"guild","author":{"id":"wife","username":"u","global_name":null},"content":"original","flags":%d,"attachments":[{"filename":"voice.ogg","url":%q}]}`, flags, server.URL))
+			raw := []byte(fmt.Sprintf(`{"id":"v","channel_id":"ch","guild_id":"guild","author":{"id":"20","username":"u","global_name":null},"content":"original","flags":%d,"attachments":[{"filename":"voice.ogg","url":%q}]}`, flags, server.URL))
 			sink := newSink()
-			if err := Sources(c)[0].(src).dcHandle(t.Context(), sink, raw); err != nil {
+			if err := Sources(c)[0].(src).dcHandle(t.Context(), sink, "test", raw); err != nil {
 				t.Fatal(err)
 			}
 			ev := await(t, sink.signal).value.(map[string]any)
+			// The role comes from the profile's roles map, not from the id.
 			if ev["role"] != "wife" || ev["from"] != "u" || ev["guild_id"] != "guild" {
 				t.Fatal(ev)
 			}

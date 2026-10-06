@@ -50,10 +50,7 @@ func newServer(base *core.Ctx, p paths, opts serverOptions) (*server, error) {
 	s := &server{base: base, paths: p, options: opts,
 		profiles: make(map[string]*profileHost), clients: make(map[*client]hello),
 		conns: make(map[net.Conn]struct{}), stop: make(chan string, 1)}
-	names := []string{"main"}
-	if base.Cfg.Profiles != nil {
-		names = base.Cfg.Profiles.Keys()
-	}
+	names := base.Cfg.Profiles.Keys()
 	pool := &lockPool{held: make(map[string]*sharedLock)}
 	s.locks = pool
 	for _, name := range names {

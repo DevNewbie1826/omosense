@@ -152,13 +152,9 @@ func report(err error, code int) int {
 }
 
 func environmentPaths() (paths, error) {
-	dir := os.Getenv("OMOMEOW_DIR")
-	if dir == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return paths{}, err
-		}
-		dir = filepath.Join(home, ".omomeow")
+	dir, _, err := core.EnvDirs()
+	if err != nil {
+		return paths{}, err
 	}
 	return pathsFor(dir, os.Getenv("OMOSENSE_SOCK")), nil
 }

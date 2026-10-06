@@ -16,7 +16,7 @@ import (
 func transcribe(ctx context.Context, url string) (text string, err error) {
 	// A unique directory prevents concurrent voice messages from overwriting
 	// each other's ffmpeg/Whisper files. All artifacts are removed on every exit.
-	dir, err := os.MkdirTemp("", "os-voice-")
+	dir, err := os.MkdirTemp("", "omosense-voice-")
 	if err != nil {
 		return "", fmt.Errorf("voice temporary directory: %w", err)
 	}
@@ -25,7 +25,7 @@ func transcribe(ctx context.Context, url string) (text string, err error) {
 			err = fmt.Errorf("voice cleanup: %w", cleanupErr)
 		}
 	}()
-	base := filepath.Join(dir, "omomeow-voice")
+	base := filepath.Join(dir, "omosense-voice")
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return "", fmt.Errorf("voice request: %w", err)

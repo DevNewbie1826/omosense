@@ -58,14 +58,14 @@ func buildBinaries(t *testing.T) {
 func cliEnv(t *testing.T) (home, dir, state string) {
 	t.Helper()
 	home = t.TempDir()
-	dir = filepath.Join(home, ".omomeow")
+	dir = filepath.Join(home, ".omosense")
 	state = filepath.Join(dir, "state")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("HOME", home)
-	t.Setenv("OMOMEOW_DIR", dir)
-	t.Setenv("OMOMEOW_STATE", state)
+	t.Setenv("OMOSENSE_DIR", dir)
+	t.Setenv("OMOSENSE_STATE", state)
 	return home, dir, state
 }
 
@@ -76,7 +76,7 @@ func writeCliConfig(t *testing.T, dir, cfg string) {
 	}
 }
 
-const cliFallbackCfg = `{"telegram":{"bot":"b1","dm_bot":"b2"},"discord":{"bot":"d1"}}`
+const cliProfilesCfg = `{"profiles":{"main":{"telegram":{"bots":["b1","b2"]},"discord":{"bots":["d1"]},"tidy":{"enabled":true}}}}`
 
 func runBin(t *testing.T, args ...string) (stdout, stderr string, code int) {
 	t.Helper()
@@ -133,7 +133,7 @@ func TestCLITopLevelHelp(t *testing.T) {
 
 func TestCLIUnknownProfileExits2(t *testing.T) {
 	_, dir, _ := cliEnv(t)
-	writeCliConfig(t, dir, cliFallbackCfg)
+	writeCliConfig(t, dir, cliProfilesCfg)
 
 	stdout, stderr, code := runBin(t, "listen", "--profile", "nope")
 	if code != 2 {
@@ -149,7 +149,7 @@ func TestCLIUnknownProfileExits2(t *testing.T) {
 
 func TestCLISayProfileBothSyntaxes(t *testing.T) {
 	_, dir, _ := cliEnv(t)
-	writeCliConfig(t, dir, cliFallbackCfg)
+	writeCliConfig(t, dir, cliProfilesCfg)
 
 	for _, args := range [][]string{
 		{"say", "telegram", "send", "{}", "--profile", "nope"},
@@ -167,7 +167,7 @@ func TestCLISayProfileBothSyntaxes(t *testing.T) {
 
 func TestCLIReadOnlyPathsLeaveStateAbsent(t *testing.T) {
 	_, dir, state := cliEnv(t)
-	writeCliConfig(t, dir, cliFallbackCfg)
+	writeCliConfig(t, dir, cliProfilesCfg)
 
 	for _, args := range [][]string{
 		{"google", "--once", "--profile", "main"},
@@ -184,7 +184,7 @@ func TestCLIReadOnlyPathsLeaveStateAbsent(t *testing.T) {
 
 func TestCLIWritableRunCreatesState(t *testing.T) {
 	_, dir, state := cliEnv(t)
-	writeCliConfig(t, dir, cliFallbackCfg)
+	writeCliConfig(t, dir, cliProfilesCfg)
 
 	// remind is a long-running writable path with no external calls when the
 	// reminders file is absent; it must create the state dir, then stop on SIGTERM.
@@ -231,5 +231,68 @@ func TestCLIWritableRunCreatesState(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		_ = cmd.Process.Kill()
 		t.Fatalf("remind did not exit on SIGTERM")
+	}
+}
+
+func TestCLILegacyConfigFailsLoudly(t *testing.T) {
+	_, dir, _ := cliEnv(t)
+	writeCliConfig(t, dir, `{"telegram":{"bot":"b1"},"discord":{"bot":"d1"}}`)
+
+	_, stderr, code := runBin(t, "listen", "--profile", "main", "--dry-run")
+	if code != 1 {
+		t.Errorf("exit = %d, want 1", code)
+	}
+	if !strings.Contains(stderr, `legacy top-level key "telegram" is no longer supported`) || !strings.Contains(stderr, "profiles") {
+		t.Errorf("stderr = %q, want the legacy config message", stderr)
+	}
+
+	// A legacy document that also carries a profiles block fails the same
+	// way instead of loading with the old sections quietly ignored.
+	writeCliConfig(t, dir, `{"telegram":{"bot":"b1"},"profiles":{"main":{"telegram":{"bots":["b1"]}}}}`)
+	_, stderr, code = runBin(t, "listen", "--profile", "main", "--dry-run")
+	if code != 1 || !strings.Contains(stderr, `legacy top-level key "telegram"`) {
+		t.Errorf("exit = %d stderr = %q, want legacy failure", code, stderr)
+	}
+}
+
+func TestCLIMissingProfilesFailsLoudly(t *testing.T) {
+	_, dir, _ := cliEnv(t)
+	writeCliConfig(t, dir, `{"mail": true}`)
+	_, stderr, code := runBin(t, "listen", "--profile", "main", "--dry-run")
+	if code != 1 || !strings.Contains(stderr, `config.json: "profiles" is required`) {
+		t.Errorf("exit = %d stderr = %q, want profiles required", code, stderr)
+	}
+}
+
+func TestCLIStaleOmomeowEnvFails(t *testing.T) {
+	home := t.TempDir()
+	dir := filepath.Join(home, ".omomeow")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeCliConfig(t, dir, cliProfilesCfg)
+	buildBinaries(t)
+	var env []string
+	for _, e := range os.Environ() {
+		if strings.HasPrefix(e, "OMOSENSE_DIR=") || strings.HasPrefix(e, "OMOSENSE_STATE=") ||
+			strings.HasPrefix(e, "OMOMEOW_DIR=") || strings.HasPrefix(e, "OMOMEOW_STATE=") {
+			continue
+		}
+		env = append(env, e)
+	}
+	cmd := exec.Command(binPath, "listen", "--dry-run")
+	cmd.Env = append(env, "HOME="+home, "OMOMEOW_DIR="+dir)
+	var ob, eb bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &ob, &eb
+	err := cmd.Run()
+	code := 0
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		code = ee.ExitCode()
+	} else if err != nil {
+		t.Fatal(err)
+	}
+	if code != 1 || !strings.Contains(eb.String(), "OMOMEOW_DIR is no longer read; set OMOSENSE_DIR") {
+		t.Errorf("exit = %d stderr = %q, want stale OMOMEOW_DIR failure", code, eb.String())
 	}
 }

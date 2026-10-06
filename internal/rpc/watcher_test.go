@@ -437,17 +437,16 @@ func TestMalformedStateSkipsOnlySession(t *testing.T) {
 
 func TestThreadFiltersAndWatchAll(t *testing.T) {
 	for _, tc := range []struct {
-		name, threads, config string
-		all                   bool
-		keys                  []any
+		name, threads string
+		all, rpcAll   bool
+		keys          []any
 	}{
-		{"object", `{"a":{"session_id":"d1"},"b":{"session":"d2"}}`, `{}`, false, []any{"a", "b"}},
-		{"array", `[{"session":"d1"},{"session_id":"d2"}]`, `{}`, false, []any{"0", "1"}},
-		{"missing", "", `{}`, false, nil},
-		{"malformed", `broken`, `{}`, false, nil},
-		{"non true", "", `{"rpc":{"all":"true"}}`, false, nil},
-		{"flag", `{"a":{"session":"d1"}}`, `{}`, true, []any{"a", nil, nil}},
-		{"config", "", `{"rpc":{"all":true}}`, false, []any{nil, nil, nil}},
+		{"object", `{"a":{"session_id":"d1"},"b":{"session":"d2"}}`, false, false, []any{"a", "b"}},
+		{"array", `[{"session":"d1"},{"session_id":"d2"}]`, false, false, []any{"0", "1"}},
+		{"missing", "", false, false, nil},
+		{"malformed", `broken`, false, false, nil},
+		{"flag", `{"a":{"session":"d1"}}`, true, false, []any{"a", nil, nil}},
+		{"rpc.all", "", false, true, []any{nil, nil, nil}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			path := shortSocket(t)
@@ -456,11 +455,7 @@ func TestThreadFiltersAndWatchAll(t *testing.T) {
 			var b bytes.Buffer
 			c := rpcCtx(t, &b, tc.threads)
 			c.Flags["--all"] = tc.all
-			v, err := core.ParseJSON([]byte(tc.config))
-			if err != nil {
-				t.Fatal(err)
-			}
-			c.Cfg = &core.Cfg{Raw: v.(*core.OMap)}
+			c.Profile.RPC.All = tc.rpcAll
 			runTicks(t, c, 1)
 			got := events(t, &b)
 			if len(got) != len(tc.keys) {
@@ -564,7 +559,7 @@ func TestRegisteredJobSource(t *testing.T) {
 }
 
 func TestWatchAllDoneRule(t *testing.T) {
-	for _, mode := range []string{"flag", "config"} {
+	for _, mode := range []string{"flag", "rpc.all"} {
 		t.Run(mode, func(t *testing.T) {
 			// Given unregistered work and count growth with explicit watch-all.
 			var ticks []scriptTick
@@ -579,11 +574,7 @@ func TestWatchAllDoneRule(t *testing.T) {
 			if mode == "flag" {
 				c.Flags["--all"] = true
 			} else {
-				v, err := core.ParseJSON([]byte(`{"rpc":{"all":true}}`))
-				if err != nil {
-					t.Fatal(err)
-				}
-				c.Cfg = &core.Cfg{Raw: v.(*core.OMap)}
+				c.Profile.RPC.All = true
 			}
 			// When the source observes every state over the real socket.
 			runTicks(t, c, len(ticks))

@@ -21,14 +21,18 @@ func TestDiscordLoggerSilentAndCloseCapture(t *testing.T) {
 	oldOut, oldErr := os.Stdout, os.Stderr
 	os.Stdout, os.Stderr = writer, writer
 	defer func() { os.Stdout, os.Stderr = oldOut, oldErr }()
-	o := &outage{clock: newClock(), sink: newSink()}
+	o := &outage{clock: newClock(), sink: newSink(), bot: "test"}
 	discordActive.Lock()
-	old := discordActive.outage
-	discordActive.outage = o
+	old, had := discordActive.bots["test"]
+	discordActive.bots["test"] = o
 	discordActive.Unlock()
 	defer func() {
 		discordActive.Lock()
-		discordActive.outage = old
+		if had {
+			discordActive.bots["test"] = old
+		} else {
+			delete(discordActive.bots, "test")
+		}
 		discordActive.Unlock()
 	}()
 	if discordgo.Logger == nil {
