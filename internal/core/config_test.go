@@ -299,3 +299,30 @@ func TestLoadCfgRawKeepsOrder(t *testing.T) {
 		t.Errorf("raw keys = %v, want %v", got, want)
 	}
 }
+
+func TestCred(t *testing.T) {
+	home := t.TempDir()
+	f := filepath.Join(home, ".config", "agent-messenger", "telegrambot-credentials.json")
+	if err := os.MkdirAll(filepath.Dir(f), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(f, []byte(`{"bots":{"tb":{"token":"tk"}},"other":1}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tok, err := Cred(home, "telegrambot-credentials.json", "tb")
+	if err != nil {
+		t.Fatalf("cred: %v", err)
+	}
+	if tok != "tk" {
+		t.Errorf("token = %q, want tk", tok)
+	}
+
+	_, err = Cred(home, "telegrambot-credentials.json", "missing")
+	if err == nil {
+		t.Fatal("expected an error for an unknown bot")
+	}
+	if strings.Contains(err.Error(), "tk") {
+		t.Errorf("error must never echo a token value: %v", err)
+	}
+}
