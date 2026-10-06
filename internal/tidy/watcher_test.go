@@ -74,7 +74,7 @@ func TestOnceReadOnly(t *testing.T) {
 	if got := readFile(t, wm); got != body {
 		t.Fatalf("--once rewrote the watermark:\ngot:\n%s\nwant:\n%s", got, body)
 	}
-	if _, err := os.Stat(filepath.Join(state, "memory-tidy-main.lock.json")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(state, "memory-tidy.lock.json")); !os.IsNotExist(err) {
 		t.Fatal("--once took the lock")
 	}
 	if _, err := os.Stat(wm + ".tmp"); !os.IsNotExist(err) {
@@ -240,7 +240,7 @@ func TestLoopQuietThenReemit(t *testing.T) {
 		if d != 5*time.Minute {
 			t.Errorf("interval = %v, want 5m", d)
 		}
-		if _, err := os.Stat(filepath.Join(state, "memory-tidy-main.lock.json")); err == nil {
+		if _, err := os.Stat(filepath.Join(state, "memory-tidy.lock.json")); err == nil {
 			lockHeld = true
 		} else {
 			t.Errorf("lock missing during loop: %v", err)
@@ -259,7 +259,7 @@ func TestLoopQuietThenReemit(t *testing.T) {
 	if !lockHeld {
 		t.Fatal("loop never observed its lock")
 	}
-	if _, err := os.Stat(filepath.Join(state, "memory-tidy-main.lock.json")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(state, "memory-tidy.lock.json")); !os.IsNotExist(err) {
 		t.Fatal("lock not released after Run")
 	}
 	if got := readFile(t, filepath.Join(state, "memory-tidy.json")); got != seed {
@@ -271,7 +271,7 @@ func TestLoopQuietThenReemit(t *testing.T) {
 	// the re-emit guard short-circuits first.
 	line := fmt.Sprintf(`TIDY {"changed":[{"repo":"alpha","from":null,"to":%q}]}`, sha)
 	wantLines(t, linesOf(&buf),
-		"LOG memory-tidy watcher starting (profile main, check 5m, quiet 90m, max 240m)",
+		"LOG memory-tidy watcher starting (check 5m, quiet 90m, max 240m)",
 		line,
 		line,
 	)
@@ -311,7 +311,7 @@ func TestLoopMaxEmitsAndBackups(t *testing.T) {
 	bundle := filepath.Join(home, ".omo", "memory-backups", date, "alpha.bundle")
 	size := statOf(t, bundle).Size()
 	wantLines(t, linesOf(&buf),
-		"LOG memory-tidy watcher starting (profile main, check 240m, quiet 600m, max 240m)",
+		"LOG memory-tidy watcher starting (check 240m, quiet 600m, max 240m)",
 		fmt.Sprintf("LOG memory-tidy backup %s repos=1 bytes=%d failed=none", date, size),
 		fmt.Sprintf(`TIDY {"changed":[{"repo":"alpha","from":null,"to":%q}]}`, sha),
 	)
@@ -348,36 +348,34 @@ func TestSourceRunStopsOnCancel(t *testing.T) {
 	// The daemon owns the lock, so the source must not create one; the
 	// first tick still runs its daily backup (0m old commit is not quiet,
 	// so no TIDY).
-	if _, err := os.Stat(filepath.Join(state, "memory-tidy-main.lock.json")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(state, "memory-tidy.lock.json")); !os.IsNotExist(err) {
 		t.Fatal("daemon-hosted source took the lock")
 	}
 	date := seoulDateOf(t, time.UnixMilli(epoch*1000))
 	wantLines(t, linesOf(&buf),
-		"LOG memory-tidy watcher starting (profile main, check 10m, quiet 60m, max 240m)",
+		"LOG memory-tidy watcher starting (check 10m, quiet 60m, max 240m)",
 		fmt.Sprintf("LOG memory-tidy backup %s repos=1 bytes=%d failed=none", date, statOf(t, filepath.Join(backupsOf(t), date, "alpha.bundle")).Size()),
 	)
 }
 
 func TestSourcesPausable(t *testing.T) {
-	for _, prof := range []string{"main", "family"} {
-		srcs := Sources(&core.Ctx{Profile: core.Profile{Name: prof, Tidy: core.TidyCfg{Enabled: true}}})
-		if len(srcs) != 1 {
-			t.Fatalf("profile %s: Sources = %d, want 1", prof, len(srcs))
-		}
-		s := srcs[0]
-		if s.Name() != "tidy" {
-			t.Errorf("name = %q", s.Name())
-		}
-		if s.AlwaysOn() {
-			t.Errorf("tidy must be pausable (pause-while-idle)")
-		}
-		name, legacy := s.LockName()
-		if name != "memory-tidy-"+prof || legacy != "" {
-			t.Errorf("lock = %q/%q, want memory-tidy-%s with no legacy", name, legacy, prof)
-		}
-		if got, want := s.Prefixes(), []string{"TIDY"}; len(got) != 1 || got[0] != want[0] {
-			t.Errorf("prefixes = %v, want %v", got, want)
-		}
+	srcs := Sources(&core.Ctx{Profile: core.Profile{Tidy: core.TidyCfg{Enabled: true}}})
+	if len(srcs) != 1 {
+		t.Fatalf("Sources = %d, want 1", len(srcs))
+	}
+	s := srcs[0]
+	if s.Name() != "tidy" {
+		t.Errorf("name = %q", s.Name())
+	}
+	if s.AlwaysOn() {
+		t.Errorf("tidy must be pausable (pause-while-idle)")
+	}
+	name, legacy := s.LockName()
+	if name != "memory-tidy" || legacy != "" {
+		t.Errorf("lock = %q/%q, want memory-tidy with no legacy", name, legacy)
+	}
+	if got, want := s.Prefixes(), []string{"TIDY"}; len(got) != 1 || got[0] != want[0] {
+		t.Errorf("prefixes = %v, want %v", got, want)
 	}
 }
 
@@ -426,7 +424,7 @@ func TestTidySkipRules(t *testing.T) {
 	})
 }
 
-func TestDisabledProfileOneShot(t *testing.T) {
+func TestDisabledTidyOneShot(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		flag string
@@ -447,7 +445,7 @@ func TestDisabledProfileOneShot(t *testing.T) {
 			if code := Run(c, tc.args); code != 0 {
 				t.Fatalf("Run = %d, want 0", code)
 			}
-			wantLines(t, linesOf(&buf), "LOG tidy disabled for profile family")
+			wantLines(t, linesOf(&buf), "LOG tidy disabled")
 			if _, err := os.Stat(filepath.Join(state, "memory-tidy.json")); !os.IsNotExist(err) {
 				t.Fatal("disabled tidy wrote a watermark")
 			}
@@ -459,17 +457,16 @@ func TestDisabledProfileOneShot(t *testing.T) {
 }
 
 func TestSourcesDisabled(t *testing.T) {
-	srcs := Sources(&core.Ctx{Profile: core.Profile{Name: "family"}})
+	srcs := Sources(&core.Ctx{Profile: core.Profile{}})
 	if len(srcs) != 0 {
 		t.Fatalf("Sources = %d, want none when tidy is disabled", len(srcs))
 	}
 }
 
-func testCtx(state, profile string, buf *bytes.Buffer) *core.Ctx {
+func testCtx(state, _ string, buf *bytes.Buffer) *core.Ctx {
 	return &core.Ctx{
 		State: state,
 		Profile: core.Profile{
-			Name: profile,
 			Tidy: core.TidyCfg{Enabled: true, LearnOthers: true},
 		},
 		Flags: map[string]bool{},

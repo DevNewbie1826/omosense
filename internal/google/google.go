@@ -13,7 +13,7 @@ import (
 )
 
 // Help is the usage text printed by omosense google --help.
-const Help = `Usage: omosense google [--profile P] [--once]
+const Help = `Usage: omosense google [--once]
 
 Watches calendars and mail via zele, printing CAL, SOON, MAIL and LOG
 lines to stdout.
@@ -36,8 +36,7 @@ func Run(c *core.Ctx, args []string) int {
 		w.once(context.Background())
 		return 0
 	}
-	name, legacy := lockNames(c.Profile.Name)
-	release := c.Acquire(name, legacy)
+	release := c.Acquire("watch-google", "")
 	defer release()
 	w, err := newWatcher(c, c.Out, true)
 	if err != nil {
@@ -51,39 +50,32 @@ func Run(c *core.Ctx, args []string) int {
 	return 0
 }
 
-func lockNames(profile string) (name, legacy string) {
-	return "watch-google-" + profile, "watch-google"
-}
-
-// Sources returns the google source of ctx's profile.
+// Sources returns the google source of the folder's config.
 func Sources(c *core.Ctx) []core.Source {
-	name, legacy := lockNames(c.Profile.Name)
 	return []core.Source{
 		src{
 			c:        c,
 			name:     "google",
 			prefixes: []string{"CAL", "SOON", "MAIL"},
-			lock:     name,
-			legacy:   legacy,
+			lock:     "watch-google",
 		},
 	}
 }
 
-// src is the daemon-hosted google source: one pausable watcher per profile.
+// src is the host's google source.
 type src struct {
 	c        *core.Ctx
 	name     string
 	prefixes []string
 	lock     string
-	legacy   string
 }
 
 func (s src) Name() string               { return s.name }
 func (s src) Prefixes() []string         { return s.prefixes }
 func (s src) AlwaysOn() bool             { return false }
-func (s src) LockName() (string, string) { return s.lock, s.legacy }
+func (s src) LockName() (string, string) { return s.lock, "" }
 
-// Run hosts the watcher on the daemon's sink. The daemon host owns the
+// Run hosts the watcher on the host's sink. The host owns the
 // watch-google lock (IS-15), so no lock is taken here.
 func (s src) Run(ctx context.Context, sink core.Sink) error {
 	w, err := newWatcher(s.c, sink, true)

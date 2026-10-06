@@ -27,7 +27,7 @@ func testEnv(t *testing.T) (dir, state string) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(`{"profiles":{"main":{"telegram":{"bots":["b1"]},"discord":{"bots":["d1"]}},"family":{"telegram":{"bots":["fam1"]}}}}`), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(`{"telegram":{"bot":"b1"},"discord":{"bot":"d1"}}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("HOME", home)
@@ -47,7 +47,7 @@ func loadCtx(t *testing.T) *core.Ctx {
 }
 
 func remindersFile(ctx *core.Ctx) string {
-	return filepath.Join(ctx.State, "reminders-"+ctx.Profile.Name+".json")
+	return filepath.Join(ctx.State, "reminders.json")
 }
 
 func mustRead(t *testing.T, p string) []byte {
@@ -68,13 +68,16 @@ func withHooks(t *testing.T, fixed time.Time, sayBin string, sleep func(context.
 	t.Cleanup(func() { hookNow, hookSleep, hookSayBin = oldNow, oldSleep, oldBin })
 }
 
-// writeFakeSay installs a script that records "$*" and exits per env, so a
-// test can flip FAKE_SAY_EXIT/STDOUT/STDERR between ticks.
+// writeFakeSay installs a script that records "$*" (and, when
+// FAKE_SAY_ENV_CAPTURE is set, the OMOSENSE_DIR/OMOSENSE_STATE it was handed)
+// and exits per env, so a test can flip FAKE_SAY_EXIT/STDOUT/STDERR between
+// ticks.
 func writeFakeSay(t *testing.T, capture string) string {
 	t.Helper()
 	p := filepath.Join(t.TempDir(), "fake-say")
 	script := `#!/bin/sh
 printf '%s\n' "$*" >> "$FAKE_SAY_CAPTURE"
+if [ -n "$FAKE_SAY_ENV_CAPTURE" ]; then printf '%s|%s\n' "$OMOSENSE_DIR" "$OMOSENSE_STATE" >> "$FAKE_SAY_ENV_CAPTURE"; fi
 [ -n "$FAKE_SAY_STDOUT" ] && printf '%s' "$FAKE_SAY_STDOUT"
 [ -n "$FAKE_SAY_STDERR" ] && printf '%s' "$FAKE_SAY_STDERR" >&2
 exit "$FAKE_SAY_EXIT"
@@ -257,8 +260,8 @@ func TestRunLoopSendsDueReminderOnce(t *testing.T) {
 	sink := newChanSink()
 	cancel, done := runSource(t, ctx, sink)
 
-	if got := sink.waitLine(t, "LOG reminder scheduler starting"); got != "LOG reminder scheduler starting (profile main)" {
-		t.Errorf("startup line = %q, want the TS grammar with the profile name", got)
+	if got := sink.waitLine(t, "LOG reminder scheduler starting"); got != "LOG reminder scheduler starting" {
+		t.Errorf("startup line = %q, want the TS grammar without a profile", got)
 	}
 	sent := sink.waitLine(t, "REMIND sent ")
 	if !strings.Contains(sent, `"sent":"2026-10-03T10:05:00.000Z"`) {
@@ -269,8 +272,8 @@ func TestRunLoopSendsDueReminderOnce(t *testing.T) {
 	}
 
 	capArgs := mustRead(t, capture)
-	if want := "say --profile main telegram send {\"b\":2,\"a\":1,\"text\":\"hi 안\"}\n"; string(capArgs) != want {
-		t.Errorf("say args = %q, want %q (target order kept, text merged)", capArgs, want)
+	if want := "say telegram send {\"b\":2,\"a\":1,\"text\":\"hi 안\"}\n"; string(capArgs) != want {
+		t.Errorf("say args = %q, want %q (target order kept, text merged, no --profile)", capArgs, want)
 	}
 
 	sleep.waitCalls(t, 1)
@@ -299,21 +302,19 @@ func TestRunLoopSendsDueReminderOnce(t *testing.T) {
 	}
 }
 
-// IS-7 companion: sendViaSay must pass --profile so a FAMILY reminder is
-// sent through FAMILY's bot (say's default bot is the selected profile's
-// first bot), never through main's.
-func TestSendViaSayPassesProfile(t *testing.T) {
-	_, _ = testEnv(t)
-	ctx, err := core.Load(core.ParseArgs([]string{"--profile", "family"}), true)
-	if err != nil {
-		t.Fatalf("load family: %v", err)
-	}
+// The say child must resolve the SAME folder: no --profile (the flag is
+// gone), and OMOSENSE_DIR/OMOSENSE_STATE pinned to this scheduler's dirs so
+// the child reads the same config.json and picks the same default bot.
+func TestSendViaSayInheritsFolder(t *testing.T) {
+	ctx := loadCtx(t)
 	file := remindersFile(ctx)
 	due := `[{"id":"f1","at":"2026-10-03T10:04:00.000Z","platform":"telegram","target":{"chat_id":7},"text":"hi"}]`
 	if err := os.WriteFile(file, []byte(due), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	capture := filepath.Join(t.TempDir(), "captured-args")
+	envCapture := filepath.Join(t.TempDir(), "captured-env")
+	t.Setenv("FAKE_SAY_ENV_CAPTURE", envCapture)
 	sleep := newFakeSleeper()
 	withHooks(t, fixedTime, writeFakeSay(t, capture), sleep.sleep)
 
@@ -321,8 +322,11 @@ func TestSendViaSayPassesProfile(t *testing.T) {
 	cancel, done := runSource(t, ctx, sink)
 	sink.waitLine(t, "REMIND sent ")
 
-	if capArgs := string(mustRead(t, capture)); capArgs != "say --profile family telegram send {\"chat_id\":7,\"text\":\"hi\"}\n" {
-		t.Errorf("say args = %q, want the family --profile passed through", capArgs)
+	if capArgs := string(mustRead(t, capture)); capArgs != "say telegram send {\"chat_id\":7,\"text\":\"hi\"}\n" {
+		t.Errorf("say args = %q, want no --profile", capArgs)
+	}
+	if want := ctx.Dir + "|" + ctx.State + "\n"; string(mustRead(t, envCapture)) != want {
+		t.Errorf("say child env = %q, want OMOSENSE_DIR|OMOSENSE_STATE = %q", string(mustRead(t, envCapture)), want)
 	}
 
 	cancel()

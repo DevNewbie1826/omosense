@@ -175,7 +175,7 @@ func rpcCtx(t *testing.T, out *bytes.Buffer, threads string) *core.Ctx {
 			t.Fatal(err)
 		}
 	}
-	return &core.Ctx{State: state, Profile: core.Profile{Name: "main"}, Flags: map[string]bool{}, Out: core.NewOut(out)}
+	return &core.Ctx{State: state, Profile: core.Profile{}, Flags: map[string]bool{}, Out: core.NewOut(out)}
 }
 
 func session(handle, id string) map[string]any {
@@ -238,19 +238,20 @@ func TestTransitions(t *testing.T) {
 		counts []int
 		want   []string
 		from   []any
+		done   []string
 	}{
-		{"first blocked", []string{"blocked"}, []int{0}, []string{"blocked"}, []any{nil}},
-		{"first idle", []string{"idle"}, []int{4}, nil, nil},
-		{"first working", []string{"working"}, []int{4}, nil, nil},
-		{"working idle", []string{"working", "idle"}, []int{0, 0}, []string{"done"}, []any{"working"}},
-		{"working blocked idle", []string{"working", "blocked", "idle"}, []int{0, 0, 0}, []string{"blocked", "done"}, []any{"working", "blocked"}},
-		{"idle growth", []string{"idle", "idle"}, []int{1, 2}, nil, nil},
-		{"blocked growth", []string{"blocked", "idle"}, []int{1, 2}, []string{"blocked"}, []any{nil}},
-		{"blocked no run", []string{"blocked", "idle"}, []int{1, 1}, []string{"blocked"}, []any{nil}},
-		{"quiet transitions", []string{"idle", "working", "blocked", "working"}, []int{0, 0, 0, 0}, []string{"blocked"}, []any{"working"}},
-		{"done clears run", []string{"working", "idle", "idle"}, []int{0, 0, 0}, []string{"done"}, []any{"working"}},
-		{"done clears run despite growth", []string{"working", "idle", "idle"}, []int{1, 2, 3}, []string{"done"}, []any{"working"}},
-		{"compacting", []string{"compacting", "idle"}, []int{0, 0}, []string{"done"}, []any{"working"}},
+		{"first blocked", []string{"blocked"}, []int{0}, []string{"blocked"}, []any{nil}, nil},
+		{"first idle", []string{"idle"}, []int{4}, nil, nil, nil},
+		{"first working", []string{"working"}, []int{4}, nil, nil, nil},
+		{"working idle", []string{"working", "idle"}, []int{0, 0}, nil, nil, []string{"durable"}},
+		{"working blocked idle", []string{"working", "blocked", "idle"}, []int{0, 0, 0}, []string{"blocked"}, []any{"working"}, []string{"durable"}},
+		{"idle growth", []string{"idle", "idle"}, []int{1, 2}, nil, nil, nil},
+		{"blocked growth", []string{"blocked", "idle"}, []int{1, 2}, []string{"blocked"}, []any{nil}, nil},
+		{"blocked no run", []string{"blocked", "idle"}, []int{1, 1}, []string{"blocked"}, []any{nil}, nil},
+		{"quiet transitions", []string{"idle", "working", "blocked", "working"}, []int{0, 0, 0, 0}, []string{"blocked"}, []any{"working"}, nil},
+		{"done clears run", []string{"working", "idle", "idle"}, []int{0, 0, 0}, nil, nil, []string{"durable"}},
+		{"done clears run despite growth", []string{"working", "idle", "idle"}, []int{1, 2, 3}, nil, nil, []string{"durable"}},
+		{"compacting", []string{"compacting", "idle"}, []int{0, 0}, nil, nil, []string{"durable"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -266,7 +267,8 @@ func TestTransitions(t *testing.T) {
 			c := rpcCtx(t, &b, `{"job":{"session_id":"durable"}}`)
 			// When the loop observes each scripted tick.
 			runTicks(t, c, len(ticks))
-			// Then only the specified semantic events are emitted.
+			// Then only the specified semantic events are emitted, and every
+			// completion reaches the pending file instead of stdout.
 			got := events(t, &b)
 			if len(got) != len(tc.want) {
 				t.Fatalf("events = %v, want %v; stdout %s", got, tc.want, b.String())
@@ -282,6 +284,16 @@ func TestTransitions(t *testing.T) {
 				if !reflect.DeepEqual(e, want) {
 					t.Fatalf("payload = %#v, want %#v", e, want)
 				}
+			}
+			var recorded []string
+			for _, e := range pendingList(t, newPendingStore(c.State)) {
+				recorded = append(recorded, e.ID)
+			}
+			if strings.Join(recorded, ",") != strings.Join(tc.done, ",") {
+				t.Fatalf("recorded done = %v, want %v; stdout %s", recorded, tc.done, b.String())
+			}
+			if strings.Contains(b.String(), `"event":"done"`) {
+				t.Fatalf("done was printed to stdout (IS-8): %s", b.String())
 			}
 			if strings.Count(b.String(), "LOG rpc ready (1 sessions, 1 watched)") != 1 {
 				t.Fatalf("ready not exactly once: %s", b.String())
@@ -303,10 +315,13 @@ func TestOpenedClosedAndDurableIdentity(t *testing.T) {
 	c.Flags["--all"] = true
 	runTicks(t, c, 3)
 	got := events(t, &b)
-	if len(got) != 3 || got[0]["event"] != "done" || got[0]["session"] != "rpc-7" || got[1]["event"] != "opened" || got[1]["to"] != "idle" || got[1]["from"] != nil || got[2]["event"] != "closed" || got[2]["id"] != "a" || got[2]["from"] != "idle" {
+	if len(got) != 2 || got[0]["event"] != "opened" || got[0]["to"] != "idle" || got[0]["from"] != nil || got[1]["event"] != "closed" || got[1]["id"] != "a" || got[1]["from"] != "idle" {
 		t.Fatalf("events = %v", got)
 	}
-	if strings.Contains(b.String(), "unknown_session") {
+	if es := pendingList(t, newPendingStore(c.State)); len(es) != 1 || es[0].ID != "a" || es[0].Session != "rpc-7" {
+		t.Fatalf("recorded done = %+v", es)
+	}
+	if strings.Contains(b.String(), `"event":"done"`) || strings.Contains(b.String(), "unknown_session") {
 		t.Fatal(b.String())
 	}
 }
@@ -405,9 +420,11 @@ func TestTransportFailureSkipsTick(t *testing.T) {
 	// When the watcher disconnects and recovers.
 	runTicks(t, c, 4)
 	// Then the failed ticks neither close nor open anything, and the run survives.
-	got := events(t, &b)
-	if len(got) != 1 || got[0]["event"] != "done" || got[0]["id"] != "a" || got[0]["from"] != "working" {
+	if got := events(t, &b); len(got) != 0 {
 		t.Fatalf("transport changed baseline: %s", b.String())
+	}
+	if es := pendingList(t, newPendingStore(c.State)); len(es) != 1 || es[0].ID != "a" {
+		t.Fatalf("transport changed the recorded baseline: %+v", es)
 	}
 	if strings.Count(b.String(), "EOF") != 1 {
 		t.Fatalf("transport error not deduped: %s", b.String())
@@ -429,9 +446,14 @@ func TestMalformedStateSkipsOnlySession(t *testing.T) {
 	// When the watcher receives malformed state alongside a successful observation.
 	runTicks(t, c, 2)
 	// Then the healthy session still completes; the malformed one is skipped.
-	got := events(t, &b)
-	if len(got) != 1 || got[0]["event"] != "done" || got[0]["id"] != "b" || !strings.Contains(b.String(), "LOG rpc a json:") {
+	if got := events(t, &b); len(got) != 0 {
 		t.Fatalf("malformed state affected sibling: %s", b.String())
+	}
+	if es := pendingList(t, newPendingStore(c.State)); len(es) != 1 || es[0].ID != "b" {
+		t.Fatalf("malformed state affected the recorded sibling: %+v", es)
+	}
+	if !strings.Contains(b.String(), "LOG rpc a json:") {
+		t.Fatalf("malformed state not reported: %s", b.String())
 	}
 }
 
@@ -528,7 +550,7 @@ func TestRegisteredJobSource(t *testing.T) {
 			got := events(t, &b)
 			want := []string{}
 			if tc.key != "" {
-				want = []string{"opened", "done", "blocked", "closed"}
+				want = []string{"opened", "blocked", "closed"}
 			}
 			if len(got) != len(want) {
 				t.Fatalf("events = %v, want %v; stdout %s", got, want, b.String())
@@ -541,6 +563,14 @@ func TestRegisteredJobSource(t *testing.T) {
 				if e["event"] != want[i] || e["thread"] != tc.key || e["id"] != "durable" || e["cwd"] != tc.cwd || !reflect.DeepEqual(e["questions"], questions) {
 					t.Fatalf("event = %v, want %s on thread %s", e, want[i], tc.key)
 				}
+			}
+			es := pendingList(t, newPendingStore(c.State))
+			if tc.key == "" {
+				if len(es) != 0 {
+					t.Fatalf("unmatched job recorded a completion: %+v", es)
+				}
+			} else if len(es) != 1 || es[0].ID != "durable" || es[0].Thread == nil || *es[0].Thread != tc.key {
+				t.Fatalf("recorded done = %+v", es)
 			}
 			f.mu.Lock()
 			calls := append([]string(nil), f.calls...)
@@ -580,8 +610,12 @@ func TestWatchAllDoneRule(t *testing.T) {
 			runTicks(t, c, len(ticks))
 			// Then count growth never completes unobserved or already completed work.
 			got := events(t, &b)
-			if len(got) != 2 || got[0]["event"] != "blocked" || !reflect.DeepEqual(got[0]["questions"], []any{"Which?"}) || got[1]["event"] != "done" || got[1]["from"] != "working" || got[1]["thread"] != nil {
+			if len(got) != 1 || got[0]["event"] != "blocked" || !reflect.DeepEqual(got[0]["questions"], []any{"Which?"}) {
 				t.Fatalf("events = %v; stdout %s", got, b.String())
+			}
+			es := pendingList(t, newPendingStore(c.State))
+			if len(es) != 1 || es[0].ID != "d" || es[0].Count != 1 || es[0].Thread != nil {
+				t.Fatalf("recorded done = %+v", es)
 			}
 			t.Logf("Source.Run watch-all %s: %s", mode, b.String())
 		})
@@ -594,7 +628,13 @@ func TestErrorsAndRecovery(t *testing.T) {
 	var b bytes.Buffer
 	c := rpcCtx(t, &b, "")
 	c.Flags["--all"] = true
+	store := newPendingStore(c.State)
 	w := newWatcher(c, c.Out)
+	w.record = func(id string, ev rpcEvent) {
+		if _, err := store.Record(id, ev); err != nil {
+			t.Error(err)
+		}
+	}
 	w.tick(context.Background())
 	w.tick(context.Background())
 	if strings.Count(b.String(), "LOG rpc ") != 1 {
@@ -612,8 +652,11 @@ func TestErrorsAndRecovery(t *testing.T) {
 		w.tick(context.Background())
 	}
 	got := events(t, &b)
-	if len(got) != 1 || got[0]["event"] != "done" {
+	if len(got) != 0 {
 		t.Fatalf("failed ticks changed baseline: %s", b.String())
+	}
+	if es := pendingList(t, store); len(es) != 1 || es[0].ID != "d" {
+		t.Fatalf("failed ticks changed the recorded baseline: %+v", es)
 	}
 	if strings.Count(b.String(), "LOG rpc list_failed") != 1 || strings.Count(b.String(), "state_failed") != 1 || strings.Count(b.String(), "LOG rpc ready (1 sessions, 1 watched)") != 2 {
 		t.Fatalf("error/ready counts: %s", b.String())
@@ -738,7 +781,7 @@ func TestSurfaceSnapshotAndSource(t *testing.T) {
 	}
 	src := sources[0]
 	lock, legacy := src.LockName()
-	if src.Name() != "rpc" || !reflect.DeepEqual(src.Prefixes(), []string{"RPC"}) || src.AlwaysOn() || lock != "watch-rpc-main" || legacy != "" {
+	if src.Name() != "rpc" || !reflect.DeepEqual(src.Prefixes(), []string{"RPC"}) || src.AlwaysOn() || lock != "watch-rpc" || legacy != "" {
 		t.Fatalf("source contract: %v", src)
 	}
 	old := sleepFn
@@ -755,10 +798,13 @@ func TestSurfaceSnapshotAndSource(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := events(t, &b)
-	if len(got) != 3 || got[0]["event"] != "blocked" || got[1]["event"] != "done" || got[2]["event"] != "closed" {
+	if len(got) != 2 || got[0]["event"] != "blocked" || got[1]["event"] != "closed" {
 		t.Fatalf("source output %s", b.String())
 	}
-	if !strings.HasPrefix(b.String(), fmt.Sprintf("LOG rpc watcher starting (profile main, every 5s, watch all, sock %s)\n", path)) {
+	if es := pendingList(t, newPendingStore(c.State)); len(es) != 1 || es[0].ID != "d" {
+		t.Fatalf("source recorded %+v", es)
+	}
+	if !strings.HasPrefix(b.String(), fmt.Sprintf("LOG rpc watcher starting (every 5s, watch all, sock %s)\n", path)) {
 		t.Fatal(b.String())
 	}
 	t.Logf("Source.Run: %s", b.String())

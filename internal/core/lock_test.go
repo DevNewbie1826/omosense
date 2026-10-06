@@ -73,17 +73,17 @@ func pidOf(t *testing.T, m *OMap) string {
 func TestTryAcquireBlocksOnLivePrimaryPid(t *testing.T) {
 	state := t.TempDir()
 	pid := liveSleeper(t)
-	writeLock(t, state, "listen-main", heldJSON(pid))
+	writeLock(t, state, "listen", heldJSON(pid))
 
-	release, blockedBy, held, err := testCtx(state).TryAcquire("listen-main", "")
+	release, blockedBy, held, err := testCtx(state).TryAcquire("listen", "")
 	if err != nil {
 		t.Fatalf("tryacquire: %v", err)
 	}
 	if release != nil {
 		t.Errorf("release must be nil when blocked")
 	}
-	if blockedBy != "listen-main" {
-		t.Errorf("blockedBy = %q, want listen-main", blockedBy)
+	if blockedBy != "listen" {
+		t.Errorf("blockedBy = %q, want listen", blockedBy)
 	}
 	if held == nil {
 		t.Fatal("held lock metadata missing")
@@ -95,24 +95,26 @@ func TestTryAcquireBlocksOnLivePrimaryPid(t *testing.T) {
 
 func TestTryAcquireBlocksOnLiveLegacyPid(t *testing.T) {
 	// A live legacy lock blocks and reports the legacy name (lock.ts:14).
+	// No shipped caller passes a legacy name any more, so the pair here is
+	// artificial.
 	state := t.TempDir()
 	pid := liveSleeper(t)
-	writeLock(t, state, "listen", heldJSON(pid))
+	writeLock(t, state, "listen-legacy", heldJSON(pid))
 
-	release, blockedBy, held, err := testCtx(state).TryAcquire("listen-main", "listen")
+	release, blockedBy, held, err := testCtx(state).TryAcquire("listen", "listen-legacy")
 	if err != nil {
 		t.Fatalf("tryacquire: %v", err)
 	}
-	if release != nil || blockedBy != "listen" || held == nil {
-		t.Errorf("got release?%v blockedBy=%q held?%v, want none/listen/non-nil", release != nil, blockedBy, held != nil)
+	if release != nil || blockedBy != "listen-legacy" || held == nil {
+		t.Errorf("got release?%v blockedBy=%q held?%v, want none/listen-legacy/non-nil", release != nil, blockedBy, held != nil)
 	}
 }
 
 func TestTryAcquireDeadPidOverwritten(t *testing.T) {
 	state := t.TempDir()
-	writeLock(t, state, "listen-main", heldJSON(deadPid(t)))
+	writeLock(t, state, "listen", heldJSON(deadPid(t)))
 
-	release, blockedBy, _, err := testCtx(state).TryAcquire("listen-main", "")
+	release, blockedBy, _, err := testCtx(state).TryAcquire("listen", "")
 	if err != nil {
 		t.Fatalf("tryacquire: %v", err)
 	}
@@ -120,7 +122,7 @@ func TestTryAcquireDeadPidOverwritten(t *testing.T) {
 		t.Fatalf("dead holder must be overwritten: blockedBy=%q release?%v", blockedBy, release != nil)
 	}
 
-	b, err := os.ReadFile(filepath.Join(state, "listen-main.lock.json"))
+	b, err := os.ReadFile(filepath.Join(state, "listen.lock.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,7 +135,7 @@ func TestTryAcquireDeadPidOverwritten(t *testing.T) {
 	}
 
 	release()
-	if _, err := os.Stat(filepath.Join(state, "listen-main.lock.json")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(state, "listen.lock.json")); !os.IsNotExist(err) {
 		t.Errorf("release must remove our lock: %v", err)
 	}
 }
@@ -142,13 +144,13 @@ func TestTryAcquireWritesOwnerLock(t *testing.T) {
 	state := t.TempDir()
 	unsetLockEnv(t)
 
-	release, _, _, err := testCtx(state).TryAcquire("remind-main", "remind")
+	release, _, _, err := testCtx(state).TryAcquire("remind", "")
 	if err != nil {
 		t.Fatalf("tryacquire: %v", err)
 	}
 	defer release()
 
-	b, err := os.ReadFile(filepath.Join(state, "remind-main.lock.json"))
+	b, err := os.ReadFile(filepath.Join(state, "remind.lock.json"))
 	if err != nil {
 		t.Fatalf("lock file: %v", err)
 	}
@@ -181,13 +183,13 @@ func TestTryAcquireSessionEnv(t *testing.T) {
 	t.Setenv("PI_SESSION_ID", "s1")
 	t.Setenv("HERDR_PANE_ID", "p1")
 
-	release, _, _, err := testCtx(state).TryAcquire("tidy-main", "")
+	release, _, _, err := testCtx(state).TryAcquire("memory-tidy", "")
 	if err != nil {
 		t.Fatalf("tryacquire: %v", err)
 	}
 	defer release()
 
-	b, err := os.ReadFile(filepath.Join(state, "tidy-main.lock.json"))
+	b, err := os.ReadFile(filepath.Join(state, "memory-tidy.lock.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -205,22 +207,22 @@ func TestReleaseOnlyWhenPidMatches(t *testing.T) {
 	state := t.TempDir()
 	pid := liveSleeper(t)
 
-	release, _, _, err := testCtx(state).TryAcquire("herdr-main", "")
+	release, _, _, err := testCtx(state).TryAcquire("watch-herdr", "")
 	if err != nil {
 		t.Fatalf("tryacquire: %v", err)
 	}
-	writeLock(t, state, "herdr-main", heldJSON(pid))
+	writeLock(t, state, "watch-herdr", heldJSON(pid))
 	release()
 
-	if _, err := os.Stat(filepath.Join(state, "herdr-main.lock.json")); err != nil {
+	if _, err := os.Stat(filepath.Join(state, "watch-herdr.lock.json")); err != nil {
 		t.Fatalf("release removed a lock we no longer own: %v", err)
 	}
 }
 
 func TestTryAcquireUnparsableLock(t *testing.T) {
 	state := t.TempDir()
-	writeLock(t, state, "listen-main", "{oops")
-	if _, _, _, err := testCtx(state).TryAcquire("listen-main", ""); err == nil {
+	writeLock(t, state, "listen", "{oops")
+	if _, _, _, err := testCtx(state).TryAcquire("listen", ""); err == nil {
 		t.Fatal("expected an error for an unparsable lock file")
 	}
 }

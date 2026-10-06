@@ -1,7 +1,6 @@
 package core
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -31,149 +30,145 @@ func writeConfig(t *testing.T, dir, cfg string) {
 	}
 }
 
-const mainCfg = `{"profiles":{"main":{"telegram":{"bots":["mb"],"roles":{}},"discord":{"bots":["db"]}}}}`
+const mainCfg = `{"telegram":{"bot":"mb","roles":{}},"discord":{"bot":"db"}}`
 
-const profilesCfg = `{
-  "profiles": {
-    "main": {
-      "telegram": {"bots": ["mb"], "roles": {"12": "owner", "13": "wife"}},
-      "discord": {"bots": ["db"], "roles": {"44": "owner"}},
-      "rpc": {"enabled": true, "session": null, "all": false},
-      "tidy": {"enabled": true, "learnOthers": true, "exclude": ["repo1"]},
-      "memory": "mem-main",
-      "mail": true
-    },
-    "family": {
-      "telegram": {"bots": ["fb"], "roles": {}},
-      "discord": {"bots": [], "roles": {}},
-      "rpc": {},
-      "tidy": {"exclude": ["x"]},
-      "calendars": ["cal1", "cal2"],
-      "mail": false
-    },
-    "nocal": {
-      "telegram": {"bots": []},
-      "discord": {"bots": ["db2"]},
-      "calendars": null,
-      "mail": true
-    }
-  }
+// flatCfg is the whole flat document: every key of the single-session shape
+// with a value, so one load pins the entire Profile.
+const flatCfg = `{
+  "telegram": {"bot": "mb", "roles": {"12": "owner", "13": "wife"}},
+  "discord": {"bot": "db", "roles": {"44": "owner"}},
+  "rpc": {"enabled": true, "all": false},
+  "tidy": {"enabled": true, "learnOthers": true, "exclude": ["repo1"]},
+  "herdr": {"enabled": true},
+  "memory": "mem-main",
+  "calendars": ["cal1", "cal2"],
+  "mail": true
 }`
 
-func TestLoadNamedProfiles(t *testing.T) {
-	_, dir, _ := testEnv(t)
-	writeConfig(t, dir, profilesCfg)
+func boolPtr(b bool) *bool { return &b }
 
-	ctx, err := Load(ParseArgs([]string{"--profile", "main"}), false)
+func TestLoadFlatConfig(t *testing.T) {
+	_, dir, _ := testEnv(t)
+	writeConfig(t, dir, flatCfg)
+
+	ctx, err := Load(ParseArgs(nil), false)
 	if err != nil {
-		t.Fatalf("load main: %v", err)
+		t.Fatalf("load: %v", err)
 	}
 	want := Profile{
-		Name:     "main",
-		Telegram: PlatformCfg{Bots: []string{"mb"}, Roles: map[string]string{"12": "owner", "13": "wife"}},
-		Discord:  PlatformCfg{Bots: []string{"db"}, Roles: map[string]string{"44": "owner"}},
-		RPC:      RPCCfg{Enabled: true},
-		Tidy:     TidyCfg{Enabled: true, LearnOthers: true, Exclude: []string{"repo1"}},
-		Memory:   "mem-main",
-		Mail:     true,
+		Telegram:  PlatformCfg{Bot: "mb", Roles: map[string]string{"12": "owner", "13": "wife"}},
+		Discord:   PlatformCfg{Bot: "db", Roles: map[string]string{"44": "owner"}},
+		RPC:       RPCCfg{Enabled: true},
+		Tidy:      TidyCfg{Enabled: true, LearnOthers: true, Exclude: []string{"repo1"}},
+		Herdr:     HerdrCfg{Enabled: boolPtr(true)},
+		Memory:    "mem-main",
+		Calendars: &[]string{"cal1", "cal2"},
+		Mail:      true,
 	}
 	if !reflect.DeepEqual(ctx.Profile, want) {
-		t.Errorf("main profile = %+v, want %+v", ctx.Profile, want)
-	}
-
-	ctx, err = Load(ParseArgs([]string{"--profile=family"}), false)
-	if err != nil {
-		t.Fatalf("load family: %v", err)
-	}
-	if len(ctx.Profile.Telegram.Bots) != 1 || ctx.Profile.Telegram.Bots[0] != "fb" ||
-		len(ctx.Profile.Discord.Bots) != 0 || ctx.Profile.RPC.Enabled || ctx.Profile.Mail {
-		t.Errorf("family profile = %+v", ctx.Profile)
-	}
-	if ctx.Profile.Tidy.Enabled || ctx.Profile.Tidy.LearnOthers || !reflect.DeepEqual(ctx.Profile.Tidy.Exclude, []string{"x"}) {
-		t.Errorf("family tidy = %+v", ctx.Profile.Tidy)
-	}
-	if ctx.Profile.Calendars == nil || len(*ctx.Profile.Calendars) != 2 || (*ctx.Profile.Calendars)[0] != "cal1" {
-		t.Errorf("family calendars = %v", ctx.Profile.Calendars)
-	}
-
-	ctx, err = Load(ParseArgs([]string{"--profile", "nocal"}), false)
-	if err != nil {
-		t.Fatalf("load nocal: %v", err)
-	}
-	// An explicit calendars:null means all calendars, same as an absent key.
-	if ctx.Profile.Calendars != nil {
-		t.Errorf("calendars:null must resolve to nil (all), got %v", *ctx.Profile.Calendars)
-	}
-	if len(ctx.Profile.Telegram.Bots) != 0 || len(ctx.Profile.Discord.Bots) != 1 || !ctx.Profile.Mail {
-		t.Errorf("nocal profile = %+v", ctx.Profile)
+		t.Errorf("profile = %+v, want %+v", ctx.Profile, want)
 	}
 }
 
-func TestLoadUnknownProfile(t *testing.T) {
-	_, dir, _ := testEnv(t)
-	writeConfig(t, dir, profilesCfg)
-
-	_, err := Load(ParseArgs([]string{"--profile", "nope"}), false)
-	var up UnknownProfileError
-	if !errors.As(err, &up) {
-		t.Fatalf("err = %v, want UnknownProfileError", err)
-	}
-	if up.Name != "nope" || up.Error() != "unknown profile nope" {
-		t.Errorf("error = %q / name %q", up.Error(), up.Name)
+func TestLoadHerdrDefaultsOn(t *testing.T) {
+	// herdr is a default source: an absent key (and an explicit null) means
+	// on, and only an explicit false turns it off.
+	for _, tc := range []struct {
+		name string
+		cfg  string
+	}{{"absent", mainCfg}, {"null", `{"herdr":null}`}, {"false", `{"herdr":{"enabled":false}}`}} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, dir, _ := testEnv(t)
+			writeConfig(t, dir, tc.cfg)
+			ctx, err := Load(ParseArgs(nil), false)
+			if err != nil {
+				t.Fatalf("load: %v", err)
+			}
+			want := tc.name != "false"
+			if ctx.Profile.Herdr.On() != want {
+				t.Errorf("herdr.On() = %v, want %v (enabled %v)", ctx.Profile.Herdr.On(), want, ctx.Profile.Herdr.Enabled)
+			}
+		})
 	}
 }
 
-func TestLoadLegacyTopLevelKeyRejected(t *testing.T) {
+func TestLoadRejectsProfiles(t *testing.T) {
+	// Guard: a stale profiles-shaped config must fail loudly instead of
+	// loading with no bots at all.
+	for _, cfg := range []string{
+		`{"profiles":{"main":{"telegram":{"bots":["mb"]}}}}`,
+		`{"profiles":["main"]}`,
+		`{"profiles":null}`,
+	} {
+		_, dir, _ := testEnv(t)
+		writeConfig(t, dir, cfg)
+		_, err := Load(ParseArgs(nil), false)
+		if err == nil || !strings.Contains(err.Error(), `"profiles" is no longer supported`) {
+			t.Errorf("cfg %s: err = %v, want the profiles-removed message", cfg, err)
+		}
+	}
+}
+
+func TestLoadLegacyKeyRejected(t *testing.T) {
 	// Guard: an old-shape config must never load, or the binary would run
 	// silently with zero bots.
-	for _, key := range []string{"telegram", "discord", "owner", "wife", "rpc"} {
+	for _, key := range []string{"owner", "wife"} {
 		_, dir, _ := testEnv(t)
-		writeConfig(t, dir, fmt.Sprintf(`{%q:{}, "profiles":{"main":{}}}`, key))
+		writeConfig(t, dir, fmt.Sprintf(`{%q:"x"}`, key))
 		_, err := Load(ParseArgs(nil), false)
 		if err == nil {
 			t.Fatalf("legacy key %s: config must not load", key)
 		}
-		want := fmt.Sprintf("config.json: legacy top-level key %q is no longer supported; move it into profiles.<name> (see new profile shape)", key)
+		want := fmt.Sprintf("config.json: legacy top-level key %q is no longer supported; config.json is flat now (telegram, discord, rpc, tidy, herdr, memory, calendars, mail)", key)
 		if err.Error() != want {
 			t.Errorf("legacy key %s: err = %q, want %q", key, err, want)
 		}
 	}
+	_, dir, _ := testEnv(t)
+	writeConfig(t, dir, `{"bots":["mb"]}`)
+	_, err := Load(ParseArgs(nil), false)
+	if err == nil || !strings.Contains(err.Error(), `"bots" is no longer supported`) {
+		t.Fatalf("bots array: err = %v, want the bots-removed message", err)
+	}
 }
 
-func TestLoadRequiresProfiles(t *testing.T) {
-	_, dir, _ := testEnv(t)
-	writeConfig(t, dir, `{"mail": true}`)
-	_, err := Load(ParseArgs(nil), false)
-	if err == nil || err.Error() != `config.json: "profiles" is required` {
-		t.Fatalf("err = %v, want profiles required", err)
-	}
-	writeConfig(t, dir, `{"profiles": ["main"]}`)
-	_, err = Load(ParseArgs(nil), false)
-	if err == nil || err.Error() != `config.json: "profiles" must be an object` {
-		t.Fatalf("err = %v, want profiles must be an object", err)
+func TestLoadPlatformBotsArrayRejected(t *testing.T) {
+	// Guard: the previous per-profile bots array must not load as a
+	// bot-less config.
+	for _, platform := range []string{"telegram", "discord"} {
+		_, dir, _ := testEnv(t)
+		writeConfig(t, dir, fmt.Sprintf(`{%q:{"bots":["mb"]}}`, platform))
+		_, err := Load(ParseArgs(nil), false)
+		if err == nil {
+			t.Fatalf("%s.bots: config must not load", platform)
+		}
+		want := fmt.Sprintf("config.json: %s.bots is no longer supported; %s.bot holds one bot name", platform, platform)
+		if err.Error() != want {
+			t.Errorf("%s.bots: err = %q, want %q", platform, err, want)
+		}
 	}
 }
 
 func TestResolveProfileShapeErrors(t *testing.T) {
 	cases := []struct{ cfg, want string }{
-		{`{"profiles":{"main":[]}}`, "profiles.main must be an object"},
-		{`{"profiles":{"main":{"telegram":[]}}}`, "profiles.main.telegram must be an object"},
-		{`{"profiles":{"main":{"discord":true}}}`, "profiles.main.discord must be an object"},
-		{`{"profiles":{"main":{"telegram":{"bots":"mb"}}}}`, "profiles.main.telegram.bots must be an array of strings"},
-		{`{"profiles":{"main":{"telegram":{"bots":[1]}}}}`, "profiles.main.telegram.bots must be an array of strings"},
-		{`{"profiles":{"main":{"telegram":{"roles":[]}}}}`, "profiles.main.telegram.roles must be an object with string values"},
-		{`{"profiles":{"main":{"telegram":{"roles":{"12":2}}}}}`, "profiles.main.telegram.roles must be an object with string values"},
-		{`{"profiles":{"main":{"discord":{"roles":{"a":true}}}}}`, "profiles.main.discord.roles must be an object with string values"},
-		{`{"profiles":{"main":{"rpc":false}}}`, "profiles.main.rpc must be an object"},
-		{`{"profiles":{"main":{"rpc":{"enabled":"yes"}}}}`, "profiles.main.rpc.enabled must be a boolean"},
-		{`{"profiles":{"main":{"rpc":{"session":7}}}}`, "profiles.main.rpc.session must be a string"},
-		{`{"profiles":{"main":{"rpc":{"all":1}}}}`, "profiles.main.rpc.all must be a boolean"},
-		{`{"profiles":{"main":{"tidy":[]}}}`, "profiles.main.tidy must be an object"},
-		{`{"profiles":{"main":{"tidy":{"exclude":"x"}}}}`, "profiles.main.tidy.exclude must be an array of strings"},
-		{`{"profiles":{"main":{"tidy":{"learnOthers":1}}}}`, "profiles.main.tidy.learnOthers must be a boolean"},
-		{`{"profiles":{"main":{"memory":5}}}`, "profiles.main.memory must be a string"},
-		{`{"profiles":{"main":{"mail":"yes"}}}`, "profiles.main.mail must be a boolean"},
-		{`{"profiles":{"main":{"calendars":{"a":"b"}}}}`, "profiles.main.calendars must be an array of strings"},
+		{`{"telegram":[]}`, "config.json: telegram must be an object"},
+		{`{"discord":true}`, "config.json: discord must be an object"},
+		{`{"telegram":{"bot":1}}`, "config.json: telegram.bot must be a string"},
+		{`{"discord":{"bot":["db"]}}`, "config.json: discord.bot must be a string"},
+		{`{"telegram":{"roles":[]}}`, "config.json: telegram.roles must be an object with string values"},
+		{`{"telegram":{"roles":{"12":2}}}`, "config.json: telegram.roles must be an object with string values"},
+		{`{"discord":{"roles":{"a":true}}}`, "config.json: discord.roles must be an object with string values"},
+		{`{"rpc":false}`, "config.json: rpc must be an object"},
+		{`{"rpc":{"enabled":"yes"}}`, "config.json: rpc.enabled must be a boolean"},
+		{`{"rpc":{"all":1}}`, "config.json: rpc.all must be a boolean"},
+		{`{"tidy":[]}`, "config.json: tidy must be an object"},
+		{`{"tidy":{"exclude":"x"}}`, "config.json: tidy.exclude must be an array of strings"},
+		{`{"tidy":{"learnOthers":1}}`, "config.json: tidy.learnOthers must be a boolean"},
+		{`{"herdr":[]}`, "config.json: herdr must be an object"},
+		{`{"herdr":{"enabled":"yes"}}`, "config.json: herdr.enabled must be a boolean"},
+		{`{"memory":5}`, "config.json: memory must be a string"},
+		{`{"mail":"yes"}`, "config.json: mail must be a boolean"},
+		{`{"calendars":{"a":"b"}}`, "config.json: calendars must be an array of strings"},
 	}
 	for _, tc := range cases {
 		_, dir, _ := testEnv(t)
@@ -192,9 +187,11 @@ func TestEnvDirsDefaultsAndOverrides(t *testing.T) {
 	t.Setenv("OMOSENSE_STATE", "")
 	t.Setenv("OMOMEOW_DIR", "")
 	t.Setenv("OMOMEOW_STATE", "")
+	cwd := t.TempDir()
+	t.Chdir(cwd)
 	dir, state, err := EnvDirs()
-	if err != nil || dir != filepath.Join(home, ".omosense") || state != filepath.Join(home, ".omosense", "state") {
-		t.Fatalf("EnvDirs = %q %q %v, want default ~/.omosense and <dir>/state", dir, state, err)
+	if err != nil || dir != filepath.Join(cwd, ".omosense") || state != filepath.Join(cwd, ".omosense", "state") {
+		t.Fatalf("EnvDirs = %q %q %v, want the cwd default <cwd>/.omosense and <dir>/state", dir, state, err)
 	}
 	override := filepath.Join(home, "run")
 	t.Setenv("OMOSENSE_DIR", override)
@@ -287,14 +284,14 @@ func TestLoadBadJSONConfig(t *testing.T) {
 
 func TestLoadCfgRawKeepsOrder(t *testing.T) {
 	_, dir, _ := testEnv(t)
-	writeConfig(t, dir, `{"profiles":{"main":{}},"zz":1,"aa":2}`)
+	writeConfig(t, dir, `{"mail":true,"zz":1,"aa":2}`)
 
 	ctx, err := Load(ParseArgs(nil), false)
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
 	got := ctx.Cfg.Raw.Keys()
-	want := []string{"profiles", "zz", "aa"}
+	want := []string{"mail", "zz", "aa"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("raw keys = %v, want %v", got, want)
 	}

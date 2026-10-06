@@ -23,6 +23,22 @@ var (
 	buildErr  error
 )
 
+// pinnedGoEnv keeps the child `go build` on the user's real Go caches: the
+// tests repoint HOME at temp dirs, and a module cache inside t.TempDir
+// leaves read-only files that break the cleanup. Resolved at package init,
+// before any test runs t.Setenv.
+var pinnedGoEnv = func() []string {
+	out, err := exec.Command("go", "env", "GOMODCACHE", "GOCACHE").Output()
+	if err != nil {
+		return nil
+	}
+	vals := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(vals) != 2 {
+		return nil
+	}
+	return []string{"GOMODCACHE=" + vals[0], "GOCACHE=" + vals[1]}
+}()
+
 func TestMain(m *testing.M) {
 	code := m.Run()
 	if buildDir != "" {
@@ -41,12 +57,16 @@ func buildBinaries(t *testing.T) {
 			return
 		}
 		binPath = filepath.Join(buildDir, "omosense")
-		if out, err := exec.Command("go", "build", "-o", binPath, "../../cmd/omosense").CombinedOutput(); err != nil {
+		build := exec.Command("go", "build", "-o", binPath, "../../cmd/omosense")
+		build.Env = append(os.Environ(), pinnedGoEnv...)
+		if out, err := build.CombinedOutput(); err != nil {
 			buildErr = fmt.Errorf("go build cmd/omosense: %v\n%s", err, out)
 			return
 		}
 		probePath = filepath.Join(buildDir, "lockprobe")
-		if out, err := exec.Command("go", "build", "-o", probePath, "./testdata/lockprobe").CombinedOutput(); err != nil {
+		probe := exec.Command("go", "build", "-o", probePath, "./testdata/lockprobe")
+		probe.Env = append(os.Environ(), pinnedGoEnv...)
+		if out, err := probe.CombinedOutput(); err != nil {
 			buildErr = fmt.Errorf("go build lockprobe: %v\n%s", err, out)
 		}
 	})
@@ -76,7 +96,7 @@ func writeCliConfig(t *testing.T, dir, cfg string) {
 	}
 }
 
-const cliProfilesCfg = `{"profiles":{"main":{"telegram":{"bots":["b1","b2"]},"discord":{"bots":["d1"]},"tidy":{"enabled":true}}}}`
+const cliFlatCfg = `{"telegram":{"bot":"b1"},"discord":{"bot":"d1"},"tidy":{"enabled":true}}`
 
 func runBin(t *testing.T, args ...string) (stdout, stderr string, code int) {
 	t.Helper()
@@ -95,16 +115,23 @@ func runBin(t *testing.T, args ...string) (stdout, stderr string, code int) {
 	return ob.String(), eb.String(), code
 }
 
-func TestCLINoArgsUsage(t *testing.T) {
+// TestCLIBareHostMissingConfig pins bare `omosense` as the session host: it
+// loads the folder's config.json instead of printing usage, so a folder
+// without one fails loudly naming the exact path.
+func TestCLIBareHostMissingConfig(t *testing.T) {
+	// Build before cliEnv points HOME at a temp dir: go build under a fresh
+	// HOME would fill that dir with a read-only module cache.
+	buildBinaries(t)
+	_, dir, _ := cliEnv(t)
 	stdout, stderr, code := runBin(t)
-	if code != 2 {
-		t.Errorf("exit = %d, want 2", code)
+	if code != 1 {
+		t.Errorf("exit = %d, want 1", code)
 	}
 	if stdout != "" {
 		t.Errorf("stdout = %q, want empty", stdout)
 	}
-	if !strings.Contains(stderr, "Usage: omosense <subcommand>") {
-		t.Errorf("stderr = %q, want usage", stderr)
+	if !strings.Contains(stderr, filepath.Join(dir, "config.json")) {
+		t.Errorf("stderr = %q, want the config path", stderr)
 	}
 }
 
@@ -113,8 +140,25 @@ func TestCLIUnknownSubcommand(t *testing.T) {
 	if code != 2 {
 		t.Errorf("exit = %d, want 2", code)
 	}
-	if !strings.Contains(stderr, "Usage: omosense <subcommand>") {
+	if !strings.Contains(stderr, "Usage: omosense") {
 		t.Errorf("stderr = %q, want usage", stderr)
+	}
+}
+
+// TestCLIDaemonAndAttachRemoved pins IS-2: the retired daemon and its attach
+// client are unknown subcommands, so a stale caller fails loudly.
+func TestCLIDaemonAndAttachRemoved(t *testing.T) {
+	for _, args := range [][]string{{"daemon"}, {"daemon", "status"}, {"attach", "listen"}} {
+		stdout, stderr, code := runBin(t, args...)
+		if code != 2 {
+			t.Errorf("%v: exit = %d, want 2", args, code)
+		}
+		if stdout != "" {
+			t.Errorf("%v: stdout = %q, want empty", args, stdout)
+		}
+		if !strings.Contains(stderr, "Usage: omosense") {
+			t.Errorf("%v: stderr = %q, want usage", args, stderr)
+		}
 	}
 }
 
@@ -123,57 +167,54 @@ func TestCLITopLevelHelp(t *testing.T) {
 	if code != 0 {
 		t.Errorf("exit = %d, want 0", code)
 	}
-	if !strings.Contains(stdout, "Usage: omosense <subcommand>") {
-		t.Errorf("stdout = %q, want usage", stdout)
+	if !strings.Contains(stdout, "Usage: omosense") || !strings.Contains(stdout, "Bare omosense runs the session host") {
+		t.Errorf("stdout = %q, want the session-host usage", stdout)
+	}
+	if strings.Contains(stdout, "daemon") || strings.Contains(stdout, "attach") {
+		t.Errorf("stdout = %q, must not advertise the retired daemon", stdout)
 	}
 	if stderr != "" {
 		t.Errorf("stderr = %q, want empty", stderr)
 	}
 }
 
-func TestCLIUnknownProfileExits2(t *testing.T) {
+// TestCLIProfileFlagRemoved pins the stale-caller guard: --profile fails
+// loudly (exit 2) in every position instead of silently reading another
+// folder's config, and --help does not rescue it.
+func TestCLIProfileFlagRemoved(t *testing.T) {
 	_, dir, _ := cliEnv(t)
-	writeCliConfig(t, dir, cliProfilesCfg)
-
-	stdout, stderr, code := runBin(t, "listen", "--profile", "nope")
-	if code != 2 {
-		t.Errorf("exit = %d, want 2", code)
-	}
-	if stderr != "unknown profile nope\n" {
-		t.Errorf("stderr = %q", stderr)
-	}
-	if stdout != "" {
-		t.Errorf("stdout = %q, want empty", stdout)
-	}
-}
-
-func TestCLISayProfileBothSyntaxes(t *testing.T) {
-	_, dir, _ := cliEnv(t)
-	writeCliConfig(t, dir, cliProfilesCfg)
+	writeCliConfig(t, dir, cliFlatCfg)
 
 	for _, args := range [][]string{
+		{"listen", "--profile", "nope"},
+		{"listen", "--profile=nope"},
 		{"say", "telegram", "send", "{}", "--profile", "nope"},
 		{"say", "--profile=nope", "telegram"},
+		{"remind", "--profile", "main"},
+		{"listen", "--help", "--profile", "main"},
 	} {
-		_, stderr, code := runBin(t, args...)
+		stdout, stderr, code := runBin(t, args...)
 		if code != 2 {
 			t.Errorf("%v: exit = %d, want 2", args, code)
 		}
-		if stderr != "unknown profile nope\n" {
-			t.Errorf("%v: stderr = %q", args, stderr)
+		if stdout != "" {
+			t.Errorf("%v: stdout = %q, want empty", args, stdout)
+		}
+		if !strings.Contains(stderr, "--profile was removed") {
+			t.Errorf("%v: stderr = %q, want the removal message", args, stderr)
 		}
 	}
 }
 
 func TestCLIReadOnlyPathsLeaveStateAbsent(t *testing.T) {
 	_, dir, state := cliEnv(t)
-	writeCliConfig(t, dir, cliProfilesCfg)
+	writeCliConfig(t, dir, cliFlatCfg)
 
 	for _, args := range [][]string{
-		{"google", "--once", "--profile", "main"},
-		{"herdr", "--once", "--profile", "main"},
-		{"listen", "--dry-run", "--profile", "main"},
-		{"say", "--profile", "main"},
+		{"google", "--once"},
+		{"herdr", "--once"},
+		{"listen", "--dry-run"},
+		{"say", "telegram", "send", "{}"},
 	} {
 		runBin(t, args...)
 		if _, err := os.Stat(state); !os.IsNotExist(err) {
@@ -184,14 +225,14 @@ func TestCLIReadOnlyPathsLeaveStateAbsent(t *testing.T) {
 
 func TestCLIWritableRunCreatesState(t *testing.T) {
 	_, dir, state := cliEnv(t)
-	writeCliConfig(t, dir, cliProfilesCfg)
+	writeCliConfig(t, dir, cliFlatCfg)
 
 	// remind is a long-running writable path with no external calls when the
 	// reminders file is absent; it must create the state dir, then stop on SIGTERM.
 	// The startup LOG line is printed only after the state dir exists and the
 	// lock is held, so it is the exact readiness signal.
 	buildBinaries(t)
-	cmd := exec.Command(binPath, "remind", "--profile", "main")
+	cmd := exec.Command(binPath, "remind")
 	out, err := cmd.StdoutPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -234,33 +275,37 @@ func TestCLIWritableRunCreatesState(t *testing.T) {
 	}
 }
 
+// TestCLILegacyConfigFailsLoudly pins the stale-shape guard on the real
+// binary: a profiles document, a legacy owner/wife key and a bots array must
+// each fail loudly instead of running with no bots.
 func TestCLILegacyConfigFailsLoudly(t *testing.T) {
 	_, dir, _ := cliEnv(t)
-	writeCliConfig(t, dir, `{"telegram":{"bot":"b1"},"discord":{"bot":"d1"}}`)
-
-	_, stderr, code := runBin(t, "listen", "--profile", "main", "--dry-run")
-	if code != 1 {
-		t.Errorf("exit = %d, want 1", code)
-	}
-	if !strings.Contains(stderr, `legacy top-level key "telegram" is no longer supported`) || !strings.Contains(stderr, "profiles") {
-		t.Errorf("stderr = %q, want the legacy config message", stderr)
-	}
-
-	// A legacy document that also carries a profiles block fails the same
-	// way instead of loading with the old sections quietly ignored.
-	writeCliConfig(t, dir, `{"telegram":{"bot":"b1"},"profiles":{"main":{"telegram":{"bots":["b1"]}}}}`)
-	_, stderr, code = runBin(t, "listen", "--profile", "main", "--dry-run")
-	if code != 1 || !strings.Contains(stderr, `legacy top-level key "telegram"`) {
-		t.Errorf("exit = %d stderr = %q, want legacy failure", code, stderr)
+	for _, tc := range []struct{ cfg, want string }{
+		{`{"profiles":{"main":{"telegram":{"bots":["b1"]}}}}`, `"profiles" is no longer supported`},
+		{`{"owner":"12"}`, `legacy top-level key "owner" is no longer supported`},
+		{`{"wife":"13"}`, `legacy top-level key "wife" is no longer supported`},
+		{`{"bots":["b1"]}`, `"bots" is no longer supported`},
+		{`{"telegram":{"bots":["b1"]}}`, `telegram.bots is no longer supported`},
+	} {
+		writeCliConfig(t, dir, tc.cfg)
+		_, stderr, code := runBin(t, "listen", "--dry-run")
+		if code != 1 {
+			t.Errorf("cfg %s: exit = %d, want 1", tc.cfg, code)
+		}
+		if !strings.Contains(stderr, tc.want) {
+			t.Errorf("cfg %s: stderr = %q, want %q", tc.cfg, stderr, tc.want)
+		}
 	}
 }
 
-func TestCLIMissingProfilesFailsLoudly(t *testing.T) {
+// TestCLIShapeErrorNamesTheKey pins the loud shape errors: a present key of
+// the wrong type names its path in config.json.
+func TestCLIShapeErrorNamesTheKey(t *testing.T) {
 	_, dir, _ := cliEnv(t)
-	writeCliConfig(t, dir, `{"mail": true}`)
-	_, stderr, code := runBin(t, "listen", "--profile", "main", "--dry-run")
-	if code != 1 || !strings.Contains(stderr, `config.json: "profiles" is required`) {
-		t.Errorf("exit = %d stderr = %q, want profiles required", code, stderr)
+	writeCliConfig(t, dir, `{"telegram":{"bot":7}}`)
+	_, stderr, code := runBin(t, "listen", "--dry-run")
+	if code != 1 || !strings.Contains(stderr, "config.json: telegram.bot must be a string") {
+		t.Errorf("exit = %d stderr = %q, want the telegram.bot shape error", code, stderr)
 	}
 }
 
@@ -270,7 +315,7 @@ func TestCLIStaleOmomeowEnvFails(t *testing.T) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	writeCliConfig(t, dir, cliProfilesCfg)
+	writeCliConfig(t, dir, cliFlatCfg)
 	buildBinaries(t)
 	var env []string
 	for _, e := range os.Environ() {

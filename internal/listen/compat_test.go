@@ -25,7 +25,7 @@ func TestCompatProcess(t *testing.T) {
 		return
 	}
 	// The parent sets sandbox directories and fake API endpoints before exec.
-	args := []string{"--profile", "test"}
+	var args []string
 	if os.Getenv("OMOSENSE_LISTEN_TEST_DRY") == "1" {
 		args = append(args, "--dry-run")
 	}
@@ -58,11 +58,11 @@ func compatConfig(t *testing.T, c *core.Ctx, telegram bool) {
 	if err := os.MkdirAll(c.Dir, 0700); err != nil {
 		t.Fatal(err)
 	}
-	bots := `[]`
+	bot := `""`
 	if telegram {
-		bots = `["test"]`
+		bot = `"test"`
 	}
-	cfg := fmt.Sprintf(`{"profiles":{"test":{"telegram":{"bots":%s,"roles":{"12":"owner"}},"discord":{"bots":[],"roles":{}}}}}`, bots)
+	cfg := fmt.Sprintf(`{"telegram":{"bot":%s,"roles":{"12":"owner"}},"discord":{"bot":"","roles":{}}}`, bot)
 	if err := os.WriteFile(filepath.Join(c.Dir, "config.json"), []byte(cfg), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -70,18 +70,18 @@ func compatConfig(t *testing.T, c *core.Ctx, telegram bool) {
 
 func TestCompatDryRunAndSourcePolicies(t *testing.T) {
 	c := testCtx(t)
-	c.Profile.Discord.Bots = []string{"d1"}
+	c.Profile.Discord.Bot = "d1"
 	sources := Sources(c)
 	if len(sources) != 2 || sources[0].Name() != "telegram" || sources[0].AlwaysOn() || sources[1].Name() != "discord" || !sources[1].AlwaysOn() {
 		t.Fatal("source run policy")
 	}
 	for _, source := range sources {
 		lock, legacy := source.LockName()
-		if lock != "listen-test" || legacy != "listen" || len(source.Prefixes()) != 1 || source.Prefixes()[0] != "EVENT" {
+		if lock != "listen" || legacy != "" || len(source.Prefixes()) != 1 || source.Prefixes()[0] != "EVENT" {
 			t.Fatal("shared lock or prefix", lock, legacy, source.Prefixes())
 		}
 	}
-	c.Profile.Discord.Bots = nil
+	c.Profile.Discord.Bot = ""
 	if len(Sources(c)) != 1 {
 		t.Fatal("discord enabled for a disabled profile")
 	}
@@ -106,7 +106,7 @@ func TestCompatDryRunAndSourcePolicies(t *testing.T) {
 		t.Fatalf("dry-run output %s want %s", out, direct.Bytes())
 	}
 	var plan map[string]any
-	if err := json.Unmarshal(bytes.TrimPrefix(bytes.TrimSpace(out), []byte("PLAN ")), &plan); err != nil || plan["lock"] != "listen-test" || plan["profile"] != "test" || plan["state"] != c.State {
+	if err := json.Unmarshal(bytes.TrimPrefix(bytes.TrimSpace(out), []byte("PLAN ")), &plan); err != nil || plan["lock"] != "listen" || plan["dir"] != c.Dir || plan["state"] != c.State {
 		t.Fatal(plan, err)
 	}
 	if !reflect.DeepEqual(plan["telegram"], []any{"test"}) || !reflect.DeepEqual(plan["discord"], []any{}) {
@@ -118,24 +118,26 @@ func TestCompatDryRunAndSourcePolicies(t *testing.T) {
 	t.Logf("PASS: sandbox compat process --profile test --dry-run -> %s; cleanup: subprocess exited, no state files created", bytes.TrimSpace(out))
 }
 
-func TestCompatStartupAndLegacyLock(t *testing.T) {
+func TestCompatStartupAndLiveLock(t *testing.T) {
 	c := testCtx(t)
 	compatConfig(t, c, false)
 	out, err := compatCommand(t, c, false).CombinedOutput()
-	if err != nil || string(out) != "LOG omosense listener starting (profile test)\n" {
+	if err != nil || string(out) != "LOG omosense listener starting\n" {
 		t.Fatalf("startup: %v %s", err, out)
 	}
-	if _, err := os.Stat(filepath.Join(c.State, "listen-test.lock.json")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(c.State, "listen.lock.json")); !os.IsNotExist(err) {
 		t.Fatal("compat leaked lock", err)
 	}
-	legacy := filepath.Join(c.State, "listen.lock.json")
-	if err := os.WriteFile(legacy, []byte(fmt.Sprintf(`{"pid":%d,"session":"fixture"}`, os.Getpid())), 0600); err != nil {
+	// A live holder of the (now unsuffixed) listen lock blocks the second
+	// listener instead of letting it start.
+	held := filepath.Join(c.State, "listen.lock.json")
+	if err := os.WriteFile(held, []byte(fmt.Sprintf(`{"pid":%d,"session":"fixture"}`, os.Getpid())), 0600); err != nil {
 		t.Fatal(err)
 	}
 	out, err = compatCommand(t, c, false).CombinedOutput()
 	exit, ok := err.(*exec.ExitError)
 	if !ok || exit.ExitCode() != 3 || !strings.HasPrefix(string(out), "LOG ALREADY_RUNNING listen ") || strings.Contains(string(out), "starting") {
-		t.Fatalf("legacy exclusion: %v %s", err, out)
+		t.Fatalf("live-holder exclusion: %v %s", err, out)
 	}
 }
 
@@ -160,14 +162,14 @@ func TestCompatDryRunEmptyBots(t *testing.T) {
 	}
 }
 
-// TestCompatDryRunPlanBots pins the PLAN bot lists to the profile config:
-// the discord field is the bot list, not a boolean.
+// TestCompatDryRunPlanBots pins the PLAN bot lists to the flat config: each
+// platform reports its one configured bot as a one-element list.
 func TestCompatDryRunPlanBots(t *testing.T) {
 	c := testCtx(t)
 	if err := os.MkdirAll(c.Dir, 0700); err != nil {
 		t.Fatal(err)
 	}
-	cfg := `{"profiles":{"test":{"telegram":{"bots":["t1","t2"],"roles":{}},"discord":{"bots":["d1","d2"],"roles":{}}}}}`
+	cfg := `{"telegram":{"bot":"t1","roles":{}},"discord":{"bot":"d1","roles":{}}}`
 	if err := os.WriteFile(filepath.Join(c.Dir, "config.json"), []byte(cfg), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -179,7 +181,7 @@ func TestCompatDryRunPlanBots(t *testing.T) {
 	if err := json.Unmarshal(bytes.TrimPrefix(bytes.TrimSpace(out), []byte("PLAN ")), &plan); err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(plan["telegram"], []any{"t1", "t2"}) || !reflect.DeepEqual(plan["discord"], []any{"d1", "d2"}) {
+	if !reflect.DeepEqual(plan["telegram"], []any{"t1"}) || !reflect.DeepEqual(plan["discord"], []any{"d1"}) {
 		t.Fatalf("PLAN bot lists: %s", out)
 	}
 	t.Logf("PASS: PLAN reports the configured bot lists -> %s; cleanup: subprocess exited, no state created", bytes.TrimSpace(out))
@@ -236,7 +238,7 @@ func TestCompatTelegramStdoutAndSignalCleanup(t *testing.T) {
 			lines <- scanner.Text()
 		}
 	}()
-	if line := await(t, lines); line != "LOG omosense listener starting (profile test)" {
+	if line := await(t, lines); line != "LOG omosense listener starting" {
 		t.Fatal(line)
 	}
 	line := await(t, lines)
@@ -254,7 +256,7 @@ func TestCompatTelegramStdoutAndSignalCleanup(t *testing.T) {
 	if err != nil || stderr.Len() != 0 {
 		t.Fatalf("compat signal exit: %v %s", err, stderr.Bytes())
 	}
-	if _, err := os.Stat(filepath.Join(c.State, "listen-test.lock.json")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(c.State, "listen.lock.json")); !os.IsNotExist(err) {
 		t.Fatal("signal leaked lock", err)
 	}
 	b, err := os.ReadFile(filepath.Join(c.State, "tg-offset-test"))

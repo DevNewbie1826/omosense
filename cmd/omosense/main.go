@@ -1,19 +1,19 @@
-// Command omosense is the Go rewrite of the bun monitors
-// (listen, watch-google, remind, watch-herdr, memory-tidy, say). Each
-// subcommand runs one source in-process with the TS stdout grammar; the
-// resident daemon and its attach clients are the default long-term mode.
+// Command omosense is the Go rewrite of the bun monitors (listen,
+// watch-google, remind, watch-herdr, memory-tidy, say). Bare `omosense`
+// runs one foreground session host; each subcommand runs one source
+// in-process with the TS stdout grammar.
 package main
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	"github.com/DevNewbie1826/omosense/internal/core"
-	"github.com/DevNewbie1826/omosense/internal/daemon"
 	"github.com/DevNewbie1826/omosense/internal/google"
 	"github.com/DevNewbie1826/omosense/internal/herdr"
+	"github.com/DevNewbie1826/omosense/internal/host"
 	"github.com/DevNewbie1826/omosense/internal/listen"
 	"github.com/DevNewbie1826/omosense/internal/remind"
 	"github.com/DevNewbie1826/omosense/internal/rpc"
@@ -25,10 +25,20 @@ func main() {
 	os.Exit(run(os.Args[1:]))
 }
 
+// profileRemoved is the stale-caller message: --profile belonged to the
+// profiles object, and a caller still passing it must fail loudly instead
+// of silently reading another folder's config.
+const profileRemoved = "omosense: --profile was removed; config.json is per folder now (run omosense in the folder that holds .omosense/config.json)"
+
 func run(args []string) int {
+	for _, a := range args {
+		if a == "--profile" || strings.HasPrefix(a, "--profile=") {
+			fmt.Fprintln(os.Stderr, profileRemoved)
+			return 2
+		}
+	}
 	if len(args) == 0 {
-		usage(os.Stderr)
-		return 2
+		return runHost()
 	}
 	sub, rest := args[0], args[1:]
 	if sub == "--help" || sub == "-h" {
@@ -37,18 +47,6 @@ func run(args []string) int {
 	}
 
 	switch sub {
-	case "daemon":
-		if hasHelp(rest) {
-			fmt.Print(daemon.DaemonHelp)
-			return 0
-		}
-		return daemon.RunDaemon(rest)
-	case "attach":
-		if hasHelp(rest) {
-			fmt.Print(daemon.AttachHelp)
-			return 0
-		}
-		return daemon.RunAttach(rest)
 	case "listen", "google", "remind", "herdr", "rpc", "tidy", "say":
 		if hasHelp(rest) {
 			fmt.Print(subHelp(sub))
@@ -60,11 +58,6 @@ func run(args []string) int {
 		writable := sub != "say" && !pa.Flags["--once"] && !pa.Flags["--now"] && !pa.Flags["--dry-run"]
 		ctx, err := core.Load(pa, writable)
 		if err != nil {
-			var up core.UnknownProfileError
-			if errors.As(err, &up) {
-				fmt.Fprintln(os.Stderr, err)
-				return 2
-			}
 			fmt.Fprintln(os.Stderr, "omosense:", err)
 			return 1
 		}
@@ -88,6 +81,17 @@ func run(args []string) int {
 		usage(os.Stderr)
 		return 2
 	}
+}
+
+// runHost is bare `omosense`: one foreground process hosting every source
+// the folder's flat config enables.
+func runHost() int {
+	ctx, err := core.Load(core.ParseArgs(nil), true)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "omosense:", err)
+		return 1
+	}
+	return host.Run(ctx)
 }
 
 func hasHelp(args []string) bool {
@@ -119,18 +123,20 @@ func subHelp(sub string) string {
 }
 
 func usage(w io.Writer) {
-	fmt.Fprint(w, `Usage: omosense <subcommand> [--profile main|family] [flags]
+	fmt.Fprint(w, `Usage: omosense [<subcommand> [flags]]
+
+Bare omosense runs the session host: one foreground process hosting every
+source this folder's .omosense/config.json enables, printing EVENT/CAL/
+SOON/MAIL/REMIND/HERDR/RPC/TIDY/LOG lines to stdout.
 
 Subcommands:
-  listen    Telegram long-poll and Discord gateway listener (EVENT)
+  listen    Telegram and Discord listener (EVENT)
   google    calendar and mail watcher (CAL, SOON, MAIL)
   remind    reminder scheduler (REMIND)
   herdr     herdr pane watcher (HERDR)
   rpc       webchat rpc.sock session watcher (RPC)
   tidy      memory tidy watcher (TIDY)
   say       outbound message sender
-  daemon    resident daemon hosting all sources
-  attach    stream a source's lines from the daemon
 
 Run omosense <subcommand> --help for per-subcommand help.
 `)

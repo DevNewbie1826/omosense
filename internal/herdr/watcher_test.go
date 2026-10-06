@@ -396,11 +396,8 @@ func TestRunStartupLockStop(t *testing.T) {
 		_ = sleeper.Process.Kill()
 		_, _ = sleeper.Process.Wait()
 	})
-	legacy := filepath.Join(state, "watch-herdr.lock.json")
-	writeFile(t, legacy, fmt.Sprintf(`{"pid":%d}`, sleeper.Process.Pid))
-
 	var buf bytes.Buffer
-	c := testCtx(state, "family", &buf)
+	c := testCtx(state, "main", &buf)
 	sleeps := 0
 	prev := sleepFn
 	sleepFn = func(ctx context.Context, d time.Duration) error {
@@ -408,12 +405,12 @@ func TestRunStartupLockStop(t *testing.T) {
 		if d != 5*time.Second {
 			t.Errorf("interval = %v, want 5s", d)
 		}
-		if _, err := os.Stat(filepath.Join(state, "watch-herdr-family.lock.json")); err != nil {
-			t.Errorf("watch-herdr-family.lock.json: %v", err)
+		if _, err := os.Stat(filepath.Join(state, "watch-herdr.lock.json")); err != nil {
+			t.Errorf("watch-herdr.lock.json: %v", err)
 		}
-		body, err := os.ReadFile(legacy)
-		if err != nil || !bytes.Contains(body, []byte(fmt.Sprintf(`"pid":%d`, sleeper.Process.Pid))) {
-			t.Errorf("legacy lock changed: %s (%v)", body, err)
+		body, err := os.ReadFile(filepath.Join(state, "watch-herdr.lock.json"))
+		if err != nil || !bytes.Contains(body, []byte(fmt.Sprintf(`"pid":%d`, os.Getpid()))) {
+			t.Errorf("our own lock not held: %s (%v)", body, err)
 		}
 		if sleeps == 1 {
 			writeFile(t, filepath.Join(dir, "local.out"), agents(ag("p1", "idle", "w")))
@@ -430,14 +427,11 @@ func TestRunStartupLockStop(t *testing.T) {
 		t.Fatalf("sleeps = %d, want 2", sleeps)
 	}
 	wantLines(t, linesOf(&buf),
-		"LOG herdr watcher starting (profile family, every 5s, skip pane-9)",
+		"LOG herdr watcher starting (every 5s, skip pane-9)",
 		`HERDR {"machine":"local","pane":"p1","tab":null,"agent":null,"title":"w","cwd":null,"from":"working","to":"idle"}`,
 	)
-	if _, err := os.Stat(filepath.Join(state, "watch-herdr-family.lock.json")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(state, "watch-herdr.lock.json")); !os.IsNotExist(err) {
 		t.Fatalf("lock still held after Run: %v", err)
-	}
-	if _, err := os.Stat(legacy); err != nil {
-		t.Fatalf("legacy lock missing: %v", err)
 	}
 }
 
@@ -468,7 +462,7 @@ func TestSourceRunStopsOnCancel(t *testing.T) {
 		t.Fatalf("source run blocked for %s; cancel must not wait out the 5s interval", time.Since(start))
 	}
 	wantLines(t, linesOf(&buf),
-		"LOG herdr watcher starting (profile main, every 5s, skip none)",
+		"LOG herdr watcher starting (every 5s, skip none)",
 		`HERDR {"machine":"local","pane":"p","tab":null,"agent":null,"title":null,"cwd":null,"from":null,"to":"blocked"}`,
 	)
 	if _, err := os.Stat(state); !os.IsNotExist(err) {
@@ -489,32 +483,30 @@ func TestSleepReturnsOnCancel(t *testing.T) {
 }
 
 func TestSourcesPausable(t *testing.T) {
-	for _, prof := range []string{"main", "family"} {
-		srcs := Sources(&core.Ctx{Profile: core.Profile{Name: prof}})
-		if len(srcs) != 1 {
-			t.Fatalf("profile %s: Sources = %d, want 1", prof, len(srcs))
-		}
-		s := srcs[0]
-		if s.Name() != "herdr" {
-			t.Errorf("name = %q", s.Name())
-		}
-		if s.AlwaysOn() {
-			t.Errorf("herdr must be pausable (pause-while-idle)")
-		}
-		name, legacy := s.LockName()
-		if name != "watch-herdr-"+prof || legacy != "" {
-			t.Errorf("lock = %q/%q, want watch-herdr-%s with no legacy", name, legacy, prof)
-		}
-		if got, want := s.Prefixes(), []string{"HERDR"}; len(got) != 1 || got[0] != want[0] {
-			t.Errorf("prefixes = %v, want %v", got, want)
-		}
+	srcs := Sources(&core.Ctx{Profile: core.Profile{}})
+	if len(srcs) != 1 {
+		t.Fatalf("Sources = %d, want 1", len(srcs))
+	}
+	s := srcs[0]
+	if s.Name() != "herdr" {
+		t.Errorf("name = %q", s.Name())
+	}
+	if s.AlwaysOn() {
+		t.Errorf("herdr must be pausable (pause-while-idle)")
+	}
+	name, legacy := s.LockName()
+	if name != "watch-herdr" || legacy != "" {
+		t.Errorf("lock = %q/%q, want watch-herdr with no legacy", name, legacy)
+	}
+	if got, want := s.Prefixes(), []string{"HERDR"}; len(got) != 1 || got[0] != want[0] {
+		t.Errorf("prefixes = %v, want %v", got, want)
 	}
 }
 
-func testCtx(state, profile string, buf *bytes.Buffer) *core.Ctx {
+func testCtx(state, _ string, buf *bytes.Buffer) *core.Ctx {
 	return &core.Ctx{
 		State:   state,
-		Profile: core.Profile{Name: profile},
+		Profile: core.Profile{},
 		Flags:   map[string]bool{},
 		Out:     core.NewOut(buf),
 	}

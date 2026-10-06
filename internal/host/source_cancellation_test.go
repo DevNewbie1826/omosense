@@ -1,8 +1,7 @@
-package daemon
+package host
 
 import (
 	"bufio"
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -54,6 +53,35 @@ func TestBlockedSourceCommand(t *testing.T) {
 	os.Exit(0)
 }
 
+type processEvent struct {
+	Event string `json:"event"`
+	PID   int    `json:"pid"`
+}
+
+type blockedCommand struct {
+	conn net.Conn
+	pid  int
+	kind string
+	err  error
+}
+
+func awaitEvent(t *testing.T, ch <-chan blockedCommand) blockedCommand {
+	t.Helper()
+	select {
+	case b := <-ch:
+		return b
+	case <-time.After(30 * time.Second):
+		t.Fatal("bounded event wait expired")
+		return blockedCommand{}
+	}
+}
+
+// TestSourceCommandCancellation re-homes the retired daemon's
+// source_cancellation proof onto the bare session host (plan review B5): a
+// source's real child process is cancelled with the host, and no descendant
+// outlives it, in all four spawn shapes. The host is started as bare
+// `omosense` with its cwd in the project folder, so config and state resolve
+// from the folder alone.
 func TestSourceCommandCancellation(t *testing.T) {
 	bin := filepath.Join(t.TempDir(), "omosense")
 	build := exec.Command("go", "build", "-o", bin, "./cmd/omosense")
@@ -66,60 +94,65 @@ func TestSourceCommandCancellation(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, tc := range []struct{ source, command, lock, mode string }{
-		{"google", "zele", "watch-google-main", "direct"},
-		{"herdr", "herdr", "watch-herdr-main", "direct"},
-		{"tidy", "git", "memory-tidy-main", "direct"},
-		{"google", "zele", "watch-google-main", "descendant"},
-		{"herdr", "herdr", "watch-herdr-main", "descendant"},
-		{"tidy", "git", "memory-tidy-main", "descendant"},
-		{"google", "zele", "watch-google-main", "escaped"},
-		{"herdr", "herdr", "watch-herdr-main", "escaped"},
-		{"tidy", "git", "memory-tidy-main", "escaped"},
-		{"google", "zele", "watch-google-main", "parent-exits"},
-		{"herdr", "herdr", "watch-herdr-main", "parent-exits"},
-		{"tidy", "git", "memory-tidy-main", "parent-exits"},
+		{"google", "zele", "watch-google", "direct"},
+		{"herdr", "herdr", "watch-herdr", "direct"},
+		{"tidy", "git", "memory-tidy", "direct"},
+		{"google", "zele", "watch-google", "descendant"},
+		{"herdr", "herdr", "watch-herdr", "descendant"},
+		{"tidy", "git", "memory-tidy", "descendant"},
+		{"google", "zele", "watch-google", "escaped"},
+		{"herdr", "herdr", "watch-herdr", "escaped"},
+		{"tidy", "git", "memory-tidy", "escaped"},
+		{"google", "zele", "watch-google", "parent-exits"},
+		{"herdr", "herdr", "watch-herdr", "parent-exits"},
+		{"tidy", "git", "memory-tidy", "parent-exits"},
 	} {
 		t.Run(tc.source+"/"+tc.mode, func(t *testing.T) {
-			p := socketPaths(t)
 			root := t.TempDir()
-			state := filepath.Join(root, "state")
+			project := filepath.Join(root, "proj")
+			dir := filepath.Join(project, ".omosense")
+			state := filepath.Join(dir, "state")
 			bindir := filepath.Join(root, "bin")
 			agents := filepath.Join(root, "agents")
-			for _, dir := range []string{state, bindir, filepath.Join(agents, "fixture", "repo", ".git")} {
-				if err := os.MkdirAll(dir, 0o700); err != nil {
+			for _, d := range []string{dir, state, bindir, filepath.Join(agents, "fixture", "repo", ".git")} {
+				if err := os.MkdirAll(d, 0o700); err != nil {
 					t.Fatal(err)
 				}
 			}
-			config := `{"profiles":{"main":{"telegram":{"bots":[]},"discord":{"bots":[]},"calendars":null,"mail":false,"tidy":{"enabled":true}}}}`
-			if err := os.WriteFile(filepath.Join(p.dir, "config.json"), []byte(config), 0o600); err != nil {
+			config := `{"calendars":null,"mail":false,"tidy":{"enabled":true}}`
+			if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(config), 0o600); err != nil {
 				t.Fatal(err)
 			}
 			script := fmt.Sprintf("#!/bin/sh\nexec %q -test.run '^TestBlockedSourceCommand$'\n", helper)
 			if err := os.WriteFile(filepath.Join(bindir, tc.command), []byte(script), 0o700); err != nil {
 				t.Fatal(err)
 			}
-			gate := filepath.Join(p.dir, "command.sock")
+			// A unix socket path is capped near 104 bytes, so the gate lives
+			// in its own short /tmp dir rather than under the long TempDir.
+			sockDir, err := os.MkdirTemp("/tmp", "os-gate-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := os.RemoveAll(sockDir); err != nil {
+					t.Error(err)
+				}
+			})
+			gate := filepath.Join(sockDir, "command.sock")
 			ln, err := net.Listen("unix", gate)
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer ln.Close()
-			type blockedCommand struct {
-				conn net.Conn
-				pid  int
-				kind string
-				err  error
-			}
 			count := 1
 			if tc.mode != "direct" {
 				count = 2
 			}
-			blocked := make(chan blockedCommand, count)
+			blocked := make(chan blockedCommand, 8)
 			go func() {
-				for range count {
+				for {
 					conn, err := ln.Accept()
 					if err != nil {
-						blocked <- blockedCommand{err: err}
 						return
 					}
 					var e processEvent
@@ -127,28 +160,30 @@ func TestSourceCommandCancellation(t *testing.T) {
 					blocked <- blockedCommand{conn: conn, pid: e.PID, kind: e.Event, err: err}
 				}
 			}()
-			env := append(os.Environ(), "HOME="+root, "OMOSENSE_DIR="+p.dir,
-				"OMOSENSE_STATE="+state, "OMOSENSE_SOCK="+p.socket, "OMO_MEMORY_AGENTS="+agents,
-				"PATH="+bindir+":"+os.Getenv("PATH"), "OS_CANCEL_HELPER=1", "OS_CANCEL_GATE="+gate,
-				"OS_CANCEL_MODE="+tc.mode, "OS_CANCEL_CHILD=",
-				"OMOSENSE_TEST_REGISTRY=", "OMOSENSE_TEST_EVENTS=", "OMOSENSE_TEST_VERSION=",
-				"OMOSENSE_TEST_READY_GATE=", "OMOSENSE_TEST_SPAWN_LOG=")
-			a := exec.Command(bin, "attach", tc.source, "--profile", "main")
+			env := append(sandboxEnv(t, root),
+				"PATH="+bindir+":"+os.Getenv("PATH"), "OMO_MEMORY_AGENTS="+agents,
+				"OS_CANCEL_HELPER=1", "OS_CANCEL_GATE="+gate,
+				"OS_CANCEL_MODE="+tc.mode, "OS_CANCEL_CHILD=")
+			a := exec.Command(bin)
+			a.Dir = project
 			a.Env = env
 			stdout, err := a.StdoutPipe()
 			if err != nil {
 				t.Fatal(err)
 			}
 			a.Stderr = os.Stderr
-			t.Logf("RUN %s attach %s --profile main (real source; socket-gated fake %s)", bin, tc.source, tc.command)
+			t.Logf("RUN %s (bare host, cwd %s; socket-gated fake %s)", bin, project, tc.command)
 			if err := a.Start(); err != nil {
 				t.Fatal(err)
 			}
+			lines := make(chan string, 16)
 			done := make(chan error, 1)
 			go func() {
 				scan := bufio.NewScanner(stdout)
 				for scan.Scan() {
-					t.Log("STDOUT " + scan.Text())
+					line := scan.Text()
+					t.Log("STDOUT " + line)
+					lines <- line
 				}
 				done <- a.Wait()
 			}()
@@ -157,43 +192,28 @@ func TestSourceCommandCancellation(t *testing.T) {
 				select {
 				case <-done:
 				case <-time.After(15 * time.Second):
-					t.Error("attach cleanup did not join")
+					t.Error("host cleanup did not join")
 				}
 			})
 			var processes []blockedCommand
-			var daemonPID int
 			t.Cleanup(func() {
 				for _, b := range processes {
 					_ = syscall.Kill(b.pid, syscall.SIGKILL)
 					_ = b.conn.Close()
 				}
-				if daemonPID != 0 {
-					_ = syscall.Kill(daemonPID, syscall.SIGKILL)
-				}
 			})
 			for range count {
-				b := await(t, blocked)
+				b := awaitEvent(t, blocked)
 				if b.err != nil {
 					t.Fatal(b.err)
 				}
 				processes = append(processes, b)
 				t.Logf("BLOCKED %s %s pid=%d; gate will not be released", tc.command, b.kind, b.pid)
 			}
-			run := func(args ...string) (string, error) {
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer cancel()
-				cmd := exec.CommandContext(ctx, bin, args...)
-				cmd.Env = env
-				out, err := cmd.CombinedOutput()
-				t.Logf("RUN %s %s; exit=%v output=%s", bin, strings.Join(args, " "), err, out)
-				return string(out), err
+			startup := awaitLine(t, lines)
+			if !strings.Contains(startup, "sources=") || !strings.Contains(startup, tc.source) {
+				t.Fatalf("startup LOG %q does not name the %s source", startup, tc.source)
 			}
-			out, err := run("daemon", "status")
-			var st status
-			if err != nil || json.Unmarshal([]byte(out), &st) != nil {
-				t.Fatalf("status: %v %s", err, out)
-			}
-			daemonPID = st.PID
 			if tc.mode == "parent-exits" {
 				// The parent exits on its own; the source must reap the rest of
 				// its process group before any stop is requested.
@@ -212,17 +232,11 @@ func TestSourceCommandCancellation(t *testing.T) {
 			if _, err := os.Stat(lock); err != nil {
 				t.Fatalf("running source lock: %v", err)
 			}
-			start := time.Now()
-			if _, err := run("daemon", "stop"); err != nil {
-				t.Fatalf("stop did not cancel in-flight %s: %v", tc.command, err)
+			if err := a.Process.Signal(syscall.SIGTERM); err != nil {
+				t.Fatal(err)
 			}
-			if elapsed := time.Since(start); elapsed >= 5*time.Second {
-				t.Fatalf("stop exceeded short bound: %s", elapsed)
-			} else {
-				t.Logf("STOP elapsed=%s (bound 5s)", elapsed)
-			}
-			if err := await(t, done); err != nil {
-				t.Fatalf("attach must exit zero without respawn: %v", err)
+			if err := awaitExit(t, done); err != nil {
+				t.Fatalf("host must exit zero on SIGTERM: %v", err)
 			}
 			done <- nil // Paired cleanup can join without polling.
 			for _, b := range processes {
@@ -258,15 +272,59 @@ func TestSourceCommandCancellation(t *testing.T) {
 				}
 				_ = b.conn.Close()
 			}
-			for _, path := range []string{lock, filepath.Join(state, "remind-main.lock.json"), p.socket, p.pid} {
-				if _, err := os.Stat(path); !os.IsNotExist(err) {
-					t.Fatalf("stop left %s: %v", path, err)
-				}
+			locks, err := filepath.Glob(filepath.Join(state, "*.lock.json"))
+			if err != nil {
+				t.Fatal(err)
 			}
-			daemonPID = 0   // Successfully stopped; never signal a reused PID.
-			processes = nil // All PIDs verified dead; never signal reused PIDs.
-			t.Log("PASS: stop/attach exit 0; parent/descendant dead; locks/socket/pid absent; no respawn")
-			t.Log("cleanup: attach joined; stopped daemon; fake processes dead; gate listener closed; fixture directories removed by testing")
+			if len(locks) != 0 {
+				t.Fatalf("stop left lock files behind: %v", locks)
+			}
+			socks, err := filepath.Glob(filepath.Join(project, "**", "*.sock"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(socks) != 0 {
+				t.Fatalf("bare host created a socket: %v", socks)
+			}
+			t.Log("PASS: bare host SIGTERM exit 0; parent/descendant dead; no lock files, no socket")
+			t.Log("cleanup: host joined; fake processes dead; gate listener closed; fixture directories removed by testing")
 		})
+	}
+}
+
+// sandboxEnv is the process environment with every OMOSENSE_/OMOMEOW_
+// variable removed, so the host resolves config and state from its cwd
+// alone (and a stale OMOMEOW_* in the harness cannot fail it).
+func sandboxEnv(t *testing.T, home string) []string {
+	t.Helper()
+	var env []string
+	for _, e := range os.Environ() {
+		if strings.HasPrefix(e, "OMOSENSE_") || strings.HasPrefix(e, "OMOMEOW_") {
+			continue
+		}
+		env = append(env, e)
+	}
+	return append(env, "HOME="+home)
+}
+
+func awaitLine(t *testing.T, lines <-chan string) string {
+	t.Helper()
+	select {
+	case line := <-lines:
+		return line
+	case <-time.After(30 * time.Second):
+		t.Fatal("host printed no startup line")
+		return ""
+	}
+}
+
+func awaitExit(t *testing.T, done <-chan error) error {
+	t.Helper()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(30 * time.Second):
+		t.Fatal("host did not exit on SIGTERM")
+		return nil
 	}
 }

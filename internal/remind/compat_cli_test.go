@@ -60,7 +60,7 @@ func TestCompatRunLocksAndReleasesOnSIGTERM(t *testing.T) {
 	_, state := testEnv(t)
 	bin := omosenseBin(t)
 
-	cmd := exec.Command(bin, "remind", "--profile", "main")
+	cmd := exec.Command(bin, "remind")
 	var eb bytes.Buffer
 	cmd.Stderr = &eb
 	stdout, err := cmd.StdoutPipe()
@@ -85,13 +85,13 @@ func TestCompatRunLocksAndReleasesOnSIGTERM(t *testing.T) {
 	case <-time.After(30 * time.Second):
 		t.Fatal("timed out waiting for the startup line")
 	}
-	if want := "LOG reminder scheduler starting (profile main)\n"; first != want {
+	if want := "LOG reminder scheduler starting\n"; first != want {
 		t.Fatalf("first line = %q, want %q", first, want)
 	}
 
-	lockPath := filepath.Join(state, "remind-main.lock.json")
+	lockPath := filepath.Join(state, "remind.lock.json")
 	if _, err := os.Stat(lockPath); err != nil {
-		t.Fatalf("remind-main lock not held while running: %v", err)
+		t.Fatalf("remind lock not held while running: %v", err)
 	}
 
 	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
@@ -113,7 +113,7 @@ func TestCompatRunLocksAndReleasesOnSIGTERM(t *testing.T) {
 	}
 }
 
-func TestCompatBlockedByLiveLegacyLockExits3(t *testing.T) {
+func TestCompatBlockedByLiveLockExits3(t *testing.T) {
 	_, state := testEnv(t)
 	sleeper := exec.Command("sleep", "300")
 	if err := sleeper.Start(); err != nil {
@@ -131,7 +131,7 @@ func TestCompatBlockedByLiveLegacyLockExits3(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cmd := exec.Command(omosenseBin(t), "remind", "--profile", "main")
+	cmd := exec.Command(omosenseBin(t), "remind")
 	var ob bytes.Buffer
 	cmd.Stdout = &ob
 	err := cmd.Run()
@@ -143,12 +143,9 @@ func TestCompatBlockedByLiveLegacyLockExits3(t *testing.T) {
 		t.Fatal(err)
 	}
 	if code != 3 {
-		t.Errorf("exit = %d, want 3 when the legacy remind lock is live", code)
+		t.Errorf("exit = %d, want 3 when the remind lock is live", code)
 	}
 	if !strings.HasPrefix(ob.String(), "LOG ALREADY_RUNNING remind {") {
-		t.Errorf("stdout = %q, want LOG ALREADY_RUNNING remind <json> (legacy name)", ob.String())
-	}
-	if _, err := os.Stat(filepath.Join(state, "remind-main.lock.json")); !os.IsNotExist(err) {
-		t.Errorf("a blocked acquire must not write its own lock: %v", err)
+		t.Errorf("stdout = %q, want LOG ALREADY_RUNNING remind <json>", ob.String())
 	}
 }

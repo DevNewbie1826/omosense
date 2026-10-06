@@ -4,8 +4,8 @@ import "testing"
 
 func TestParseArgsDefaults(t *testing.T) {
 	pa := ParseArgs(nil)
-	if pa.Profile != "main" {
-		t.Errorf("default profile = %q, want main", pa.Profile)
+	if pa.ProfileSet {
+		t.Error("--profile must not be reported for empty argv")
 	}
 	if len(pa.Flags) != 0 {
 		t.Errorf("flags = %v, want empty", pa.Flags)
@@ -15,27 +15,30 @@ func TestParseArgsDefaults(t *testing.T) {
 	}
 }
 
+// TestParseArgsProfileForms pins the removed-flag detection: both spellings
+// set ProfileSet and neither leaks a value into Flags or Rest, so main can
+// fail loudly on a stale caller instead of running another folder's config.
 func TestParseArgsProfileForms(t *testing.T) {
 	pa := ParseArgs([]string{"--profile", "family"})
-	if pa.Profile != "family" {
-		t.Errorf("--profile family: got %q", pa.Profile)
+	if !pa.ProfileSet || len(pa.Flags) != 0 || len(pa.Rest) != 0 {
+		t.Errorf("--profile family: got %+v", pa)
 	}
 	pa = ParseArgs([]string{"--profile=family"})
-	if pa.Profile != "family" {
-		t.Errorf("--profile=family: got %q", pa.Profile)
+	if !pa.ProfileSet {
+		t.Errorf("--profile=family: got %+v", pa)
 	}
 	pa = ParseArgs([]string{"--profile=family", "--dry-run"})
-	if pa.Profile != "family" || !pa.Flags["--dry-run"] {
+	if !pa.ProfileSet || !pa.Flags["--dry-run"] {
 		t.Errorf("--profile=family --dry-run: got %+v", pa)
 	}
 }
 
 func TestParseArgsProfileConsumesNextVerbatim(t *testing.T) {
-	// profile.ts parity: --profile eats the next arg even when it looks like
-	// a flag, and the consumed value never lands in Flags.
+	// --profile eats the next arg even when it looks like a flag, and the
+	// consumed value never lands in Flags.
 	pa := ParseArgs([]string{"--profile", "--dry-run"})
-	if pa.Profile != "--dry-run" {
-		t.Errorf("profile = %q, want --dry-run", pa.Profile)
+	if !pa.ProfileSet {
+		t.Error("--profile not reported")
 	}
 	if pa.Flags["--dry-run"] {
 		t.Errorf("consumed value must not become a flag")
@@ -44,8 +47,8 @@ func TestParseArgsProfileConsumesNextVerbatim(t *testing.T) {
 
 func TestParseArgsTrailingProfile(t *testing.T) {
 	pa := ParseArgs([]string{"listen", "--profile"})
-	if pa.Profile != "" {
-		t.Errorf("trailing --profile: got %q, want empty", pa.Profile)
+	if !pa.ProfileSet {
+		t.Error("trailing --profile not reported")
 	}
 	if len(pa.Rest) != 1 || pa.Rest[0] != "listen" {
 		t.Errorf("rest = %v, want [listen]", pa.Rest)

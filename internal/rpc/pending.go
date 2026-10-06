@@ -16,34 +16,34 @@ import (
 var nowFn = time.Now
 
 type pendingEntry struct {
-	ID          string  `json:"id"`
-	Session     string  `json:"session"`
-	Name        *string `json:"name"`
-	Cwd         *string `json:"cwd"`
-	Thread      *string `json:"thread"`
-	Seq         uint64  `json:"seq"`
-	Count       uint64  `json:"count"`
-	FirstAt     string  `json:"first_at"`
-	DoneAt      string  `json:"done_at"`
-	Attempts    uint64  `json:"attempts"`
-	DeliveredAt string  `json:"delivered_at"`
-	NextAt      string  `json:"next_at"`
-	LastError   string  `json:"last_error"`
+	ID      string  `json:"id"`
+	Session string  `json:"session"`
+	Name    *string `json:"name"`
+	Cwd     *string `json:"cwd"`
+	Thread  *string `json:"thread"`
+	Seq     uint64  `json:"seq"`
+	Count   uint64  `json:"count"`
+	FirstAt string  `json:"first_at"`
+	DoneAt  string  `json:"done_at"`
 }
 
+// pendingFile is the on-disk rpc-pending.json. Seq is the last sequence
+// handed out; NotifiedSeq is the newest sequence a batch has already covered,
+// so an entry is un-notified exactly when its Seq is greater.
 type pendingFile struct {
-	Version int                     `json:"version"`
-	Seq     uint64                  `json:"seq"`
-	Entries map[string]pendingEntry `json:"entries"`
+	Version     int                     `json:"version"`
+	Seq         uint64                  `json:"seq"`
+	NotifiedSeq uint64                  `json:"notified_seq"`
+	Entries     map[string]pendingEntry `json:"entries"`
 }
 
 type pendingStore struct {
-	path, lockPath, profile string
+	path, lockPath string
 }
 
-func newPendingStore(stateDir, profile string) *pendingStore {
-	base := filepath.Join(stateDir, "rpc-pending-"+profile)
-	return &pendingStore{path: base + ".json", lockPath: base + ".lock", profile: profile}
+func newPendingStore(stateDir string) *pendingStore {
+	base := filepath.Join(stateDir, "rpc-pending")
+	return &pendingStore{path: base + ".json", lockPath: base + ".lock"}
 }
 
 // Each operation opens its own lock descriptor: flock must also serialize
@@ -113,8 +113,7 @@ func (s *pendingStore) Record(id string, ev rpcEvent) (pendingEntry, error) {
 		if e.FirstAt == "" {
 			e.FirstAt = now
 		}
-		e.DoneAt, e.NextAt = now, now
-		e.Attempts, e.LastError = 0, ""
+		e.DoneAt = now
 		f.Entries[id] = e
 		out = e
 		return true
@@ -152,19 +151,34 @@ func (s *pendingStore) List() ([]pendingEntry, error) {
 	return out, err
 }
 
-// update applies a send result only to the exact completion and attempt sent.
-// An ACK or a newer Record during exec must never be undone by its result.
-func (s *pendingStore) update(sent pendingEntry, fn func(*pendingEntry)) (bool, error) {
-	applied := false
+// Unnotified lists the entries no batch has covered yet, oldest first, so the
+// last element carries the newest sequence of the batch window.
+func (s *pendingStore) Unnotified() ([]pendingEntry, error) {
+	out := []pendingEntry{}
 	err := s.transact(func(f *pendingFile) bool {
-		e, ok := f.Entries[sent.ID]
-		if !ok || e.Seq != sent.Seq || e.Attempts != sent.Attempts {
+		for _, e := range f.Entries {
+			if e.Seq > f.NotifiedSeq {
+				out = append(out, e)
+			}
+		}
+		return false
+	})
+	sort.Slice(out, func(i, j int) bool { return out[i].Seq < out[j].Seq })
+	return out, err
+}
+
+// MarkNotified advances notified_seq to seq. It never regresses, so a batch
+// whose send overlapped a newer Record leaves the newer sequence un-notified
+// and arms the next window. It reports whether the file changed.
+func (s *pendingStore) MarkNotified(seq uint64) (bool, error) {
+	changed := false
+	err := s.transact(func(f *pendingFile) bool {
+		if seq <= f.NotifiedSeq {
 			return false
 		}
-		fn(&e)
-		f.Entries[e.ID] = e
-		applied = true
+		f.NotifiedSeq = seq
+		changed = true
 		return true
 	})
-	return applied, err
+	return changed, err
 }

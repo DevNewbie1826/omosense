@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -15,11 +16,15 @@ import (
 	"github.com/DevNewbie1826/omosense/internal/core"
 )
 
+// The batcher's knobs are package-level so tests drive it with an injected
+// clock and no real sleeps (the nowFn/deliverPoll pattern).
 var (
 	deliverPoll        = 30 * time.Second
-	deliverRemind      = 10 * time.Minute
 	deliverRetry       = time.Minute
 	deliverExecTimeout = time.Minute
+	batchQuiet         = 5 * time.Minute
+	batchLimit         = 32 * 1024
+	omoExecFn          = omoExec
 )
 
 func omoBin() string {
@@ -27,47 +32,6 @@ func omoBin() string {
 		return bin
 	}
 	return "omo"
-}
-
-type deliverer struct {
-	c     *core.Ctx
-	store *pendingStore
-	sink  core.Sink
-	wake  chan struct{}
-	errs  map[string]bool
-}
-
-func newDeliverer(c *core.Ctx, store *pendingStore, sink core.Sink) *deliverer {
-	return &deliverer{c: c, store: store, sink: sink, wake: make(chan struct{}, 1), errs: map[string]bool{}}
-}
-
-func (d *deliverer) Notify() {
-	select {
-	case d.wake <- struct{}{}:
-	default:
-	}
-}
-
-func (d *deliverer) Run(ctx context.Context) {
-	for ctx.Err() == nil {
-		d.pass(ctx)
-		timer := time.NewTimer(deliverPoll)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return
-		case <-d.wake:
-			timer.Stop()
-		case <-timer.C:
-		}
-	}
-}
-
-func (d *deliverer) note(msg string) {
-	if !d.errs[msg] {
-		d.errs[msg] = true
-		d.sink.Log(msg)
-	}
 }
 
 func omoExec(ctx context.Context, args ...string) ([]byte, error) {
@@ -87,138 +51,357 @@ func omoExec(ctx context.Context, args ...string) ([]byte, error) {
 	return out, nil
 }
 
-func (d *deliverer) target(ctx context.Context) (string, error) {
-	// The profile's rpc.session pins the delivery target; empty falls
-	// back to the webchat sessions.json of the state dir.
-	if id := d.c.Profile.RPC.Session; id != "" {
-		return id, nil
+// configName is the folder's own name, the diagnostics label of this folder's
+// watcher.
+func configName(c *core.Ctx) string {
+	if c.Dir == "" {
+		return ""
 	}
-	b, err := os.ReadFile(filepath.Join(d.c.State, "sessions.json"))
+	return filepath.Base(c.Dir)
+}
+
+// batcher turns recorded completions into ONE debounced notification. Every
+// Record wakes it; it fires five quiet minutes after the newest un-notified
+// done and pushes a single batch to the subscribed session, or drops the batch
+// and leaves the entries for `omosense rpc pending` (IS-6..IS-9).
+type batcher struct {
+	c       *core.Ctx
+	store   *pendingStore
+	sink    core.Sink
+	wake    chan struct{}
+	errs    map[string]bool
+	retryAt time.Time
+}
+
+func newBatcher(c *core.Ctx, store *pendingStore, sink core.Sink) *batcher {
+	return &batcher{c: c, store: store, sink: sink, wake: make(chan struct{}, 1), errs: map[string]bool{}}
+}
+
+// Notify re-arms the timer without blocking: a coalesced wake is enough, the
+// next pass recomputes the quiet window from the pending file.
+func (b *batcher) Notify() {
+	select {
+	case b.wake <- struct{}{}:
+	default:
+	}
+}
+
+func (b *batcher) Run(ctx context.Context) {
+	for ctx.Err() == nil {
+		b.pass(ctx)
+		timer := time.NewTimer(deliverPoll)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-b.wake:
+			timer.Stop()
+		case <-timer.C:
+		}
+	}
+}
+
+// note logs a message once per process, so a repeated failure does not flood
+// the session's stdout.
+func (b *batcher) note(msg string) {
+	if !b.errs[msg] {
+		b.errs[msg] = true
+		b.sink.Log(msg)
+	}
+}
+
+// pass attempts one batch. It is due at retryAt after a failed attempt, and
+// otherwise five quiet minutes after the newest un-notified done: one rule for
+// a live process and for a restart, so a restart with un-notified entries
+// fires at max(start, lastDoneAt+5m) (B3).
+func (b *batcher) pass(ctx context.Context) {
+	entries, err := b.store.Unnotified()
 	if err != nil {
-		return "", err
+		b.note("rpc pending: " + err.Error())
+		return
 	}
-	var profiles map[string]struct {
-		SessionID string `json:"session_id"`
-		Cwd       string `json:"cwd"`
+	if len(entries) == 0 {
+		b.retryAt = time.Time{}
+		return
 	}
-	if err := json.Unmarshal(b, &profiles); err != nil {
-		return "", err
+	now := nowFn()
+	if !b.retryAt.IsZero() {
+		if now.Before(b.retryAt) {
+			return
+		}
+	} else if due := lastDoneAt(entries).Add(batchQuiet); now.Before(due) {
+		return
 	}
-	p := profiles[d.c.Profile.Name]
-	if p.SessionID != "" {
-		return p.SessionID, nil
-	}
-	if p.Cwd == "" {
-		return "", fmt.Errorf("profile %s has no cwd or session_id", d.c.Profile.Name)
-	}
-	b, err = omoExec(ctx, "thread", "list", "--all-scope", "--json")
+	b.retryAt = time.Time{}
+	sub, err := readSubscription(b.c.State)
 	if err != nil {
-		return "", err
+		// A damaged subscription must not silently swallow the batch.
+		b.note("rpc subscription: " + err.Error())
+		b.retryAt = now.Add(deliverRetry)
+		return
+	}
+	if sub == nil {
+		b.drop(entries, "rpc batch dropped: no subscriber")
+		return
+	}
+	alive, err := subscriberAlive(ctx, sub.Session)
+	if err != nil {
+		// Only a successful list that lacks the id is "not alive"; an omo
+		// outage keeps the subscription and retries (B4).
+		b.note("rpc batch list: " + err.Error())
+		b.retryAt = now.Add(deliverRetry)
+		return
+	}
+	if !alive {
+		if err := removeSubscription(b.c.State); err != nil {
+			b.note("rpc subscription: " + err.Error())
+			b.retryAt = now.Add(deliverRetry)
+			return
+		}
+		b.drop(entries, fmt.Sprintf("rpc batch dropped: subscriber %s not alive; unsubscribed", sub.Session))
+		return
+	}
+	// The subscriber's own completion is acked, never sent to itself. Its
+	// durable id and its session handle both identify the subscriber.
+	send := make([]pendingEntry, 0, len(entries))
+	for _, e := range entries {
+		if e.ID == sub.Session || e.Session == sub.Session {
+			if result, err := b.store.Ack(e.ID, e.Seq, true); err != nil {
+				b.note("rpc pending: " + err.Error())
+			} else if result == "acked" {
+				b.sink.Log(fmt.Sprintf("rpc batch: %s is the subscriber; dropped", e.ID))
+			}
+			continue
+		}
+		send = append(send, e)
+	}
+	// notified_seq covers every sequence this attempt consumed; an entry
+	// recorded while the send is in flight keeps a greater seq and re-arms.
+	maxSeq := entries[len(entries)-1].Seq
+	if len(send) == 0 {
+		b.markNotified(maxSeq)
+		return
+	}
+	key := fmt.Sprintf("omosense-rpc-batch-%d", maxSeq)
+	if _, err := omoExecFn(ctx, "thread", "send", sub.Session, batchText(send, b.c.Dir, b.c.State), "--all-scope", "--idempotency-key", key, "--json"); err != nil {
+		b.note("rpc batch send: " + err.Error())
+		b.retryAt = now.Add(deliverRetry)
+		return
+	}
+	if b.markNotified(maxSeq) {
+		b.sink.Log(fmt.Sprintf("rpc batch sent %d entries (seq <= %d) to %s", len(send), maxSeq, sub.Session))
+	} else {
+		// The watermark could not be persisted: back off instead of re-sending
+		// on every poll (the key keeps a repeat idempotent anyway).
+		b.retryAt = now.Add(deliverRetry)
+	}
+}
+
+// drop abandons the batch: every un-notified entry becomes notified, so a
+// dropped batch is never pushed later - the entries stay readable through
+// `omosense rpc pending` (IS-7).
+func (b *batcher) drop(entries []pendingEntry, msg string) {
+	if b.markNotified(entries[len(entries)-1].Seq) {
+		b.note(msg)
+	}
+}
+
+func (b *batcher) markNotified(seq uint64) bool {
+	changed, err := b.store.MarkNotified(seq)
+	if err != nil {
+		b.note("rpc pending: " + err.Error())
+		return false
+	}
+	return changed
+}
+
+// lastDoneAt is the newest done_at among the un-notified entries. An
+// unparsable timestamp contributes the zero time, so a damaged file notifies
+// immediately instead of never.
+func lastDoneAt(entries []pendingEntry) time.Time {
+	var out time.Time
+	for _, e := range entries {
+		t, err := time.Parse(time.RFC3339Nano, e.DoneAt)
+		if err != nil {
+			continue
+		}
+		if t.After(out) {
+			out = t
+		}
+	}
+	return out
+}
+
+// subscriberAlive reports whether the subscription names a live omo thread.
+// Every failure is returned so the caller retries without unsubscribing.
+func subscriberAlive(ctx context.Context, id string) (bool, error) {
+	b, err := omoExecFn(ctx, "thread", "list", "--all-scope", "--json")
+	if err != nil {
+		return false, err
 	}
 	var threads []struct {
 		ThreadID  string `json:"thread_id"`
 		SessionID string `json:"sessionId"`
 		Alive     bool   `json:"alive"`
-		Kind      string `json:"kind"`
-		Surface   string `json:"surface"`
-		Cwd       string `json:"cwd"`
 	}
 	if err := json.Unmarshal(b, &threads); err != nil {
-		return "", err
+		return false, fmt.Errorf("thread list: %w", err)
 	}
-	var candidates []string
 	for _, t := range threads {
-		if t.Alive && t.Kind == "interactive" && t.Surface == "tui" && t.Cwd != "" &&
-			filepath.Clean(t.Cwd) == filepath.Clean(p.Cwd) {
-			id := t.ThreadID
-			if id == "" {
-				id = t.SessionID
-			}
-			if id != "" {
-				candidates = append(candidates, id)
-			}
+		if t.Alive && (t.ThreadID == id || t.SessionID == id) {
+			return true, nil
 		}
 	}
-	if len(candidates) != 1 {
-		return "", fmt.Errorf("profile %s has %d cwd candidates", d.c.Profile.Name, len(candidates))
-	}
-	return candidates[0], nil
+	return false, nil
 }
 
-func (d *deliverer) pass(ctx context.Context) {
-	entries, err := d.store.List()
-	if err != nil {
-		d.note("rpc pending: " + err.Error())
-		return
-	}
-	if len(entries) == 0 || ctx.Err() != nil {
-		return
-	}
-	target, err := d.target(ctx)
-	if err != nil {
-		d.note("rpc deliver target: " + err.Error())
-		return
-	}
-	for _, e := range entries {
-		if ctx.Err() != nil {
-			return
-		}
-		next, _ := time.Parse(time.RFC3339Nano, e.NextAt)
-		if e.Attempts != 0 && nowFn().Before(next) {
-			continue
-		}
-		if e.ID == target {
-			result, err := d.store.Ack(e.ID, e.Seq, true)
-			if err != nil {
-				d.note("rpc pending: " + err.Error())
-			} else if result == "acked" {
-				d.sink.Log(fmt.Sprintf("rpc pending %s is the delivery target; dropped", e.ID))
-			}
-			continue
-		}
-		key := fmt.Sprintf("omosense-rpc-%s-%s-%d-%d", d.store.profile, e.ID, e.Seq, e.Attempts+1)
-		_, sendErr := omoExec(ctx, "thread", "send", target, deliveryText(e, d.store.profile),
-			"--all-scope", "--idempotency-key", key, "--json")
-		applied, err := d.store.update(e, func(current *pendingEntry) {
-			now := nowFn()
-			current.Attempts++
-			if sendErr == nil {
-				current.DeliveredAt = core.ISO(now)
-				current.NextAt = core.ISO(now.Add(deliverRemind))
-				current.LastError = ""
-			} else {
-				current.NextAt = core.ISO(now.Add(deliverRetry))
-				current.LastError = strings.TrimSpace(sendErr.Error())
-			}
-		})
-		if err != nil {
-			d.note("rpc pending: " + err.Error())
-		} else if applied {
-			if sendErr == nil {
-				d.sink.Log(fmt.Sprintf("rpc delivered %s seq %d attempt %d", e.ID, e.Seq, e.Attempts+1))
-			} else {
-				d.note(fmt.Sprintf("rpc deliver %s: %s", e.ID, sendErr))
-			}
-		}
-	}
+// subscription is the folder's single rpc delivery target (IS-7).
+type subscription struct {
+	Session      string `json:"session"`
+	SubscribedAt string `json:"subscribed_at"`
 }
 
-func deliveryText(e pendingEntry, profile string) string {
-	// Reserve the mandatory metadata and ACK command before bounding the
-	// display fields; truncation must never cut off the machine-consumed ACK.
-	tail := fmt.Sprintf("\n완료 id: %s\nseq: %d\ndone_at: %s\ncount: %d\n확인 명령: omosense rpc ack %s %d --profile %s\n확인할 때까지 10분마다 다시 알립니다.",
-		e.ID, e.Seq, e.DoneAt, e.Count, e.ID, e.Seq, profile)
-	fields := []*string{e.Name, e.Thread, e.Cwd}
-	values := make([]string, len(fields))
-	budget := (32768 - len(tail) - len("작업: \nthread: \ncwd: ")) / len(fields)
-	for i, field := range fields {
-		values[i] = snapText(field)
-		if len(values[i]) > budget {
-			values[i] = values[i][:budget]
-			for !utf8.ValidString(values[i]) {
-				values[i] = values[i][:len(values[i])-1]
-			}
-		}
+func subscriptionPath(stateDir string) string {
+	return filepath.Join(stateDir, "rpc-subscription.json")
+}
+
+// readSubscription returns nil when nothing is subscribed. A malformed file is
+// an error so the caller retries rather than dropping the batch.
+func readSubscription(stateDir string) (*subscription, error) {
+	b, err := os.ReadFile(subscriptionPath(stateDir))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
 	}
-	return fmt.Sprintf("작업: %s\nthread: %s\ncwd: %s%s", values[0], values[1], values[2], tail)
+	if err != nil {
+		return nil, err
+	}
+	var s subscription
+	if err := json.Unmarshal(b, &s); err != nil {
+		return nil, fmt.Errorf("rpc-subscription.json: %w", err)
+	}
+	if s.Session == "" {
+		return nil, errors.New("rpc-subscription.json: no session")
+	}
+	return &s, nil
+}
+
+// writeSubscription publishes the subscription with a temp file and a rename,
+// so the batcher never reads a half-written file.
+func writeSubscription(stateDir string, s subscription) error {
+	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+		return err
+	}
+	b, err := json.Marshal(s)
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(stateDir, ".rpc-subscription-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	if _, err = tmp.Write(b); err == nil {
+		err = tmp.Sync()
+	}
+	closeErr := tmp.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	return os.Rename(tmp.Name(), subscriptionPath(stateDir))
+}
+
+func removeSubscription(stateDir string) error {
+	if err := os.Remove(subscriptionPath(stateDir)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+// batchText renders the IS-9 batch: one block per entry, bounded to batchLimit
+// with a single overflow line naming `omosense rpc pending`. A listed entry's
+// ACK command is never truncated.
+func batchText(entries []pendingEntry, dir, state string) string {
+	absDir, absState := absPath(dir), absPath(state)
+	blocks := make([]string, len(entries))
+	for i, e := range entries {
+		blocks[i] = entryBlock(e, absDir, absState, len(entries))
+	}
+	total, kept := 0, 0
+	for i := range blocks {
+		add := len(blocks[i])
+		if kept > 0 {
+			add++ // the newline joining the previous block
+		}
+		extra := 0
+		if rest := len(blocks) - kept - 1; rest > 0 {
+			extra = 1 + len(overflowLine(rest, absDir, absState))
+		}
+		if total+add+extra > batchLimit {
+			break
+		}
+		total += add
+		kept++
+	}
+	if kept == 0 {
+		return overflowLine(len(blocks), absDir, absState)
+	}
+	out := strings.Join(blocks[:kept], "\n")
+	if kept < len(blocks) {
+		out += "\n" + overflowLine(len(blocks)-kept, absDir, absState)
+	}
+	return out
+}
+
+func overflowLine(n int, dir, state string) string {
+	return fmt.Sprintf("+%d more: OMOSENSE_DIR='%s' OMOSENSE_STATE='%s' omosense rpc pending", n, dir, state)
+}
+
+// ackCommand is the machine-consumed command the batch carries: absolute
+// env-pinned paths, so it is valid in every configuration (B1).
+func ackCommand(e pendingEntry, dir, state string) string {
+	return fmt.Sprintf("OMOSENSE_DIR='%s' OMOSENSE_STATE='%s' omosense rpc ack %s %d", dir, state, e.ID, e.Seq)
+}
+
+// entryBlock renders one entry. The display fields share the entry's slice of
+// the budget; the metadata and the ACK command are mandatory.
+func entryBlock(e pendingEntry, dir, state string, n int) string {
+	labels := "작업: \nthread: \ncwd: "
+	ack := "확인 명령: " + ackCommand(e, dir, state)
+	meta := fmt.Sprintf("완료 id: %s\nseq: %d\ndone_at: %s\ncount: %d", e.ID, e.Seq, e.DoneAt, e.Count)
+	display := (batchLimit/n - len(labels) - len(meta) - len(ack) - 2) / 3
+	if display < 0 {
+		display = 0
+	}
+	return fmt.Sprintf("작업: %s\nthread: %s\ncwd: %s\n%s\n%s",
+		truncField(snapText(e.Name), display), truncField(snapText(e.Thread), display),
+		truncField(snapText(e.Cwd), display), meta, ack)
+}
+
+// truncField cuts s to at most budget bytes without splitting a rune.
+func truncField(s string, budget int) string {
+	if budget <= 0 {
+		return ""
+	}
+	if len(s) <= budget {
+		return s
+	}
+	s = s[:budget]
+	for !utf8.ValidString(s) {
+		s = s[:len(s)-1]
+	}
+	return s
+}
+
+func absPath(p string) string {
+	if p == "" {
+		return p
+	}
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return p
+	}
+	return abs
 }

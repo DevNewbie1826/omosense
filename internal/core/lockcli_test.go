@@ -68,18 +68,18 @@ func runProbe(t *testing.T, args []string, stdin *strings.Reader, env ...string)
 
 func TestAcquireExits3OnLiveHolder(t *testing.T) {
 	_, dir, state := cliEnv(t)
-	writeCliConfig(t, dir, cliProfilesCfg)
+	writeCliConfig(t, dir, cliFlatCfg)
 	pid := liveCliSleeper(t)
-	writeCliLock(t, state, "listen-main", cliHeldJSON(pid))
+	writeCliLock(t, state, "listen", cliHeldJSON(pid))
 
-	stdOut, _, code := runProbe(t, []string{"--profile", "main"}, nil, "PROBE_LOCK=listen-main")
+	stdOut, _, code := runProbe(t, nil, nil, "PROBE_LOCK=listen")
 	if code != 3 {
 		t.Fatalf("exit = %d, want 3", code)
 	}
-	if !strings.HasPrefix(stdOut, "LOG ALREADY_RUNNING listen-main {") || !strings.HasSuffix(stdOut, "}\n") {
-		t.Fatalf("stdout = %q, want LOG ALREADY_RUNNING listen-main <json>", stdOut)
+	if !strings.HasPrefix(stdOut, "LOG ALREADY_RUNNING listen {") || !strings.HasSuffix(stdOut, "}\n") {
+		t.Fatalf("stdout = %q, want LOG ALREADY_RUNNING listen <json>", stdOut)
 	}
-	v, err := core.ParseJSON([]byte(strings.TrimPrefix(strings.TrimSuffix(stdOut, "\n"), "LOG ALREADY_RUNNING listen-main ")))
+	v, err := core.ParseJSON([]byte(strings.TrimPrefix(strings.TrimSuffix(stdOut, "\n"), "LOG ALREADY_RUNNING listen ")))
 	if err != nil {
 		t.Fatalf("held json: %v", err)
 	}
@@ -89,26 +89,29 @@ func TestAcquireExits3OnLiveHolder(t *testing.T) {
 }
 
 func TestAcquireExits3OnLiveLegacyHolder(t *testing.T) {
+	// The legacy name is checked first (lock.ts order), and the blocking
+	// holder is reported under that name. No shipped caller passes one any
+	// more, so the pair here is artificial.
 	_, dir, state := cliEnv(t)
-	writeCliConfig(t, dir, cliProfilesCfg)
+	writeCliConfig(t, dir, cliFlatCfg)
 	pid := liveCliSleeper(t)
-	writeCliLock(t, state, "listen", cliHeldJSON(pid))
+	writeCliLock(t, state, "listen-legacy", cliHeldJSON(pid))
 
-	stdOut, _, code := runProbe(t, []string{"--profile", "main"}, nil, "PROBE_LOCK=listen-main", "PROBE_LEGACY=listen")
+	stdOut, _, code := runProbe(t, nil, nil, "PROBE_LOCK=listen", "PROBE_LEGACY=listen-legacy")
 	if code != 3 {
 		t.Fatalf("exit = %d, want 3", code)
 	}
-	if !strings.HasPrefix(stdOut, "LOG ALREADY_RUNNING listen {") {
+	if !strings.HasPrefix(stdOut, "LOG ALREADY_RUNNING listen-legacy {") {
 		t.Fatalf("stdout = %q, want the legacy name in the LOG line", stdOut)
 	}
 }
 
 func TestAcquireUnparsableLockExits1(t *testing.T) {
 	_, dir, state := cliEnv(t)
-	writeCliConfig(t, dir, cliProfilesCfg)
-	writeCliLock(t, state, "listen-main", "{oops")
+	writeCliConfig(t, dir, cliFlatCfg)
+	writeCliLock(t, state, "listen", "{oops")
 
-	stdOut, stderr, code := runProbe(t, []string{"--profile", "main"}, nil, "PROBE_LOCK=listen-main")
+	stdOut, stderr, code := runProbe(t, nil, nil, "PROBE_LOCK=listen")
 	if code != 1 {
 		t.Fatalf("exit = %d, want 1", code)
 	}
@@ -119,24 +122,24 @@ func TestAcquireUnparsableLockExits1(t *testing.T) {
 
 func TestAcquireReleasesOnStdinEOF(t *testing.T) {
 	_, dir, state := cliEnv(t)
-	writeCliConfig(t, dir, cliProfilesCfg)
+	writeCliConfig(t, dir, cliFlatCfg)
 
-	stdOut, _, code := runProbe(t, []string{"--profile", "main"}, strings.NewReader(""), "PROBE_LOCK=listen-main", "PROBE_LEGACY=listen")
+	stdOut, _, code := runProbe(t, nil, strings.NewReader(""), "PROBE_LOCK=listen", "PROBE_LEGACY=listen-legacy")
 	if code != 0 || stdOut != "acquired\n" {
 		t.Fatalf("code=%d stdout=%q, want 0/acquired", code, stdOut)
 	}
-	if _, err := os.Stat(filepath.Join(state, "listen-main.lock.json")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(state, "listen.lock.json")); !os.IsNotExist(err) {
 		t.Errorf("lock file not released on exit: %v", err)
 	}
 }
 
 func TestAcquireReleasesOnSignal(t *testing.T) {
 	_, dir, state := cliEnv(t)
-	writeCliConfig(t, dir, cliProfilesCfg)
+	writeCliConfig(t, dir, cliFlatCfg)
 	buildBinaries(t)
 
-	cmd := exec.Command(probePath, "--profile", "main")
-	cmd.Env = append(os.Environ(), "PROBE_LOCK=listen-main", "PROBE_LEGACY=listen")
+	cmd := exec.Command(probePath)
+	cmd.Env = append(os.Environ(), "PROBE_LOCK=listen", "PROBE_LEGACY=listen-legacy")
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -156,7 +159,7 @@ func TestAcquireReleasesOnSignal(t *testing.T) {
 	if err != nil || line != "acquired\n" {
 		t.Fatalf("probe line = %q err=%v, want acquired", line, err)
 	}
-	if _, err := os.Stat(filepath.Join(state, "listen-main.lock.json")); err != nil {
+	if _, err := os.Stat(filepath.Join(state, "listen.lock.json")); err != nil {
 		t.Fatalf("lock file missing while held: %v", err)
 	}
 
@@ -174,7 +177,7 @@ func TestAcquireReleasesOnSignal(t *testing.T) {
 	if code != 0 {
 		t.Errorf("exit after SIGTERM = %d, want 0 (stderr=%q)", code, eb.String())
 	}
-	if _, err := os.Stat(filepath.Join(state, "listen-main.lock.json")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(state, "listen.lock.json")); !os.IsNotExist(err) {
 		t.Errorf("lock file not released on signal: %v", err)
 	}
 }

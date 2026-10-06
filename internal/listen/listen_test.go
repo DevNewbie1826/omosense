@@ -85,13 +85,10 @@ func testCtx(t *testing.T) *core.Ctx {
 	if err := os.MkdirAll(state, 0700); err != nil {
 		t.Fatal(err)
 	}
-	profiles := core.NewOMap()
-	profiles.Set("test", core.NewOMap())
 	return &core.Ctx{State: state, Dir: os.Getenv("OMOSENSE_DIR"), Profile: core.Profile{
-		Name:     "test",
-		Telegram: core.PlatformCfg{Bots: []string{"test"}, Roles: map[string]string{"12": "owner", "13": "wife"}},
-		Discord:  core.PlatformCfg{Bots: []string{"test"}, Roles: map[string]string{"owner": "owner", "wife": "wife"}},
-	}, Cfg: &core.Cfg{Raw: core.NewOMap(), Profiles: profiles}, Flags: map[string]bool{}, Out: core.NewOut(os.Stdout)}
+		Telegram: core.PlatformCfg{Bot: "test", Roles: map[string]string{"12": "owner", "13": "wife"}},
+		Discord:  core.PlatformCfg{Bot: "test", Roles: map[string]string{"owner": "owner", "wife": "wife"}},
+	}, Cfg: &core.Cfg{Raw: core.NewOMap()}, Flags: map[string]bool{}, Out: core.NewOut(os.Stdout)}
 }
 
 func TestTelegramPollPersistsOffsetAndEventShape(t *testing.T) {
@@ -124,7 +121,9 @@ func TestTelegramPollPersistsOffsetAndEventShape(t *testing.T) {
 			<-ctx.Done()
 		}
 	}))
-	defer server.Close()
+	// Cancel before closing: the second poll's handler parks on ctx.Done(),
+	// so closing first would block this test instead of failing it.
+	defer func() { cancel(); server.Close() }()
 	t.Setenv("OMOSENSE_TELEGRAM_API", server.URL)
 	sink := newSink()
 	done := make(chan error, 1)
@@ -232,23 +231,23 @@ func TestRolesFromProfile(t *testing.T) {
 	}
 }
 
-// TestSourcesSkipEmptyPlatforms pins IS-4b: a platform with no bots is not
-// a source, and a profile with neither platform registers no listen source
-// at all instead of a telegram worker that returns and is restarted.
+// TestSourcesSkipEmptyPlatforms pins IS-4b: a platform without a bot is not
+// a source, and a config with neither bot registers no listen source at all
+// instead of a telegram worker that returns and is restarted.
 func TestSourcesSkipEmptyPlatforms(t *testing.T) {
 	c := testCtx(t)
-	c.Profile.Telegram.Bots = nil
-	c.Profile.Discord.Bots = nil
+	c.Profile.Telegram.Bot = ""
+	c.Profile.Discord.Bot = ""
 	if got := Sources(c); len(got) != 0 {
-		t.Fatalf("empty profile sources = %d, want none", len(got))
+		t.Fatalf("botless config sources = %d, want none", len(got))
 	}
-	c.Profile.Discord.Bots = []string{"d1"}
+	c.Profile.Discord.Bot = "d1"
 	got := Sources(c)
 	if len(got) != 1 || got[0].Name() != "discord" {
 		t.Fatalf("discord-only sources = %v, want discord", got)
 	}
-	c.Profile.Discord.Bots = nil
-	c.Profile.Telegram.Bots = []string{"t1"}
+	c.Profile.Discord.Bot = ""
+	c.Profile.Telegram.Bot = "t1"
 	got = Sources(c)
 	if len(got) != 1 || got[0].Name() != "telegram" {
 		t.Fatalf("telegram-only sources = %v, want telegram", got)

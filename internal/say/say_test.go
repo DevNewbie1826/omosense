@@ -17,9 +17,21 @@ import (
 	"github.com/DevNewbie1826/omosense/internal/core"
 )
 
+// sayConfig is the folder's flat config: telegram.bot and discord.bot name
+// the default sending bots. The creds file below also holds dm2/d2, which
+// the {"bot":...} override tests select.
+const sayConfig = `{"telegram":{"bot":"b1"},"discord":{"bot":"d1"}}`
+
 // testEnv points HOME, OMOSENSE_DIR and OMOSENSE_STATE at temp dirs with a
-// config.json and fake agent-messenger credentials (obviously fake tokens).
+// flat config.json and fake agent-messenger credentials (obviously fake
+// tokens).
 func testEnv(t *testing.T) (home, dir, state string) {
+	return testEnvConfig(t, sayConfig)
+}
+
+// testEnvConfig is testEnv with a caller-supplied config.json, for the
+// bot-less cases.
+func testEnvConfig(t *testing.T, cfg string) (home, dir, state string) {
 	t.Helper()
 	home = t.TempDir()
 	dir = filepath.Join(home, ".omosense")
@@ -31,7 +43,7 @@ func testEnv(t *testing.T) (home, dir, state string) {
 	if err := os.MkdirAll(creds, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(`{"profiles":{"main":{"telegram":{"bots":["b1","b2"]},"discord":{"bots":["d1"]}},"family":{"telegram":{"bots":["f1"]}},"bare":{"telegram":{"bots":[]},"discord":{"bots":[]}}}}`), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(cfg), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(creds, "telegrambot-credentials.json"), []byte(`{"bots":{"b1":{"token":"TGTOK1"},"dm2":{"token":"TGTOK2"},"f1":{"token":"TGTOKFAM"}}}`), 0o644); err != nil {
@@ -71,8 +83,12 @@ func captureStd(t *testing.T) (restore func() (stdout, stderr string)) {
 }
 
 func runSay(t *testing.T, args ...string) (stdout, stderr string, code int) {
+	return runSayConfig(t, sayConfig, args...)
+}
+
+func runSayConfig(t *testing.T, cfg string, args ...string) (stdout, stderr string, code int) {
 	t.Helper()
-	testEnv(t)
+	testEnvConfig(t, cfg)
 	restore := captureStd(t)
 	ctx, err := core.Load(core.ParseArgs(args), false)
 	if err != nil {
@@ -291,15 +307,15 @@ func TestMissingJSONArgDefaultsToEmptyObject(t *testing.T) {
 	}
 }
 
-// IS-7: a profile with no bots for the platform and no {"bot":...}
-// override is a usage error (exit 2), not a cred lookup failure.
+// IS-7: a config with no bot for the platform and no {"bot":...} override
+// is a usage error (exit 2), not a cred lookup failure.
 func TestNoBotsErrorsExits2(t *testing.T) {
 	for _, platform := range []string{"telegram", "discord"} {
-		stdout, stderr, code := runSay(t, "--profile", "bare", platform, "send", `{"chat_id":1,"text":"x"}`)
+		stdout, stderr, code := runSayConfig(t, `{"telegram":{"bot":""},"discord":{"bot":""}}`, platform, "send", `{"chat_id":1,"text":"x"}`)
 		if code != 2 {
 			t.Errorf("%s: exit = %d, want 2", platform, code)
 		}
-		if want := "no bot: profile bare has no " + platform + " bots; pass {\"bot\":\"name\"} to choose one\n"; stderr != want {
+		if want := "no bot: config.json has no " + platform + ".bot; pass {\"bot\":\"name\"} to choose one\n"; stderr != want {
 			t.Errorf("%s: stderr = %q, want %q", platform, stderr, want)
 		}
 		if stdout != "" {
@@ -308,15 +324,15 @@ func TestNoBotsErrorsExits2(t *testing.T) {
 	}
 }
 
-// An explicit {"bot":...} override still sends when the profile lists no
-// bots for the platform.
+// An explicit {"bot":...} override still sends when the config names no bot
+// for the platform.
 func TestBotOverrideRescuesEmptyBots(t *testing.T) {
 	rec := &recorder{}
 	srv := httptest.NewServer(rec.handler(jsonResponder(200, `{"ok":true}`)))
 	t.Cleanup(srv.Close)
 	t.Setenv("OMOSENSE_TELEGRAM_API", srv.URL)
 
-	_, _, code := runSay(t, "--profile", "bare", "telegram", "send", `{"bot":"b1","chat_id":1,"text":"x"}`)
+	_, _, code := runSayConfig(t, `{"telegram":{"bot":""}}`, "telegram", "send", `{"bot":"b1","chat_id":1,"text":"x"}`)
 	r := rec.last(t)
 	if r.path != "/botTGTOK1/sendMessage" {
 		t.Errorf("path = %s, want the override token (/botTGTOK1/sendMessage)", r.path)
@@ -327,18 +343,18 @@ func TestBotOverrideRescuesEmptyBots(t *testing.T) {
 	}
 }
 
-// IS-7: --profile selects the profile whose bots list provides the
-// default bot (family's first bot, not main's).
-func TestProfileSelectsDefaultBot(t *testing.T) {
+// The folder's config.json supplies the default bot: telegram.bot is the
+// token say sends with, with no flag needed.
+func TestConfigSelectsDefaultBot(t *testing.T) {
 	rec := &recorder{}
 	srv := httptest.NewServer(rec.handler(jsonResponder(200, `{"ok":true}`)))
 	t.Cleanup(srv.Close)
 	t.Setenv("OMOSENSE_TELEGRAM_API", srv.URL)
 
-	_, _, code := runSay(t, "--profile", "family", "telegram", "send", `{"chat_id":1,"text":"x"}`)
+	_, _, code := runSayConfig(t, `{"telegram":{"bot":"f1"}}`, "telegram", "send", `{"chat_id":1,"text":"x"}`)
 	r := rec.last(t)
 	if r.path != "/botTGTOKFAM/sendMessage" {
-		t.Errorf("path = %s, want family's first bot (/botTGTOKFAM/sendMessage)", r.path)
+		t.Errorf("path = %s, want the configured bot (/botTGTOKFAM/sendMessage)", r.path)
 	}
 	if code != 0 {
 		t.Errorf("exit = %d, want 0", code)

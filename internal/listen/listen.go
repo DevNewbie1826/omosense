@@ -16,11 +16,11 @@ import (
 )
 
 // Help is the usage text printed by omosense listen --help.
-const Help = `Usage: omosense listen [--profile P] [--dry-run]
+const Help = `Usage: omosense listen [--dry-run]
 
-Runs one Telegram poller per bot and one Discord gateway session per bot
-that the profile configures, printing EVENT and LOG lines to stdout. A
-platform with no bots contributes no source.
+Runs the Telegram poller and the Discord gateway session this folder's
+config.json names (telegram.bot / discord.bot), printing EVENT and LOG
+lines to stdout. A platform without a bot contributes no source.
 
 Flags:
   --dry-run    print the run plan and exit 0 without taking the lock
@@ -30,20 +30,12 @@ Flags:
 // under the listen lock with the TS stdout grammar and exit semantics.
 func Run(ctx *core.Ctx, args []string) int {
 	if ctx.Flags["--dry-run"] || core.ParseArgs(args).Flags["--dry-run"] {
-		bots := ctx.Profile.Telegram.Bots
-		if bots == nil {
-			bots = []string{}
-		}
-		discordBots := ctx.Profile.Discord.Bots
-		if discordBots == nil {
-			discordBots = []string{}
-		}
-		ctx.Out.Emit("PLAN", map[string]any{"profile": ctx.Profile.Name, "discord": discordBots, "telegram": bots, "lock": "listen-" + ctx.Profile.Name, "state": ctx.State})
+		ctx.Out.Emit("PLAN", map[string]any{"dir": ctx.Dir, "telegram": platformBots(ctx.Profile.Telegram.Bot), "discord": platformBots(ctx.Profile.Discord.Bot), "lock": "listen", "state": ctx.State})
 		return 0
 	}
-	release := ctx.Acquire("listen-"+ctx.Profile.Name, "listen")
+	release := ctx.Acquire("listen", "")
 	defer release()
-	ctx.Out.Log("omosense listener starting (profile " + ctx.Profile.Name + ")")
+	ctx.Out.Log("omosense listener starting")
 	runCtx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 	defer cancel()
 	var wg sync.WaitGroup
@@ -67,39 +59,44 @@ func Run(ctx *core.Ctx, args []string) int {
 	return 0
 }
 
-// Sources returns the telegram and discord sources of ctx's profile. A
-// platform with no bots registers no source: a profile may listen on one
+// Sources returns the telegram and discord sources of the folder's config.
+// A platform without a bot registers no source: a folder may listen on one
 // platform only, or on none at all (calendar/herdr-only). Both sources
-// share the listen-<profile> lock (legacy "listen"); the daemon refcounts
-// that lock across them.
+// share the listen lock, which the host refcounts across them.
 func Sources(ctx *core.Ctx) []core.Source {
-	p := ctx.Profile.Name
 	var result []core.Source
-	if len(ctx.Profile.Telegram.Bots) > 0 {
+	if ctx.Profile.Telegram.Bot != "" {
 		result = append(result, src{
 			cfg:      ctx,
 			sleep:    sleep,
 			name:     "telegram",
 			prefixes: []string{"EVENT"},
-			lock:     "listen-" + p,
-			legacy:   "listen",
+			lock:     "listen",
 		})
 	}
-	if len(ctx.Profile.Discord.Bots) > 0 {
+	if ctx.Profile.Discord.Bot != "" {
 		result = append(result, src{
 			cfg:      ctx,
 			sleep:    sleep,
 			name:     "discord",
 			prefixes: []string{"EVENT"},
 			alwaysOn: true,
-			lock:     "listen-" + p,
-			legacy:   "listen",
+			lock:     "listen",
 		})
 	}
 	return result
 }
 
-// src hosts one platform under either the daemon or compat host.
+// platformBots is the single bot as the bot list the pollers iterate, so an
+// unset bot is an empty list rather than a one-element list holding "".
+func platformBots(bot string) []string {
+	if bot == "" {
+		return []string{}
+	}
+	return []string{bot}
+}
+
+// src hosts one platform under either the session host or the compat host.
 type src struct {
 	cfg      *core.Ctx
 	sleep    func(context.Context, time.Duration) error
@@ -108,13 +105,12 @@ type src struct {
 	prefixes []string
 	alwaysOn bool
 	lock     string
-	legacy   string
 }
 
 func (s src) Name() string               { return s.name }
 func (s src) Prefixes() []string         { return s.prefixes }
 func (s src) AlwaysOn() bool             { return s.alwaysOn }
-func (s src) LockName() (string, string) { return s.lock, s.legacy }
+func (s src) LockName() (string, string) { return s.lock, "" }
 
 func (s src) Run(ctx context.Context, sink core.Sink) error {
 	if s.name == "telegram" {

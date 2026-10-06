@@ -70,13 +70,16 @@ func (h *streamHarness) connected() {
 func (h *streamHarness) done(t *testing.T, ids ...string) {
 	t.Helper()
 	var got []string
-	for _, ev := range events(t, h.out) {
-		if ev["event"] == "done" {
-			got = append(got, ev["id"].(string))
+	for _, ev := range h.recorded {
+		if ev.Event == "done" {
+			got = append(got, ev.ID)
 		}
 	}
 	if !reflect.DeepEqual(got, ids) {
-		t.Fatalf("done ids = %v, want %v; stdout %s", got, ids, h.out.String())
+		t.Fatalf("recorded done ids = %v, want %v; records %+v; stdout %s", got, ids, h.recorded, h.out.String())
+	}
+	if strings.Contains(h.out.String(), `"event":"done"`) {
+		t.Fatalf("done was printed to stdout (IS-8): %s", h.out.String())
 	}
 }
 
@@ -147,9 +150,10 @@ func TestStreamCloseTombstone(t *testing.T) {
 		// A lagging list of a session only the stream knew must not reopen it.
 		h.w.tick(context.Background())
 		h.w.tick(context.Background())
-		if got := eventNames(t, h); !reflect.DeepEqual(got, []string{"done D7", "closed D7"}) {
+		if got := eventNames(t, h); !reflect.DeepEqual(got, []string{"closed D7"}) {
 			t.Fatalf("events = %v", got)
 		}
+		h.done(t, "D7")
 	})
 }
 
@@ -211,9 +215,10 @@ func TestStreamReplacementFromUnwatched(t *testing.T) {
 	h.frame("agent_settled", "H")
 	h.w.tick(context.Background())
 	// The unwatched pre-start identity leaves no phantom record to close.
-	if got := eventNames(t, h); !reflect.DeepEqual(got, []string{"done B", "opened B"}) {
+	if got := eventNames(t, h); !reflect.DeepEqual(got, []string{"opened B"}) {
 		t.Fatalf("events = %v", got)
 	}
+	h.done(t, "B")
 }
 
 func TestStreamLookupLostOnDown(t *testing.T) {
@@ -276,7 +281,8 @@ func TestStreamDeferredDurable(t *testing.T) {
 	h.list("s0", session("H", "D7"))
 	h.list("s0", session("H", "D7"))
 	h.frame("agent_settled", "H")
-	h.done(t, "H")
+	// The deferred completion is recorded under its late durable id.
+	h.done(t, "D7")
 	if len(h.recorded) != 1 || h.recorded[0].ID != "D7" {
 		t.Fatalf("late durable record = %+v", h.recorded)
 	}
@@ -442,7 +448,7 @@ func TestStreamNestedReconciliation(t *testing.T) {
 		q.append(streamItem{err: io.EOF})
 	}
 	h := newStreamHarness(t, tickFor("H", "D7", "working"), outer, tickFor("H", "D7", "idle"))
-	store := newPendingStore(h.w.stateDir, h.w.profile)
+	store := newPendingStore(h.w.stateDir)
 	record := h.w.record
 	h.w.record = func(id string, ev rpcEvent) {
 		record(id, ev)
@@ -499,7 +505,7 @@ func TestStreamFlappingPollFallback(t *testing.T) {
 	working, quiet := tickFor("H", "D7", "working"), tickFor("H", "D7", "idle")
 	working.beforeState, quiet.beforeState = flap, flap
 	h := newStreamHarness(t, working, tickFor("H", "D7", "idle"), quiet, tickFor("H", "D7", "idle"))
-	store := newPendingStore(h.w.stateDir, h.w.profile)
+	store := newPendingStore(h.w.stateDir)
 	record := h.w.record
 	h.w.record = func(id string, ev rpcEvent) {
 		record(id, ev)
@@ -571,7 +577,7 @@ func TestStreamHeldReconciliationRebindsTurn(t *testing.T) {
 		q.append(streamItem{frame: streamFrame{Type: "agent_settled", Session: "H"}})
 	}
 	h := newStreamHarness(t, tickFor("H", "A", "idle"), outer, reconcile, tickFor("H", "B", "idle"))
-	store := newPendingStore(h.w.stateDir, h.w.profile)
+	store := newPendingStore(h.w.stateDir)
 	record := h.w.record
 	h.w.record = func(id string, ev rpcEvent) {
 		record(id, ev)
@@ -611,7 +617,7 @@ func TestStreamReconciliationDropsEndedTurn(t *testing.T) {
 		q.append(streamItem{frame: streamFrame{Type: "agent_settled", Session: "H"}})
 	}
 	h := newStreamHarness(t, tickFor("H", "A", "idle"), outer, tickFor("H", "B", "idle"))
-	store := newPendingStore(h.w.stateDir, h.w.profile)
+	store := newPendingStore(h.w.stateDir)
 	record := h.w.record
 	h.w.record = func(id string, ev rpcEvent) {
 		record(id, ev)
@@ -643,7 +649,7 @@ func TestStreamReconciliationDropsEndedTurn(t *testing.T) {
 
 func TestStreamReconnectRemovedKnownTurn(t *testing.T) {
 	h := newStreamHarness(t, tickFor("H", "A", "idle"), scriptTick{})
-	store := newPendingStore(h.w.stateDir, h.w.profile)
+	store := newPendingStore(h.w.stateDir)
 	record := h.w.record
 	h.w.record = func(id string, ev rpcEvent) {
 		record(id, ev)
@@ -692,7 +698,7 @@ func TestStreamOutageReplacementRemoved(t *testing.T) {
 				ticks = append(ticks, tickFor("H", "B", status))
 			}
 			h := newStreamHarness(t, append(ticks, scriptTick{})...)
-			store := newPendingStore(h.w.stateDir, h.w.profile)
+			store := newPendingStore(h.w.stateDir)
 			record := h.w.record
 			h.w.record = func(id string, ev rpcEvent) {
 				record(id, ev)
@@ -734,7 +740,7 @@ func TestStreamOutagePollKeepsKnownTurn(t *testing.T) {
 	for _, status := range []string{"working", "blocked"} {
 		t.Run(status, func(t *testing.T) {
 			h := newStreamHarness(t, tickFor("H", "A", "idle"), tickFor("H", "A", status), scriptTick{})
-			store := newPendingStore(h.w.stateDir, h.w.profile)
+			store := newPendingStore(h.w.stateDir)
 			record := h.w.record
 			h.w.record = func(id string, ev rpcEvent) {
 				record(id, ev)
@@ -778,7 +784,7 @@ func TestStreamReconciliationBindsBeforeLaterSettle(t *testing.T) {
 		q.append(streamItem{frame: streamFrame{Type: "agent_settled", Session: "H"}})
 	}
 	h := newStreamHarness(t, tickFor("H", "A", "idle"), reconcile, tickFor("H", "B", "idle"))
-	store := newPendingStore(h.w.stateDir, h.w.profile)
+	store := newPendingStore(h.w.stateDir)
 	record := h.w.record
 	h.w.record = func(id string, ev rpcEvent) {
 		record(id, ev)
@@ -824,7 +830,7 @@ func TestStreamStaleOutagePollKeepsBinding(t *testing.T) {
 		q.append(streamItem{err: io.EOF})
 	}
 	h := newStreamHarness(t, tickFor("H", "Z", "idle"), stale, scriptTick{})
-	store := newPendingStore(h.w.stateDir, h.w.profile)
+	store := newPendingStore(h.w.stateDir)
 	record := h.w.record
 	h.w.record = func(id string, ev rpcEvent) {
 		record(id, ev)
@@ -869,7 +875,7 @@ func TestStreamLookupBindingSurvivesOlderPoll(t *testing.T) {
 		q.append(streamItem{err: io.EOF})
 	}
 	h := newStreamHarness(t, tickFor("H", "", "idle"), older, scriptTick{})
-	store := newPendingStore(h.w.stateDir, h.w.profile)
+	store := newPendingStore(h.w.stateDir)
 	record := h.w.record
 	h.w.record = func(id string, ev rpcEvent) {
 		record(id, ev)
@@ -1086,8 +1092,8 @@ func TestStreamLookupWhileTickHeld(t *testing.T) {
 	c := rpcCtx(t, &b, "")
 	c.Flags["--all"] = true
 	w := newWatcher(c, c.Out)
-	var recorded []rpcEvent
-	w.record = func(_ string, ev rpcEvent) { recorded = append(recorded, ev) }
+	h := &streamHarness{w: w, out: &b}
+	w.record = func(_ string, ev rpcEvent) { h.recorded = append(h.recorded, ev) }
 	w.queue = newStreamFIFO()
 	ctx, cancel := context.WithCancel(context.Background())
 	readerDone := make(chan struct{})
@@ -1171,10 +1177,9 @@ func TestStreamLookupWhileTickHeld(t *testing.T) {
 	cancel()
 	awaitStream(t, readerDone)
 	w.drainStream(context.Background())
-	h := &streamHarness{w: w, out: &b}
 	h.done(t, "B")
-	if len(recorded) != 1 || recorded[0].ID != "B" {
-		t.Fatalf("held-tick pending identity = %+v", recorded)
+	if len(h.recorded) != 1 || h.recorded[0].ID != "B" {
+		t.Fatalf("held-tick pending identity = %+v", h.recorded)
 	}
 	t.Logf("held-tick RPC output:\n%s", b.String())
 }
@@ -1189,7 +1194,10 @@ func TestStreamOverflow(t *testing.T) {
 	defer b.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	var completed atomic.Int32
-	h.w.record = func(_ string, _ rpcEvent) { completed.Add(1) }
+	h.w.record = func(_ string, ev rpcEvent) {
+		h.recorded = append(h.recorded, ev)
+		completed.Add(1)
+	}
 	reconnecting := make(chan int32, 1)
 	oldDial := streamDialFn
 	dials := 0
