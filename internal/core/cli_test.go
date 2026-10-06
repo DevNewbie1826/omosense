@@ -76,7 +76,7 @@ func writeCliConfig(t *testing.T, dir, cfg string) {
 	}
 }
 
-const cliProfilesCfg = `{"profiles":{"main":{"telegram":{"bots":["b1","b2"]},"discord":{"bots":["d1"]}}}}`
+const cliProfilesCfg = `{"profiles":{"main":{"telegram":{"bots":["b1","b2"]},"discord":{"bots":["d1"]},"tidy":{"enabled":true}}}}`
 
 func runBin(t *testing.T, args ...string) (stdout, stderr string, code int) {
 	t.Helper()

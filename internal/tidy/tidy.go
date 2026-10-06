@@ -1,6 +1,6 @@
 // Package tidy hosts the memory-tidy watcher: it prints a TIDY line when a
 // source memory repo's HEAD moved past the watermark, keeps daily
-// git-bundle backups, and mirrors ~/.omomeow/memory-tidy.ts state interop.
+// git-bundle backups, and mirrors the memory-tidy watermark file.
 package tidy
 
 import (
@@ -26,7 +26,8 @@ Flags:
 `
 
 // Run is the compat subcommand host, in memory-tidy.ts order: the
-// threshold flags parse first (a bad value logs and exits 2), then
+// threshold flags parse first (a bad value logs and exits 2), then a
+// disabled profile prints one LOG line and exits 0. Otherwise
 // --write-watermark, --backup-now and the read-only --now/--once run
 // without the lock, and everything else enters the locked watcher loop.
 func Run(c *core.Ctx, args []string) int {
@@ -36,6 +37,10 @@ func Run(c *core.Ctx, args []string) int {
 		return 2
 	}
 	t.checkMs, t.quietMs, t.maxMs = checkMs, quietMs, maxMs
+	if !c.Profile.Tidy.Enabled {
+		t.sink.Log(fmt.Sprintf("tidy disabled for profile %s", c.Profile.Name))
+		return 0
+	}
 
 	switch {
 	case c.Flags["--write-watermark"]:
@@ -131,9 +136,13 @@ func (t *tidyer) nowOnce(ctx context.Context) error {
 	return nil
 }
 
-// Sources returns the tidy source of c's profile. It is pause-while-idle
-// (IS-13) and takes memory-tidy-<profile> with no legacy lock name.
+// Sources returns the tidy source of c's profile when tidy is enabled, and
+// no source otherwise. It is pause-while-idle (IS-13) and takes
+// memory-tidy-<profile> with no legacy lock name.
 func Sources(c *core.Ctx) []core.Source {
+	if !c.Profile.Tidy.Enabled {
+		return nil
+	}
 	return []core.Source{src{
 		c:        c,
 		name:     "tidy",

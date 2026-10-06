@@ -90,7 +90,7 @@ func TestSourceCommandCancellation(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			config := `{"profiles":{"main":{"telegram":{"bots":[]},"discord":{"bots":[]},"calendars":null,"mail":false}}}`
+			config := `{"profiles":{"main":{"telegram":{"bots":[]},"discord":{"bots":[]},"calendars":null,"mail":false,"tidy":{"enabled":true}}}}`
 			if err := os.WriteFile(filepath.Join(p.dir, "config.json"), []byte(config), 0o600); err != nil {
 				t.Fatal(err)
 			}

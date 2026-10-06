@@ -63,19 +63,22 @@ type emitRec struct {
 	at float64
 }
 
-// tidyer is one profile's memory-tidy watcher: resolved paths, thresholds
-// and the injected clock/sleep.
+// tidyer is one profile's memory-tidy watcher: resolved paths, which repos
+// heads() may report, thresholds, and the injected clock/sleep.
 type tidyer struct {
-	state   string
-	profile string
-	agents  string
-	backups string
-	sink    core.Sink
-	checkMs float64
-	quietMs float64
-	maxMs   float64
-	now     func() time.Time
-	sleep   func(context.Context, time.Duration) error
+	state       string
+	profile     string
+	memory      string
+	exclude     map[string]bool
+	learnOthers bool
+	agents      string
+	backups     string
+	sink        core.Sink
+	checkMs     float64
+	quietMs     float64
+	maxMs       float64
+	now         func() time.Time
+	sleep       func(context.Context, time.Duration) error
 }
 
 // newTidyer resolves AGENTS ($OMO_MEMORY_AGENTS or ~/.omo/memory/agents)
@@ -86,17 +89,24 @@ func newTidyer(c *core.Ctx, sink core.Sink) *tidyer {
 	if agents == "" {
 		agents = filepath.Join(home, ".omo", "memory", "agents")
 	}
+	exclude := make(map[string]bool, len(c.Profile.Tidy.Exclude))
+	for _, name := range c.Profile.Tidy.Exclude {
+		exclude[name] = true
+	}
 	return &tidyer{
-		state:   c.State,
-		profile: c.Profile.Name,
-		agents:  agents,
-		backups: filepath.Join(home, ".omo", "memory-backups"),
-		sink:    sink,
-		checkMs: defaultCheckMin * 60_000,
-		quietMs: defaultQuietMin * 60_000,
-		maxMs:   defaultMaxMin * 60_000,
-		now:     nowFn,
-		sleep:   sleepFn,
+		state:       c.State,
+		profile:     c.Profile.Name,
+		memory:      c.Profile.Memory,
+		exclude:     exclude,
+		learnOthers: c.Profile.Tidy.LearnOthers,
+		agents:      agents,
+		backups:     filepath.Join(home, ".omo", "memory-backups"),
+		sink:        sink,
+		checkMs:     defaultCheckMin * 60_000,
+		quietMs:     defaultQuietMin * 60_000,
+		maxMs:       defaultMaxMin * 60_000,
+		now:         nowFn,
+		sleep:       sleepFn,
 	}
 }
 

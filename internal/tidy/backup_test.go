@@ -15,8 +15,8 @@ func TestBackupNowCreatesVerifiesPrunes(t *testing.T) {
 	home, agents, state := sandbox(t)
 	repoA := makeRepo(t, agents, "a")
 	commitAt(t, repoA, 1750000000, "a1")
-	repoX := makeRepo(t, agents, "owo-mode-57b805e5")
-	commitAt(t, repoX, 1750000100, "x1")                // EXCLUDE set: still backed up
+	repoX := makeRepo(t, agents, "skipped-repo")
+	commitAt(t, repoX, 1750000100, "x1")                // tidy.exclude: still backed up
 	makeRepo(t, agents, "empty")                        // no commits: qualifies via rev-parse, bundle create fails
 	mkdirAll(t, filepath.Join(agents, "plain", "repo")) // not a git repo: skipped
 	mkdirAll(t, filepath.Join(agents, "agentonly"))     // no repo/ subdir: skipped
@@ -35,6 +35,7 @@ func TestBackupNowCreatesVerifiesPrunes(t *testing.T) {
 
 	var buf bytes.Buffer
 	c := testCtx(state, "main", &buf)
+	c.Profile.Tidy.Exclude = []string{"skipped-repo"}
 	c.Flags["--backup-now"] = true
 	if code := Run(c, []string{"--backup-now"}); code != 1 {
 		t.Fatalf("Run --backup-now = %d, want 1 (the empty repo fails to bundle)", code)
@@ -45,7 +46,7 @@ func TestBackupNowCreatesVerifiesPrunes(t *testing.T) {
 		t.Fatalf("backup dir mode = %o, want 700", perm)
 	}
 	bundleA := filepath.Join(day, "a.bundle")
-	bundleX := filepath.Join(day, "owo-mode-57b805e5.bundle")
+	bundleX := filepath.Join(day, "skipped-repo.bundle")
 	sizeA := statOf(t, bundleA).Size()
 	sizeX := statOf(t, bundleX).Size()
 	if _, err := os.Stat(filepath.Join(day, "empty.bundle")); !os.IsNotExist(err) {
@@ -54,8 +55,8 @@ func TestBackupNowCreatesVerifiesPrunes(t *testing.T) {
 	// The bundles are real: verify the one produced from repoA.
 	gitIn{dir: repoA}.run(t, "bundle", "verify", bundleA)
 
-	// repos=3 counts a, owo-mode (EXCLUDE) and empty; plain and agentonly
-	// never qualify. bytes sums only the verified bundles.
+	// repos=3 counts a, skipped-repo (tidy.exclude) and empty; plain and
+	// agentonly never qualify. bytes sums only the verified bundles.
 	wantLines(t, linesOf(&buf),
 		fmt.Sprintf("LOG memory-tidy backup %s repos=3 bytes=%d failed=empty", date, sizeA+sizeX))
 
