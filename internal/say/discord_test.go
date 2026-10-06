@@ -207,3 +207,22 @@ func TestDiscordNetworkErrorExits1(t *testing.T) {
 		t.Errorf("stdout=%q stderr=%q, want empty stdout + error JSON", stdout, stderr)
 	}
 }
+
+// IS-7: the {"bot":...} override also applies to discord and is stripped
+// from the payload before the request.
+func TestDiscordBotOverrideSelectsBotCred(t *testing.T) {
+	rec := &recorder{}
+	srv := httptest.NewServer(rec.handler(jsonResponder(200, `{"id":"13"}`)))
+	t.Cleanup(srv.Close)
+	t.Setenv("OMOSENSE_DISCORD_API", srv.URL)
+
+	_, _, code := runSay(t, "discord", "send", `{"bot":"d2","channel_id":456,"text":"hi"}`)
+	r := rec.last(t)
+	if auth := r.header.Get("Authorization"); auth != "Bot DCTOK2" {
+		t.Errorf("authorization = %q, want the a.bot override token (Bot DCTOK2)", auth)
+	}
+	jsonEqual(t, r.body, `{"content":"hi"}`)
+	if code != 0 {
+		t.Errorf("exit = %d, want 0", code)
+	}
+}

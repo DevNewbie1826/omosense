@@ -239,10 +239,11 @@ func entryLine(verb string, r *core.OMap) pendingLine {
 	return pendingLine{prefix: "REMIND", text: verb + " " + string(b)}
 }
 
-// sendViaSay execs "<self> say <platform> send <json>" with the target
-// object plus text, the same argument list remind.ts passed to say.ts. It
-// returns the exit code and the captured stdout/stderr; only a failure to
-// spawn is an error.
+// sendViaSay execs "<self> say --profile <profile> <platform> send <json>"
+// with the target object plus text (remind.ts's argument list plus the
+// profile flag: say's default bot comes from the profile, so the child
+// must run under this scheduler's profile). It returns the exit code and
+// the captured stdout/stderr; only a failure to spawn is an error.
 func (s *scheduler) sendViaSay(ctx context.Context, r *core.OMap) (code int, out, errOut string, err error) {
 	body := core.NewOMap()
 	if t, _ := getOMap(r, "target"); t != nil {
@@ -266,7 +267,7 @@ func (s *scheduler) sendViaSay(ctx context.Context, r *core.OMap) (code int, out
 			return 0, "", "", err
 		}
 	}
-	cmd := core.SourceCommand(ctx, bin, "say", fieldStr(r, "platform"), "send", string(j))
+	cmd := core.SourceCommand(ctx, bin, "say", "--profile", s.c.Profile.Name, fieldStr(r, "platform"), "send", string(j))
 	var ob, eb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &ob, &eb
 	if err := core.RunSource(cmd); err != nil {

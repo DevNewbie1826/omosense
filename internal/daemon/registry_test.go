@@ -11,10 +11,16 @@ import (
 )
 
 // TestRegistryProfiles checks the resident source list for two profiles.
-// main enables discord, names telegram bot "x", and turns mail on.
-// family disables discord. Always-on is exactly remind and discord (IS-13);
-// family has no discord source, so only remind stays always-on.
-// Prefixes are the IS-3 grammar prefixes each source emits.
+// main enables discord and rpc, names telegram bot "x", and turns mail on.
+// family keeps one telegram bot and disables discord. Always-on is exactly
+// remind and discord (IS-13); family has no discord source, so only remind
+// stays always-on. Prefixes are the IS-3 grammar prefixes each source emits.
+//
+// Correction (node n2-listen, IS-4b): the family fixture must name a
+// telegram bot, because a profile with an empty telegram.bots list no
+// longer registers a telegram source at all.
+// Both profiles set tidy.enabled: tidy.Sources registers by that flag
+// (IS-6, node n4-tidy), so the fixture names it explicitly.
 func TestRegistryProfiles(t *testing.T) {
 	home := t.TempDir()
 	dir := filepath.Join(home, "omosense")
@@ -27,8 +33,8 @@ func TestRegistryProfiles(t *testing.T) {
 	t.Setenv("OMOSENSE_STATE", state)
 	const cfg = `{
   "profiles": {
-    "main": {"telegram": {"bots": ["x"]}, "discord": {"bots": ["d1"]}, "mail": true},
-    "family": {"discord": {"bots": []}}
+    "main": {"telegram": {"bots": ["x"]}, "discord": {"bots": ["d1"]}, "rpc": {"enabled": true}, "tidy": {"enabled": true}, "mail": true},
+    "family": {"telegram": {"bots": ["y"]}, "discord": {"bots": []}, "tidy": {"enabled": true}}
   }
 }`
 	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(cfg), 0o644); err != nil {
@@ -57,6 +63,47 @@ func TestRegistryProfiles(t *testing.T) {
 
 	checkProfileSources(t, Registry(mainCtx), mainWant, []string{"discord", "remind"})
 	checkProfileSources(t, Registry(familyCtx), familyWant, []string{"remind"})
+}
+
+// TestRegistryRPCProfileFlag guards IS-5: the rpc source is registered by
+// the profile's rpc.enabled flag, not by the profile name — a non-"main"
+// profile with rpc.enabled gets the source, main without it does not.
+func TestRegistryRPCProfileFlag(t *testing.T) {
+	home := t.TempDir()
+	dir := filepath.Join(home, "omosense")
+	state := filepath.Join(home, "state")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("OMOSENSE_DIR", dir)
+	t.Setenv("OMOSENSE_STATE", state)
+	const cfg = `{
+  "profiles": {
+    "main": {"telegram": {"bots": ["x"]}},
+    "alpha": {"telegram": {"bots": ["a1"]}, "rpc": {"enabled": true}}
+  }
+}`
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		profile string
+		wantRPC bool
+	}{
+		{"alpha", true},
+		{"main", false},
+	} {
+		ctx := loadProfile(t, tc.profile)
+		var names []string
+		for _, s := range Registry(ctx) {
+			names = append(names, s.Name())
+		}
+		if slices.Contains(names, "rpc") != tc.wantRPC {
+			t.Errorf("%s sources = %v, wantRPC = %v", tc.profile, names, tc.wantRPC)
+		}
+	}
 }
 
 type sourceExpect struct {

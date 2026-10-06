@@ -185,11 +185,9 @@ func TestDeliverZero(t *testing.T) {
 
 func TestDeliverProfile(t *testing.T) {
 	d, f, _ := deliveryFixture(t, "family")
-	cfg, err := core.ParseJSON([]byte(`{"rpc":{"main":"WRONG"}}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	d.c.Cfg = &core.Cfg{Raw: cfg.(*core.OMap)}
+	// IS-5: the profile's rpc.session pins the delivery target even when
+	// the webchat sessions.json would resolve another one.
+	d.c.Profile.RPC.Session = "FAMTARGET"
 	main := newPendingStore(d.c.State, "main")
 	pendingRecord(t, main, "D7", "rpc-main")
 	before, err := os.ReadFile(main.path)
@@ -199,7 +197,7 @@ func TestDeliverProfile(t *testing.T) {
 	e := pendingRecord(t, d.store, "D7", "rpc-family")
 	d.pass(context.Background())
 	calls := f.calls(t)
-	if len(calls) != 1 || calls[0][2] != "TARGET" ||
+	if len(calls) != 1 || calls[0][2] != "FAMTARGET" ||
 		!strings.Contains(calls[0][3], "omosense rpc ack D7 1 --profile family") ||
 		calls[0][6] != "omosense-rpc-family-D7-1-1" {
 		t.Fatalf("profile delivery: %q", calls)
@@ -320,19 +318,16 @@ func TestDeliverRecordInFlight(t *testing.T) {
 
 func TestDeliverTargetPrecedence(t *testing.T) {
 	for _, tc := range []struct {
-		name, config, sessions, rows, want string
+		name, sessions, rows, want string
+		session                    string // profile rpc.session ("" = unset)
 	}{
-		{"config", `{"rpc":{"main":"OVERRIDE"}}`, `{}`, `[]`, "OVERRIDE"},
-		{"session", `{"rpc":{"main":false}}`, `{"main":{"session_id":"DIRECT"}}`, `[]`, "DIRECT"},
-		{"cwd", `{}`, `{"main":{"cwd":"/agent/."}}`, `[{"thread_id":"MATCH","alive":true,"kind":"interactive","surface":"tui","cwd":"/agent"}]`, "MATCH"},
+		{"rpc.session", `{}`, `[]`, "OVERRIDE", "OVERRIDE"},
+		{"sessions.json", `{"main":{"session_id":"DIRECT"}}`, `[]`, "DIRECT", ""},
+		{"cwd", `{"main":{"cwd":"/agent/."}}`, `[{"thread_id":"MATCH","alive":true,"kind":"interactive","surface":"tui","cwd":"/agent"}]`, "MATCH", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			d, f, _ := deliveryFixture(t, "main")
-			cfg, err := core.ParseJSON([]byte(tc.config))
-			if err != nil {
-				t.Fatal(err)
-			}
-			d.c.Cfg = &core.Cfg{Raw: cfg.(*core.OMap)}
+			d.c.Profile.RPC.Session = tc.session
 			deliveryWrite(t, filepath.Join(d.c.State, "sessions.json"), tc.sessions)
 			deliveryWrite(t, filepath.Join(f.dir, "list"), tc.rows+"\n")
 			pendingRecord(t, d.store, "D7", "rpc-7")

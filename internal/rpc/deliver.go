@@ -88,14 +88,10 @@ func omoExec(ctx context.Context, args ...string) ([]byte, error) {
 }
 
 func (d *deliverer) target(ctx context.Context) (string, error) {
-	if d.c.Profile.Name == "main" && d.c.Cfg != nil && d.c.Cfg.Raw != nil {
-		v, _ := d.c.Cfg.Raw.Get("rpc")
-		if rpc, ok := v.(*core.OMap); ok {
-			v, _ = rpc.Get("main")
-			if id, ok := v.(string); ok && id != "" {
-				return id, nil
-			}
-		}
+	// The profile's rpc.session pins the delivery target; empty falls
+	// back to the webchat sessions.json of the state dir.
+	if id := d.c.Profile.RPC.Session; id != "" {
+		return id, nil
 	}
 	b, err := os.ReadFile(filepath.Join(d.c.State, "sessions.json"))
 	if err != nil {

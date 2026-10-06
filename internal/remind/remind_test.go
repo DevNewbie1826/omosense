@@ -27,7 +27,7 @@ func testEnv(t *testing.T) (dir, state string) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(`{"profiles":{"main":{"telegram":{"bots":["b1"]},"discord":{"bots":["d1"]}}}}`), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(`{"profiles":{"main":{"telegram":{"bots":["b1"]},"discord":{"bots":["d1"]}},"family":{"telegram":{"bots":["fam1"]}}}}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("HOME", home)
@@ -269,7 +269,7 @@ func TestRunLoopSendsDueReminderOnce(t *testing.T) {
 	}
 
 	capArgs := mustRead(t, capture)
-	if want := "say telegram send {\"b\":2,\"a\":1,\"text\":\"hi 안\"}\n"; string(capArgs) != want {
+	if want := "say --profile main telegram send {\"b\":2,\"a\":1,\"text\":\"hi 안\"}\n"; string(capArgs) != want {
 		t.Errorf("say args = %q, want %q (target order kept, text merged)", capArgs, want)
 	}
 
@@ -291,6 +291,38 @@ func TestRunLoopSendsDueReminderOnce(t *testing.T) {
 		if d != 20*time.Second {
 			t.Errorf("sleep interval = %v, want 20s", d)
 		}
+	}
+
+	cancel()
+	if err := waitDone(t, done); err != nil {
+		t.Errorf("Run returned %v, want nil after cancel", err)
+	}
+}
+
+// IS-7 companion: sendViaSay must pass --profile so a FAMILY reminder is
+// sent through FAMILY's bot (say's default bot is the selected profile's
+// first bot), never through main's.
+func TestSendViaSayPassesProfile(t *testing.T) {
+	_, _ = testEnv(t)
+	ctx, err := core.Load(core.ParseArgs([]string{"--profile", "family"}), true)
+	if err != nil {
+		t.Fatalf("load family: %v", err)
+	}
+	file := remindersFile(ctx)
+	due := `[{"id":"f1","at":"2026-10-03T10:04:00.000Z","platform":"telegram","target":{"chat_id":7},"text":"hi"}]`
+	if err := os.WriteFile(file, []byte(due), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	capture := filepath.Join(t.TempDir(), "captured-args")
+	sleep := newFakeSleeper()
+	withHooks(t, fixedTime, writeFakeSay(t, capture), sleep.sleep)
+
+	sink := newChanSink()
+	cancel, done := runSource(t, ctx, sink)
+	sink.waitLine(t, "REMIND sent ")
+
+	if capArgs := string(mustRead(t, capture)); capArgs != "say --profile family telegram send {\"chat_id\":7,\"text\":\"hi\"}\n" {
+		t.Errorf("say args = %q, want the family --profile passed through", capArgs)
 	}
 
 	cancel()

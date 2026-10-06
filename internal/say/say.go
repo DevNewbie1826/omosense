@@ -17,8 +17,11 @@ import (
 const Help = `Usage: omosense say <platform> <action> <json> [--profile P]
 
 Sends a message through the platform bot API and prints the response
-JSON to stdout. --profile is validated but does not select the bot;
-pass {"bot":"name"} in the json to override it.
+JSON to stdout. --profile selects the profile (default main); its
+<platform>.bots list provides the default bot, its first entry. Pass
+{"bot":"name"} in the json to override the bot on either platform
+(the field is stripped and never sent to the API). A profile with no
+bots for the platform and no override exits 2.
 `
 
 // Sources returns no daemon sources because say is a one-shot command.
@@ -53,17 +56,35 @@ func run(ctx *core.Ctx, stdout, stderr io.Writer) int {
 	if err != nil {
 		return e.fail(err)
 	}
+	bot := botFor(ctx, a, platform)
+	if bot == "" {
+		fmt.Fprintf(stderr, "no bot: profile %s has no %s bots; pass {\"bot\":\"name\"} to choose one\n", ctx.Profile.Name, platform)
+		return 2
+	}
 	if platform == "telegram" {
-		bot := firstBot(ctx.Profile.Telegram.Bots)
-		if v, ok := a.Get("bot"); ok {
-			if s, is := v.(string); is {
-				bot = s
-			}
-		}
-		a.Delete("bot")
 		return e.telegram(action, a, bot)
 	}
-	return e.discord(action, a, firstBot(ctx.Profile.Discord.Bots))
+	return e.discord(action, a, bot)
+}
+
+// botFor resolves the sending bot: the {"bot":"name"} override from the
+// args when present, else the profile's first bot for the platform. The
+// override key is deleted from the payload on both platforms so it never
+// reaches the API. An empty result means the profile has no bot for the
+// platform and none was overridden.
+func botFor(ctx *core.Ctx, a *core.OMap, platform string) string {
+	bots := ctx.Profile.Telegram.Bots
+	if platform == "discord" {
+		bots = ctx.Profile.Discord.Bots
+	}
+	bot := firstBot(bots)
+	if v, ok := a.Get("bot"); ok {
+		if s, is := v.(string); is {
+			bot = s
+		}
+	}
+	a.Delete("bot")
+	return bot
 }
 
 // firstBot returns the profile's default bot for a platform: the first
