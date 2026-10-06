@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -110,10 +111,11 @@ func (b *batcher) note(msg string) {
 	}
 }
 
-// pass attempts one batch. It is due at retryAt after a failed attempt, and
-// otherwise five quiet minutes after the newest un-notified done: one rule for
-// a live process and for a restart, so a restart with un-notified entries
-// fires at max(start, lastDoneAt+5m) (B3).
+// pass attempts one batch. It is due at retryAt after a failed attempt and at
+// five quiet minutes after the newest un-notified done, whichever is later: one
+// rule for a live process and for a restart, so a restart with un-notified
+// entries fires at max(start, lastDoneAt+5m) (B3), and a done recorded while a
+// retry is pending still waits its own quiet window (IS-6).
 func (b *batcher) pass(ctx context.Context) {
 	entries, err := b.store.Unnotified()
 	if err != nil {
@@ -125,11 +127,11 @@ func (b *batcher) pass(ctx context.Context) {
 		return
 	}
 	now := nowFn()
-	if !b.retryAt.IsZero() {
-		if now.Before(b.retryAt) {
-			return
-		}
-	} else if due := lastDoneAt(entries).Add(batchQuiet); now.Before(due) {
+	due := lastDoneAt(entries).Add(batchQuiet)
+	if !b.retryAt.IsZero() && b.retryAt.After(due) {
+		due = b.retryAt
+	}
+	if now.Before(due) {
 		return
 	}
 	b.retryAt = time.Time{}
@@ -153,12 +155,33 @@ func (b *batcher) pass(ctx context.Context) {
 		return
 	}
 	if !alive {
-		if err := removeSubscription(b.c.State); err != nil {
+		removed, err := removeSubscriptionIf(b.c.State, sub.Session)
+		if err != nil {
 			b.note("rpc subscription: " + err.Error())
 			b.retryAt = now.Add(deliverRetry)
 			return
 		}
+		if !removed {
+			// The subscription changed while its liveness was being checked:
+			// the stale result is discarded, the batch is not consumed, and the
+			// next pass re-evaluates the replacement (IS-7).
+			b.retryAt = now.Add(deliverRetry)
+			return
+		}
 		b.drop(entries, fmt.Sprintf("rpc batch dropped: subscriber %s not alive; unsubscribed", sub.Session))
+		return
+	}
+	// The liveness answer belongs to the subscription that was examined: if a
+	// replacement (or an unsubscribe) landed while `thread list` ran, the batch
+	// must not be sent to the old session. Re-read under the subscription lock.
+	unchanged, err := subscriptionUnchanged(b.c.State, sub.Session)
+	if err != nil {
+		b.note("rpc subscription: " + err.Error())
+		b.retryAt = now.Add(deliverRetry)
+		return
+	}
+	if !unchanged {
+		b.retryAt = now.Add(deliverRetry)
 		return
 	}
 	// The subscriber's own completion is acked, never sent to itself. Its
@@ -265,6 +288,38 @@ func subscriptionPath(stateDir string) string {
 	return filepath.Join(stateDir, "rpc-subscription.json")
 }
 
+// subscriptionLockPath serializes subscription updates with the batcher's
+// compare-and-remove, so a stale liveness result can never delete a
+// replacement published while its check was in flight (IS-7).
+func subscriptionLockPath(stateDir string) string {
+	return filepath.Join(stateDir, "rpc-subscription.lock")
+}
+
+// lockSubscription takes the exclusive subscription lock, creating the state
+// dir and the lock file when needed.
+func lockSubscription(stateDir string) (*os.File, error) {
+	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(subscriptionLockPath(stateDir), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return f, nil
+}
+
+func unlockSubscription(f *os.File) {
+	if f == nil {
+		return
+	}
+	syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	f.Close()
+}
+
 // readSubscription returns nil when nothing is subscribed. A malformed file is
 // an error so the caller retries rather than dropping the batch.
 func readSubscription(stateDir string) (*subscription, error) {
@@ -286,15 +341,18 @@ func readSubscription(stateDir string) (*subscription, error) {
 }
 
 // writeSubscription publishes the subscription with a temp file and a rename,
-// so the batcher never reads a half-written file.
+// so the batcher never reads a half-written file. It holds the subscription
+// lock so it cannot interleave with a compare-and-remove (IS-7).
 func writeSubscription(stateDir string, s subscription) error {
-	if err := os.MkdirAll(stateDir, 0o755); err != nil {
-		return err
-	}
 	b, err := json.Marshal(s)
 	if err != nil {
 		return err
 	}
+	lock, err := lockSubscription(stateDir)
+	if err != nil {
+		return err
+	}
+	defer unlockSubscription(lock)
 	tmp, err := os.CreateTemp(stateDir, ".rpc-subscription-*")
 	if err != nil {
 		return err
@@ -313,11 +371,64 @@ func writeSubscription(stateDir string, s subscription) error {
 	return os.Rename(tmp.Name(), subscriptionPath(stateDir))
 }
 
-func removeSubscription(stateDir string) error {
-	if err := os.Remove(subscriptionPath(stateDir)); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
+// removeSubscriptionIf removes the subscription only when it is still the one
+// examined: a subscription replaced while the liveness check was in flight is
+// left untouched. It reports whether a removal happened (IS-7).
+func removeSubscriptionIf(stateDir, session string) (bool, error) {
+	lock, err := lockSubscription(stateDir)
+	if err != nil {
+		return false, err
 	}
-	return nil
+	defer unlockSubscription(lock)
+	cur, err := readSubscription(stateDir)
+	if err != nil {
+		return false, err
+	}
+	if cur == nil || cur.Session != session {
+		return false, nil
+	}
+	if err := os.Remove(subscriptionPath(stateDir)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return false, err
+	}
+	return true, nil
+}
+
+// subscriptionUnchanged reports whether the stored subscription is still the
+// one examined, read under the subscription lock so a replacement published
+// during the liveness check cannot be sent the old subscriber's batch (IS-7).
+func subscriptionUnchanged(stateDir, session string) (bool, error) {
+	lock, err := lockSubscription(stateDir)
+	if err != nil {
+		return false, err
+	}
+	defer unlockSubscription(lock)
+	cur, err := readSubscription(stateDir)
+	if err != nil {
+		return false, err
+	}
+	return cur != nil && cur.Session == session, nil
+}
+
+// takeSubscription removes and returns the current subscription under the
+// subscription lock, so `omosense rpc unsubscribe` cannot interleave with the
+// batcher's compare-and-remove.
+func takeSubscription(stateDir string) (*subscription, error) {
+	lock, err := lockSubscription(stateDir)
+	if err != nil {
+		return nil, err
+	}
+	defer unlockSubscription(lock)
+	sub, err := readSubscription(stateDir)
+	if err != nil {
+		return nil, err
+	}
+	if sub == nil {
+		return nil, nil
+	}
+	if err := os.Remove(subscriptionPath(stateDir)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	return sub, nil
 }
 
 // batchText renders the IS-9 batch: one block per entry, bounded to batchLimit
@@ -356,13 +467,20 @@ func batchText(entries []pendingEntry, dir, state string) string {
 }
 
 func overflowLine(n int, dir, state string) string {
-	return fmt.Sprintf("+%d more: OMOSENSE_DIR='%s' OMOSENSE_STATE='%s' omosense rpc pending", n, dir, state)
+	return fmt.Sprintf("+%d more: OMOSENSE_DIR=%s OMOSENSE_STATE=%s omosense rpc pending", n, shellQuote(dir), shellQuote(state))
 }
 
 // ackCommand is the machine-consumed command the batch carries: absolute
 // env-pinned paths, so it is valid in every configuration (B1).
 func ackCommand(e pendingEntry, dir, state string) string {
-	return fmt.Sprintf("OMOSENSE_DIR='%s' OMOSENSE_STATE='%s' omosense rpc ack %s %d", dir, state, e.ID, e.Seq)
+	return fmt.Sprintf("OMOSENSE_DIR=%s OMOSENSE_STATE=%s omosense rpc ack %s %d", shellQuote(dir), shellQuote(state), e.ID, e.Seq)
+}
+
+// shellQuote renders s as one POSIX shell word: single-quoted, with every
+// embedded single quote escaped as '\” so a folder named quote'project still
+// yields a command that runs (IS-9/B1).
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // entryBlock renders one entry. The display fields share the entry's slice of

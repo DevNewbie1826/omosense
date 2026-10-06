@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -43,6 +44,10 @@ printf '\000' >> "$dir/argv"
 if [ "$2" = list ]; then
   IFS= read -r lcode < "$dir/listcontrol"
   if [ "$lcode" != 0 ]; then printf 'list refused\n' >&2; exit "$lcode"; fi
+  if [ -p "$dir/listready" ]; then
+    printf 'ready\n' > "$dir/listready"
+    IFS= read -r lrelease < "$dir/listrelease"
+  fi
   while IFS= read -r line; do printf '%s\n' "$line"; done < "$dir/list"
   exit 0
 fi
@@ -118,12 +123,13 @@ func newBatchFixture(t *testing.T) *batchFixture {
 		t.Fatal(err)
 	}
 	var logs bytes.Buffer
+	out := core.NewOut(&logs)
 	x := &batchFixture{f: f, logs: &logs, now: time.Date(2026, 10, 5, 0, 0, 0, 0, time.UTC)}
 	old := nowFn
 	nowFn = x.clock
 	t.Cleanup(func() { nowFn = old })
-	c := &core.Ctx{Dir: dir, State: state, Profile: core.Profile{}}
-	x.b = newBatcher(c, newPendingStore(state), core.NewOut(&logs))
+	c := &core.Ctx{Dir: dir, State: state, Profile: core.Profile{}, Out: out}
+	x.b = newBatcher(c, newPendingStore(state), out)
 	return x
 }
 
@@ -161,6 +167,33 @@ func (x *batchFixture) alive(t *testing.T, session string, ok bool) {
 		rows = fmt.Sprintf(`[{"thread_id":"%s","sessionId":"%s","alive":true}]`, session, session)
 	}
 	deliveryWrite(t, filepath.Join(x.f.dir, "list"), rows+"\n")
+}
+
+// replaceSubscription models a real `omosense rpc unsubscribe` followed by
+// `omosense rpc subscribe <session>` completing while a liveness check is in
+// flight (IS-7).
+func (x *batchFixture) replaceSubscription(t *testing.T, session string) {
+	t.Helper()
+	args := x.b.c.Args
+	x.b.c.Args = []string{"unsubscribe"}
+	if code := unsubscribe(x.b.c); code != 0 {
+		t.Fatalf("unsubscribe exit %d", code)
+	}
+	x.b.c.Args = []string{"subscribe", session}
+	if code := subscribe(x.b.c); code != 0 {
+		t.Fatalf("subscribe exit %d", code)
+	}
+	x.b.c.Args = args
+}
+
+// removeBarrier unlinks gated FIFOs so a later pass does not wait on them.
+func (x *batchFixture) removeBarrier(t *testing.T, names ...string) {
+	t.Helper()
+	for _, n := range names {
+		if err := os.Remove(filepath.Join(x.f.dir, n)); err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
 // TestBatchDebounce guards Risk row "several dones within 5 minutes produce
@@ -260,7 +293,9 @@ func TestBatchRecordDuringSend(t *testing.T) {
 	wait, release := deliveryBarrier(t, x.f)
 	done := deliveryAsyncPass(t, x.b)
 	wait()
+	t.Logf("first send entered the FIFO barrier; the shim holds it until release")
 	second := pendingRecord(t, x.b.store, "D7", "rpc-9")
+	t.Logf("in-flight record D7 seq=%d recorded while the send is inside the barrier", second.Seq)
 	release()
 	done()
 	un, err := x.b.store.Unnotified()
@@ -363,6 +398,197 @@ func TestBatchDeadSubscriber(t *testing.T) {
 				t.Fatalf("pending = %+v", es)
 			}
 		})
+	}
+}
+
+// TestBatchStaleLivenessKeepsReplacement guards IS-7: a subscription replaced
+// while the liveness check for the previous one is in flight must survive, and
+// its batch must not be consumed by the stale result. Removal is
+// compare-and-remove under rpc-subscription.lock.
+func TestBatchStaleLivenessKeepsReplacement(t *testing.T) {
+	x := newBatchFixture(t)
+	x.subscribe(t, "DEAD")
+	deliveryWrite(t, filepath.Join(x.f.dir, "list"), `[{"thread_id":"LIVE","sessionId":"LIVE","alive":true}]`+"\n")
+	pendingRecord(t, x.b.store, "D7", "rpc-7")
+	x.advance(batchQuiet)
+	wait, release := listBarrier(t, x.f)
+	done := deliveryAsyncPass(t, x.b)
+	wait()
+	x.replaceSubscription(t, "LIVE")
+	release()
+	done()
+	sub, err := readSubscription(x.b.c.State)
+	if err != nil || sub == nil || sub.Session != "LIVE" {
+		t.Fatalf("stale liveness check deleted the replacement: %+v %v", sub, err)
+	}
+	if un, _ := x.b.store.Unnotified(); len(un) != 1 {
+		t.Fatalf("stale liveness result consumed the batch: %+v", un)
+	}
+	if sends := x.f.sub(t, "send"); len(sends) != 0 {
+		t.Fatalf("batch sent from the stale liveness result: %q", sends)
+	}
+	x.removeBarrier(t, "listready", "listrelease")
+	x.advance(deliverRetry)
+	x.pass(t)
+	sends := x.f.sub(t, "send")
+	if len(sends) != 1 || sends[0][2] != "LIVE" {
+		t.Fatalf("replacement did not receive the batch: %q", sends)
+	}
+	if un, _ := x.b.store.Unnotified(); len(un) != 0 {
+		t.Fatalf("replacement batch not consumed: %+v", un)
+	}
+}
+
+// TestBatchStaleLivenessAliveDoesNotSend guards the symmetric half of IS-7: a
+// subscription replaced while the liveness check for the previous one is in
+// flight must not receive the batch. The stale "alive" answer belongs to the
+// examined subscription, so the batch waits for the replacement instead.
+func TestBatchStaleLivenessAliveDoesNotSend(t *testing.T) {
+	x := newBatchFixture(t)
+	x.subscribe(t, "A")
+	pendingRecord(t, x.b.store, "D7", "rpc-7")
+	x.advance(batchQuiet)
+	wait, release := listBarrier(t, x.f)
+	done := deliveryAsyncPass(t, x.b)
+	wait()
+	x.replaceSubscription(t, "B")
+	release()
+	done()
+	if sends := x.f.sub(t, "send"); len(sends) != 0 {
+		t.Fatalf("batch sent to the replaced subscription: %q", sends)
+	}
+	if un, _ := x.b.store.Unnotified(); len(un) != 1 {
+		t.Fatalf("stale alive result consumed the batch: %+v", un)
+	}
+	if sub, err := readSubscription(x.b.c.State); err != nil || sub == nil || sub.Session != "B" {
+		t.Fatalf("subscription = %+v %v", sub, err)
+	}
+	x.removeBarrier(t, "listready", "listrelease")
+	x.alive(t, "B", true)
+	x.advance(deliverRetry)
+	x.pass(t)
+	sends := x.f.sub(t, "send")
+	if len(sends) != 1 || sends[0][2] != "B" {
+		t.Fatalf("replacement did not receive the batch: %q", sends)
+	}
+	if un, _ := x.b.store.Unnotified(); len(un) != 0 {
+		t.Fatalf("replacement batch not consumed: %+v", un)
+	}
+}
+
+// TestBatchRetryRespectsQuietWindow guards IS-6: a done recorded during a
+// retry waits its own five quiet minutes, while a plain retry with no new done
+// still fires after the one-minute backoff.
+func TestBatchRetryRespectsQuietWindow(t *testing.T) {
+	x := newBatchFixture(t)
+	x.subscribe(t, "MAINQA")
+	pendingRecord(t, x.b.store, "X", "rpc-x")
+	x.advance(batchQuiet)
+	deliveryWrite(t, filepath.Join(x.f.dir, "control"), "1\n")
+	x.pass(t)
+	if sends := x.f.sub(t, "send"); len(sends) != 1 {
+		t.Fatalf("first attempt = %q", sends)
+	}
+	second := pendingRecord(t, x.b.store, "Y", "rpc-y")
+	x.advance(deliverRetry)
+	deliveryWrite(t, filepath.Join(x.f.dir, "control"), "0\n")
+	x.pass(t)
+	if sends := x.f.sub(t, "send"); len(sends) != 1 {
+		t.Fatalf("new done sent inside its own quiet window: %q", sends)
+	}
+	x.advance(batchQuiet - deliverRetry)
+	x.pass(t)
+	sends := x.f.sub(t, "send")
+	if len(sends) != 2 {
+		t.Fatalf("quiet window did not release the retry: %q", sends)
+	}
+	text := sends[1][3]
+	if !strings.Contains(text, "X") || !strings.Contains(text, "Y") ||
+		!strings.Contains(text, fmt.Sprintf("seq: %d", second.Seq)) {
+		t.Fatalf("batch text = %q", text)
+	}
+	if un, _ := x.b.store.Unnotified(); len(un) != 0 {
+		t.Fatalf("batch not consumed: %+v", un)
+	}
+	// A plain retry with no new done still fires after one minute.
+	pendingRecord(t, x.b.store, "Z", "rpc-z")
+	x.advance(batchQuiet)
+	deliveryWrite(t, filepath.Join(x.f.dir, "control"), "1\n")
+	x.pass(t)
+	if sends := x.f.sub(t, "send"); len(sends) != 3 {
+		t.Fatalf("plain retry attempt = %q", sends)
+	}
+	x.advance(deliverRetry)
+	deliveryWrite(t, filepath.Join(x.f.dir, "control"), "0\n")
+	x.pass(t)
+	if sends := x.f.sub(t, "send"); len(sends) != 4 {
+		t.Fatalf("plain retry did not fire after one minute: %q", sends)
+	}
+}
+
+// TestBatchAckCommandQuotedPath guards IS-9/B1: the printed ack command and the
+// overflow line must survive a project path containing a single quote. Both are
+// executed through /bin/sh, the surface the subscriber's session uses, and the
+// shim reports the exact argv and environment the shell produced.
+func TestBatchAckCommandQuotedPath(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "quote'proj name")
+	state := filepath.Join(dir, "state")
+	if err := os.MkdirAll(state, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	shimDir := filepath.Join(root, "bin")
+	if err := os.MkdirAll(shimDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(root, "argv.log")
+	shim := `#!/bin/sh
+{
+  printf 'argv:'
+  for a in "$@"; do printf ' [%s]' "$a"; done
+  printf '\nDIR=[%s]\nSTATE=[%s]\n--\n' "$OMOSENSE_DIR" "$OMOSENSE_STATE"
+} >> "$OMOSENSE_ACK_LOG"
+case "$2" in
+  ack) printf 'ACK {"id":"D7","seq":3,"result":"acked"}\n' ;;
+  pending) printf 'PENDING {"id":"D7","seq":3}\n' ;;
+  *) printf 'unexpected verb %s\n' "$2" >&2; exit 3 ;;
+esac
+`
+	if err := os.WriteFile(filepath.Join(shimDir, "omosense"), []byte(shim), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", shimDir+":"+os.Getenv("PATH"))
+	t.Setenv("OMOSENSE_ACK_LOG", logPath)
+	e := pendingEntry{ID: "D7", Session: "rpc-7", Seq: 3, Count: 1, DoneAt: "2026-10-05T00:00:00.000Z"}
+	const marker = "+2 more: "
+	overflow := overflowLine(2, dir, state)
+	if !strings.HasPrefix(overflow, marker) {
+		t.Fatalf("overflow line = %q", overflow)
+	}
+	for _, run := range []struct{ name, command, want string }{
+		{"ack", ackCommand(e, dir, state),
+			fmt.Sprintf("argv: [rpc] [ack] [D7] [3]\nDIR=[%s]\nSTATE=[%s]\n--\n", dir, state)},
+		{"pending", strings.TrimPrefix(overflow, marker),
+			fmt.Sprintf("argv: [rpc] [pending]\nDIR=[%s]\nSTATE=[%s]\n--\n", dir, state)},
+	} {
+		before, err := os.ReadFile(logPath)
+		if err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		out, err := exec.Command("/bin/sh", "-c", run.command).CombinedOutput()
+		if err != nil {
+			t.Fatalf("%s command failed: %v\ncommand: %s\noutput: %s", run.name, err, run.command, out)
+		}
+		if run.name == "ack" && !strings.Contains(string(out), `"result":"acked"`) {
+			t.Fatalf("ack output = %q", out)
+		}
+		after, err := os.ReadFile(logPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := string(after[len(before):]); got != run.want {
+			t.Fatalf("%s shell environment = %q\nwant %q\ncommand: %s", run.name, got, run.want, run.command)
+		}
 	}
 }
 
@@ -532,12 +758,25 @@ func TestBatchTextBound(t *testing.T) {
 	t.Logf("batch bound: %d entries listed, %d overflow, %d bytes", listed, rest, len(text))
 }
 
-// The script announces entry into send on ready and waits on release. Both
-// FIFOs have an O_RDWR test descriptor so neither opening relies on scheduling.
+// The script announces entry into a gated command on <prefix>ready and waits on
+// <prefix>release. Both FIFOs have an O_RDWR test descriptor so neither opening
+// relies on scheduling.
 func deliveryBarrier(t *testing.T, f *fakeDelivery) (wait func(), release func()) {
 	t.Helper()
+	return fifoBarrier(t, f, "")
+}
+
+// listBarrier gates `omo thread list` so a subscription can be replaced while a
+// liveness check is in flight (IS-7).
+func listBarrier(t *testing.T, f *fakeDelivery) (wait func(), release func()) {
+	t.Helper()
+	return fifoBarrier(t, f, "list")
+}
+
+func fifoBarrier(t *testing.T, f *fakeDelivery, prefix string) (wait func(), release func()) {
+	t.Helper()
 	open := func(name string) *os.File {
-		path := filepath.Join(f.dir, name)
+		path := filepath.Join(f.dir, prefix+name)
 		if err := syscall.Mkfifo(path, 0o600); err != nil {
 			t.Fatal(err)
 		}

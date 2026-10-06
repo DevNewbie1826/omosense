@@ -139,17 +139,13 @@ func unsubscribe(c *core.Ctx) int {
 		fmt.Fprint(os.Stderr, Help)
 		return 2
 	}
-	sub, err := readSubscription(c.State)
+	sub, err := takeSubscription(c.State)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "omosense: rpc unsubscribe:", err)
 		return 1
 	}
 	var session *string
 	if sub != nil {
-		if err := removeSubscription(c.State); err != nil {
-			fmt.Fprintln(os.Stderr, "omosense: rpc unsubscribe:", err)
-			return 1
-		}
 		session = &sub.Session
 	}
 	c.Out.Emit("UNSUB", struct {
