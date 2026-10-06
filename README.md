@@ -92,7 +92,7 @@ The state dir holds:
 |---|---|
 | `reminders.json` | Reminder queue. Agents add entries here; remind sends them. |
 | `google-seen.json` | Calendar and mail items already reported. |
-| `rpc-pending.json` (+ `rpc-pending.json.lock`) | rpc completions not yet acked. |
+| `rpc-pending.json` (+ `rpc-pending.lock`) | rpc completions not yet acked. |
 | `rpc-subscription.json` | The session that receives rpc done batches. |
 | `threads.json` | rpc session registrations. |
 | `sessions.json` | Response session registration. |
@@ -100,6 +100,7 @@ The state dir holds:
 | `tg-offset-<bot>` | Telegram fetch offset for that bot. |
 | `inbox/` | Downloaded Telegram attachments. |
 | `*.lock.json` | Source locks: `listen`, `remind`, `watch-google`, `watch-herdr`, `watch-rpc`, `memory-tidy`. |
+| `rpc-subscription.lock` | Lock guarding `rpc-subscription.json` updates. |
 
 A few things stay global on purpose: bot credentials in `~/.config/agent-messenger`, tidy backups in `~/.omo/memory-backups`, and memory repos in `~/.omo/memory/agents` (or `$OMO_MEMORY_AGENTS`).
 

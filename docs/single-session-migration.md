@@ -91,7 +91,7 @@ Copy, don't move, so the old layout stays intact until the new one works. The na
 | `sessions.json` | `sessions.json` |
 | `inbox/` | `inbox/` |
 
-Don't copy lock files (`*.lock.json`, `rpc-pending-*.json.lock`) or daemon leftovers (journals, pid, socket, `omosense-profile-*.stopped`). Locks belong to running processes, and the daemon files have no reader now.
+Don't copy lock files (`*.lock.json`, `rpc-pending-*.lock`, and in the new state dir `rpc-pending.lock`, `rpc-subscription.lock`) or daemon leftovers (journals, pid, socket, `omosense-profile-*.stopped`). Locks belong to running processes, and the daemon files have no reader now.
 
 ```sh
 BOT=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["telegram"].get("bot",""))' "$NEW/config.json")

@@ -78,8 +78,11 @@ func awaitEvent(t *testing.T, ch <-chan blockedCommand) blockedCommand {
 
 // TestSourceCommandCancellation re-homes the retired daemon's
 // source_cancellation proof onto the bare session host (plan review B5): a
-// source's real child process is cancelled with the host, and no descendant
-// outlives it, in all four spawn shapes. The host is started as bare
+// source's real child process is cancelled with the host. Direct children,
+// same-group descendants and parent-exits descendants die with the host; a
+// descendant that escaped the process group (setsid-style Setpgid) is outside
+// the host's reach, exactly as at base, so the escaped shape asserts it is
+// still alive and kills it from the test. The host is started as bare
 // `omosense` with its cwd in the project folder, so config and state resolve
 // from the folder alone.
 func TestSourceCommandCancellation(t *testing.T) {
