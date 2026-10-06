@@ -6,7 +6,10 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -192,21 +195,29 @@ func TestDiscordGatewayIdentifyRawEventsAndGuard(t *testing.T) {
 	// discordgo v0.29 IdentifyProperties uses legacy $-prefixed wire keys
 	// (structs.go:2323-2327); assert the configured values, not TS's keys.
 	properties, _ := data["properties"].(map[string]any)
-	if data["intents"] != float64(1|512|4096|32768) || properties["$os"] != "darwin" || properties["$browser"] != "omomeow" || properties["$device"] != "omomeow" {
+	if data["intents"] != float64(1|512|4096|32768) || properties["$os"] != runtime.GOOS || properties["$browser"] != "omosense" || properties["$device"] != "omosense" {
 		t.Fatal("identify intents/properties", data["intents"], properties)
 	}
 	ready(t, p, "READY")
-	if line := await(t, sink.signal); line.value != "discord ready as test-bot" {
+	if line := await(t, sink.signal); line.value != "discord test ready as test-bot" {
 		t.Fatal(line)
 	}
-	// A second source must fail without opening a second session.
-	if err := Sources(c)[1].Run(t.Context(), newSink()); err == nil || err.Error() != "discord source already active in this process" {
-		t.Fatalf("guard: %v", err)
+	// A second source for the same bot must fail fast, without opening a
+	// second session (bounded wait: a removed guard would block, not pass).
+	duplicate := make(chan error, 1)
+	go func() { duplicate <- Sources(c)[1].Run(t.Context(), newSink()) }()
+	select {
+	case err := <-duplicate:
+		if err == nil || err.Error() != "discord bot test already active in this process" {
+			t.Fatalf("guard: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a second source for the same bot did not fail fast")
 	}
 	p.write(t, map[string]any{"op": 0, "t": "MESSAGE_CREATE", "s": 2, "d": map[string]any{"id": "ignored", "channel_id": "channel", "author": map[string]any{"id": "bot", "bot": true}}})
 	p.write(t, map[string]any{"op": 0, "t": "MESSAGE_CREATE", "s": 3, "d": map[string]any{"id": "message", "channel_id": "channel", "author": map[string]any{"id": "owner", "username": "username", "global_name": ""}, "message_snapshots": []any{map[string]any{}}, "referenced_message": map[string]any{"id": "reply", "content": "reply body"}, "attachments": []any{map[string]any{"filename": "a", "url": "url"}, map[string]any{"filename": "b", "url": "b-url", "content_type": "image/png"}}}})
 	ev := await(t, sink.signal)
-	want := map[string]any{"platform": "discord", "kind": "message", "guild_id": nil, "channel_id": "channel", "message_id": "message", "from_id": "owner", "from": "", "role": "owner", "text": "", "forwarded": true, "reply_to": map[string]any{"message_id": "reply", "text": "reply body"}, "attachments": []any{map[string]any{"name": "a", "url": "url"}, map[string]any{"name": "b", "url": "b-url", "type": "image/png"}}}
+	want := map[string]any{"platform": "discord", "bot": "test", "kind": "message", "guild_id": nil, "channel_id": "channel", "message_id": "message", "from_id": "owner", "from": "", "role": "owner", "text": "", "forwarded": true, "reply_to": map[string]any{"message_id": "reply", "text": "reply body"}, "attachments": []any{map[string]any{"name": "a", "url": "url"}, map[string]any{"name": "b", "url": "b-url", "type": "image/png"}}}
 	if ev.prefix != "EVENT" || !reflect.DeepEqual(ev.value, want) {
 		t.Fatalf("got %#v want %#v", ev, want)
 	}
@@ -218,6 +229,71 @@ func TestDiscordGatewayIdentifyRawEventsAndGuard(t *testing.T) {
 		t.Fatal(sink.snapshot())
 	}
 	t.Log("PASS: fake gateway identify, raw EVENT, bot skip and second-session guard; cleanup: source canceled and fake gateway closed")
+}
+
+func TestDiscordMultiBotSessionsAndEvents(t *testing.T) {
+	c := testCtx(t)
+	c.Profile.Discord.Bots = []string{"a", "b"}
+	writeDiscordCreds(t, `{"bots":{"a":{"token":"token-a"},"b":{"token":"token-b"}}}`)
+	peers, cleanup := fakeGateway(t)
+	t.Cleanup(cleanup)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	s := Sources(c)[1].(src)
+	s.clock = newClock()
+	s.sleep = func(ctx context.Context, d time.Duration) error { <-ctx.Done(); return ctx.Err() }
+	sink := newSink()
+	done := make(chan error, 1)
+	go func() { defer close(done); done <- s.Run(ctx, sink) }()
+	t.Cleanup(func() {
+		cancel()
+		if err := await(t, done); err != nil {
+			t.Error(err)
+		}
+	})
+	// Two concurrent gateway sessions, each identified by its own bot token.
+	peer := map[string]*gatewayPeer{}
+	for range 2 {
+		p := await(t, peers)
+		identify := p.packet(t, 2)
+		var data map[string]any
+		if err := json.Unmarshal(identify.Data, &data); err != nil {
+			t.Fatal(err)
+		}
+		token, _ := data["token"].(string)
+		bot := map[string]string{"token-a": "a", "token-b": "b"}[strings.TrimPrefix(token, "Bot ")]
+		if bot == "" {
+			t.Fatalf("unexpected identify token %q", token)
+		}
+		peer[bot] = p
+	}
+	if len(peer) != 2 {
+		t.Fatalf("sessions = %v, want one per bot", peer)
+	}
+	// Each session's ready LOG line names its own bot.
+	for _, bot := range []string{"a", "b"} {
+		ready(t, peer[bot], "READY")
+		if line := await(t, sink.signal); line.value != "discord "+bot+" ready as test-bot" {
+			t.Fatal(line)
+		}
+	}
+	// Each session's messages carry their own bot name.
+	for _, bot := range []string{"a", "b"} {
+		peer[bot].write(t, map[string]any{"op": 0, "t": "MESSAGE_CREATE", "s": 2, "d": map[string]any{"id": "m-" + bot, "channel_id": "channel", "author": map[string]any{"id": "owner", "username": "u"}, "content": "hi-" + bot}})
+		ev := await(t, sink.signal).value.(map[string]any)
+		if ev["bot"] != bot || ev["message_id"] != "m-"+bot || ev["role"] != "owner" {
+			t.Fatalf("event %#v want bot %s", ev, bot)
+		}
+	}
+	t.Log("PASS: two bots -> two gateway sessions, ready LOG lines and EVENTs tagged with their bot; cleanup: source canceled, fake gateway closed")
+}
+
+func writeDiscordCreds(t *testing.T, body string) {
+	t.Helper()
+	path := filepath.Join(os.Getenv("HOME"), ".config", "agent-messenger", "discordbot-credentials.json")
+	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestDiscordGatewayCloseCodesAndOp9(t *testing.T) {
@@ -273,7 +349,7 @@ func TestDiscordGatewayCloseCodesAndOp9(t *testing.T) {
 			cl.advance(3 * time.Minute)
 			tm.fire()
 			r := await(t, sink.signal)
-			want := fmt.Sprintf("discord down 3m+ (last close %d), still reconnecting", code)
+			want := fmt.Sprintf("discord test down 3m+ (last close %d), still reconnecting", code)
 			if r.value != want {
 				t.Fatalf("got %#v want %s", r, want)
 			}

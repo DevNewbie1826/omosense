@@ -30,7 +30,7 @@ type discordMessage struct {
 	} `json:"attachments"`
 }
 
-func (s src) dcHandle(ctx context.Context, sink core.Sink, raw json.RawMessage) error {
+func (s src) dcHandle(ctx context.Context, sink core.Sink, bot string, raw json.RawMessage) error {
 	var d discordMessage
 	if err := json.Unmarshal(raw, &d); err != nil {
 		return err
@@ -38,7 +38,7 @@ func (s src) dcHandle(ctx context.Context, sink core.Sink, raw json.RawMessage) 
 	if d.Author != nil && d.Author.Bot {
 		return nil
 	}
-	ev := map[string]any{"platform": "discord", "kind": "message", "guild_id": d.Guild, "channel_id": d.Channel, "message_id": d.ID, "text": textOr(d.Content, nil), "forwarded": len(d.Snapshots) > 0, "reply_to": nil}
+	ev := map[string]any{"platform": "discord", "bot": bot, "kind": "message", "guild_id": d.Guild, "channel_id": d.Channel, "message_id": d.ID, "text": textOr(d.Content, nil), "forwarded": len(d.Snapshots) > 0, "reply_to": nil}
 	if d.Author != nil {
 		ev["from_id"] = d.Author.ID
 		if d.Author.GlobalName != nil || d.Author.Username != nil {

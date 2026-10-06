@@ -18,8 +18,9 @@ import (
 // Help is the usage text printed by omosense listen --help.
 const Help = `Usage: omosense listen [--profile P] [--dry-run]
 
-Runs the profile's Telegram bots and the Discord gateway listener,
-printing EVENT and LOG lines to stdout.
+Runs one Telegram poller per bot and one Discord gateway session per bot
+that the profile configures, printing EVENT and LOG lines to stdout. A
+platform with no bots contributes no source.
 
 Flags:
   --dry-run    print the run plan and exit 0 without taking the lock
@@ -33,12 +34,16 @@ func Run(ctx *core.Ctx, args []string) int {
 		if bots == nil {
 			bots = []string{}
 		}
-		ctx.Out.Emit("PLAN", map[string]any{"profile": ctx.Profile.Name, "discord": len(ctx.Profile.Discord.Bots) > 0, "telegram": bots, "lock": "listen-" + ctx.Profile.Name, "state": ctx.State})
+		discordBots := ctx.Profile.Discord.Bots
+		if discordBots == nil {
+			discordBots = []string{}
+		}
+		ctx.Out.Emit("PLAN", map[string]any{"profile": ctx.Profile.Name, "discord": discordBots, "telegram": bots, "lock": "listen-" + ctx.Profile.Name, "state": ctx.State})
 		return 0
 	}
 	release := ctx.Acquire("listen-"+ctx.Profile.Name, "listen")
 	defer release()
-	ctx.Out.Log("omomeow listener starting (profile " + ctx.Profile.Name + ")")
+	ctx.Out.Log("omosense listener starting (profile " + ctx.Profile.Name + ")")
 	runCtx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 	defer cancel()
 	var wg sync.WaitGroup
@@ -62,20 +67,23 @@ func Run(ctx *core.Ctx, args []string) int {
 	return 0
 }
 
-// Sources returns the telegram and discord sources of ctx's profile. They
+// Sources returns the telegram and discord sources of ctx's profile. A
+// platform with no bots registers no source: a profile may listen on one
+// platform only, or on none at all (calendar/herdr-only). Both sources
 // share the listen-<profile> lock (legacy "listen"); the daemon refcounts
-// that lock across the two.
+// that lock across them.
 func Sources(ctx *core.Ctx) []core.Source {
 	p := ctx.Profile.Name
-	result := []core.Source{
-		src{
+	var result []core.Source
+	if len(ctx.Profile.Telegram.Bots) > 0 {
+		result = append(result, src{
 			cfg:      ctx,
 			sleep:    sleep,
 			name:     "telegram",
 			prefixes: []string{"EVENT"},
 			lock:     "listen-" + p,
 			legacy:   "listen",
-		},
+		})
 	}
 	if len(ctx.Profile.Discord.Bots) > 0 {
 		result = append(result, src{

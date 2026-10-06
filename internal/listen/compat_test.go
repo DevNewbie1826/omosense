@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"syscall"
 	"testing"
@@ -108,6 +109,9 @@ func TestCompatDryRunAndSourcePolicies(t *testing.T) {
 	if err := json.Unmarshal(bytes.TrimPrefix(bytes.TrimSpace(out), []byte("PLAN ")), &plan); err != nil || plan["lock"] != "listen-test" || plan["profile"] != "test" || plan["state"] != c.State {
 		t.Fatal(plan, err)
 	}
+	if !reflect.DeepEqual(plan["telegram"], []any{"test"}) || !reflect.DeepEqual(plan["discord"], []any{}) {
+		t.Fatal("plan bots", plan)
+	}
 	if _, err := os.Stat(c.State); !os.IsNotExist(err) {
 		t.Fatal("dry-run created state", err)
 	}
@@ -118,7 +122,7 @@ func TestCompatStartupAndLegacyLock(t *testing.T) {
 	c := testCtx(t)
 	compatConfig(t, c, false)
 	out, err := compatCommand(t, c, false).CombinedOutput()
-	if err != nil || string(out) != "LOG omomeow listener starting (profile test)\n" {
+	if err != nil || string(out) != "LOG omosense listener starting (profile test)\n" {
 		t.Fatalf("startup: %v %s", err, out)
 	}
 	if _, err := os.Stat(filepath.Join(c.State, "listen-test.lock.json")); !os.IsNotExist(err) {
@@ -150,6 +154,35 @@ func TestCompatDryRunEmptyBots(t *testing.T) {
 	if !ok || len(bots) != 0 {
 		t.Fatalf("empty profile must emit an empty telegram array: %s", out)
 	}
+	discord, ok := plan["discord"].([]any)
+	if !ok || len(discord) != 0 {
+		t.Fatalf("empty profile must emit an empty discord bot list: %s", out)
+	}
+}
+
+// TestCompatDryRunPlanBots pins the PLAN bot lists to the profile config:
+// the discord field is the bot list, not a boolean.
+func TestCompatDryRunPlanBots(t *testing.T) {
+	c := testCtx(t)
+	if err := os.MkdirAll(c.Dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	cfg := `{"profiles":{"test":{"telegram":{"bots":["t1","t2"],"roles":{}},"discord":{"bots":["d1","d2"],"roles":{}}}}}`
+	if err := os.WriteFile(filepath.Join(c.Dir, "config.json"), []byte(cfg), 0600); err != nil {
+		t.Fatal(err)
+	}
+	out, err := compatCommand(t, c, true).CombinedOutput()
+	if err != nil {
+		t.Fatal(err, string(out))
+	}
+	var plan map[string]any
+	if err := json.Unmarshal(bytes.TrimPrefix(bytes.TrimSpace(out), []byte("PLAN ")), &plan); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(plan["telegram"], []any{"t1", "t2"}) || !reflect.DeepEqual(plan["discord"], []any{"d1", "d2"}) {
+		t.Fatalf("PLAN bot lists: %s", out)
+	}
+	t.Logf("PASS: PLAN reports the configured bot lists -> %s; cleanup: subprocess exited, no state created", bytes.TrimSpace(out))
 }
 
 func TestCompatTelegramStdoutAndSignalCleanup(t *testing.T) {
@@ -203,7 +236,7 @@ func TestCompatTelegramStdoutAndSignalCleanup(t *testing.T) {
 			lines <- scanner.Text()
 		}
 	}()
-	if line := await(t, lines); line != "LOG omomeow listener starting (profile test)" {
+	if line := await(t, lines); line != "LOG omosense listener starting (profile test)" {
 		t.Fatal(line)
 	}
 	line := await(t, lines)

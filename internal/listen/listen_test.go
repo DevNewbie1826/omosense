@@ -186,3 +186,71 @@ func TestTelegramPollPersistsOffsetAndEventShape(t *testing.T) {
 	}
 	t.Log("PASS: POST getUpdates 41 -> EVENT message/edited/generation_stopped -> next offset/file 44; cleanup: source canceled, HTTP server closed by defer")
 }
+
+// TestRolesFromProfile pins IS-3: roles are profile data, never code. A
+// registered id keeps its role name, an unknown id falls back to "other",
+// for telegram (numeric ids) and discord (string ids) alike.
+func TestRolesFromProfile(t *testing.T) {
+	c := testCtx(t)
+	c.Profile.Telegram.Roles = map[string]string{"1": "owner", "2": "wife", "3": "trusted"}
+	c.Profile.Discord.Roles = map[string]string{"10": "owner", "20": "wife", "30": "trusted"}
+	s := Sources(c)[0].(src)
+	for _, tc := range []struct{ platform, id, want string }{
+		{"telegram", "1", "owner"},
+		{"telegram", "2", "wife"},
+		{"telegram", "3", "trusted"},
+		{"telegram", "99", "other"},
+		{"telegram", "", "other"},
+		{"discord", "10", "owner"},
+		{"discord", "20", "wife"},
+		{"discord", "30", "trusted"},
+		{"discord", "99", "other"},
+	} {
+		if got := s.role(tc.platform, tc.id); got != tc.want {
+			t.Errorf("role(%s, %s) = %q, want %q", tc.platform, tc.id, got, tc.want)
+		}
+	}
+	// The wire path feeds numeric telegram ids and string discord ids in.
+	sink := newSink()
+	var u telegramUpdate
+	if err := json.Unmarshal([]byte(`{"message":{"chat":{"id":9},"message_id":1,"from":{"id":2,"username":"u"},"text":"hi"}}`), &u); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.tgHandle(t.Context(), sink, "test", telegramAPI{"http://127.0.0.1:1", "fake-test-token", &http.Client{}}, u); err != nil {
+		t.Fatal(err)
+	}
+	ev := await(t, sink.signal).value.(map[string]any)
+	if ev["role"] != "wife" || ev["from_id"] != float64(2) {
+		t.Fatalf("telegram role: %#v", ev)
+	}
+	if err := s.dcHandle(t.Context(), sink, "test", []byte(`{"id":"m","channel_id":"c","author":{"id":"20","username":"u"},"content":"hi"}`)); err != nil {
+		t.Fatal(err)
+	}
+	ev = await(t, sink.signal).value.(map[string]any)
+	if ev["role"] != "wife" || ev["bot"] != "test" {
+		t.Fatalf("discord role: %#v", ev)
+	}
+}
+
+// TestSourcesSkipEmptyPlatforms pins IS-4b: a platform with no bots is not
+// a source, and a profile with neither platform registers no listen source
+// at all instead of a telegram worker that returns and is restarted.
+func TestSourcesSkipEmptyPlatforms(t *testing.T) {
+	c := testCtx(t)
+	c.Profile.Telegram.Bots = nil
+	c.Profile.Discord.Bots = nil
+	if got := Sources(c); len(got) != 0 {
+		t.Fatalf("empty profile sources = %d, want none", len(got))
+	}
+	c.Profile.Discord.Bots = []string{"d1"}
+	got := Sources(c)
+	if len(got) != 1 || got[0].Name() != "discord" {
+		t.Fatalf("discord-only sources = %v, want discord", got)
+	}
+	c.Profile.Discord.Bots = nil
+	c.Profile.Telegram.Bots = []string{"t1"}
+	got = Sources(c)
+	if len(got) != 1 || got[0].Name() != "telegram" {
+		t.Fatalf("telegram-only sources = %v, want telegram", got)
+	}
+}

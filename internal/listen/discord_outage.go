@@ -15,6 +15,7 @@ type outage struct {
 	mu         sync.Mutex
 	clock      clock
 	sink       core.Sink
+	bot        string
 	code       int
 	downSince  time.Time
 	everReady  bool
@@ -22,6 +23,12 @@ type outage struct {
 	timer      timer
 	generation uint64
 	stopped    bool
+}
+
+// tag names the bot every LOG line belongs to: the SDK logger is shared by
+// every session in the process, so an unattributed line is ambiguous.
+func (o *outage) tag() string {
+	return "discord " + o.bot
 }
 
 func (o *outage) connect() {
@@ -69,7 +76,7 @@ func (o *outage) disconnect() {
 			return
 		}
 		o.alerted = true
-		o.sink.Log(fmt.Sprintf("discord down 3m+ (last close %d), still reconnecting", code))
+		o.sink.Log(fmt.Sprintf("%s down 3m+ (last close %d), still reconnecting", o.tag(), code))
 	})
 }
 
@@ -82,11 +89,11 @@ func (o *outage) ready(username string, resumed bool) {
 	o.cancelTimer()
 	if !o.everReady {
 		if !resumed {
-			o.sink.Log("discord ready as " + username)
+			o.sink.Log(o.tag() + " ready as " + username)
 		}
 	} else if o.alerted {
 		minutes := int(math.Floor(o.clock.Now().Sub(o.downSince).Minutes() + 0.5))
-		o.sink.Log(fmt.Sprintf("discord recovered after %dm down", minutes))
+		o.sink.Log(fmt.Sprintf("%s recovered after %dm down", o.tag(), minutes))
 	}
 	o.everReady = true
 	o.downSince = time.Time{}
