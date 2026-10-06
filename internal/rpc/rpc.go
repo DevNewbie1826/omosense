@@ -125,7 +125,7 @@ func subscribe(c *core.Ctx) int {
 		fmt.Fprint(os.Stderr, Help)
 		return 2
 	}
-	sub := subscription{Session: c.Args[1], SubscribedAt: core.ISO(nowFn())}
+	sub := newSubscription(c.Args[1], nowFn())
 	if err := writeSubscription(c.State, sub); err != nil {
 		fmt.Fprintln(os.Stderr, "omosense: rpc subscribe:", err)
 		return 1

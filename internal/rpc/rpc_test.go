@@ -143,7 +143,7 @@ func runCompletion(t *testing.T, source bool) (string, *fakeDelivery, []string) 
 	t.Helper()
 	stateDir, f := integrationFixture(t)
 	deliveryWrite(t, filepath.Join(f.dir, "list"), fmt.Sprintf(`[{"thread_id":"%s","sessionId":"%s","alive":true}]`+"\n", rpcSubscriber, rpcSubscriber))
-	if err := writeSubscription(stateDir, subscription{Session: rpcSubscriber, SubscribedAt: core.ISO(time.Now())}); err != nil {
+	if err := writeSubscription(stateDir, newSubscription(rpcSubscriber, time.Now())); err != nil {
 		t.Fatal(err)
 	}
 	s := serveLiveStream(t, false)

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -145,6 +146,14 @@ func (x *batchFixture) advance(d time.Duration) {
 	x.mu.Unlock()
 }
 
+// setClock forces the injected clock, so a test can publish two records that
+// carry the same timestamp.
+func (x *batchFixture) setClock(at time.Time) {
+	x.mu.Lock()
+	x.now = at
+	x.mu.Unlock()
+}
+
 func (x *batchFixture) pass(t *testing.T) {
 	t.Helper()
 	x.b.pass(context.Background())
@@ -154,7 +163,7 @@ func (x *batchFixture) pass(t *testing.T) {
 // session alive.
 func (x *batchFixture) subscribe(t *testing.T, session string) {
 	t.Helper()
-	if err := writeSubscription(x.b.c.State, subscription{Session: session, SubscribedAt: core.ISO(x.clock())}); err != nil {
+	if err := writeSubscription(x.b.c.State, newSubscription(session, x.clock())); err != nil {
 		t.Fatal(err)
 	}
 	x.alive(t, session, true)
@@ -474,6 +483,87 @@ func TestBatchStaleLivenessAliveDoesNotSend(t *testing.T) {
 	if un, _ := x.b.store.Unnotified(); len(un) != 0 {
 		t.Fatalf("replacement batch not consumed: %+v", un)
 	}
+}
+
+// TestBatchStaleLivenessKeepsRenewal guards the IS-7 renewal case: a
+// subscription for the SAME session republished while the liveness check for
+// the previous record is in flight is a different instance, so the stale dead
+// result must not remove it or consume its batch. The batch is delivered after
+// a fresh live check. The fixture clock is frozen, so the renewal shares the
+// millisecond subscribed_at of the record it replaces - only the instance
+// token distinguishes them.
+func TestBatchStaleLivenessKeepsRenewal(t *testing.T) {
+	x := newBatchFixture(t)
+	start := x.clock()
+	x.subscribe(t, "SUB")
+	deliveryWrite(t, filepath.Join(x.f.dir, "list"), "[]\n") // stale list: SUB absent
+	pendingRecord(t, x.b.store, "D7", "rpc-7")
+	x.advance(batchQuiet)
+	passNow := x.clock()
+	wait, release := listBarrier(t, x.f)
+	done := deliveryAsyncPass(t, x.b)
+	wait()
+	examined, err := readSubscription(x.b.c.State)
+	if err != nil || examined == nil {
+		t.Fatalf("examined subscription = %+v %v", examined, err)
+	}
+	// Republish the same session with the clock reading of the record being
+	// replaced, so the renewal carries the very same subscribed_at: only the
+	// instance token can tell the two records apart.
+	x.setClock(start)
+	x.replaceSubscription(t, "SUB")
+	renewed, err := readSubscription(x.b.c.State)
+	if err != nil || renewed == nil {
+		t.Fatalf("renewed subscription = %+v %v", renewed, err)
+	}
+	if renewed.SubscribedAt != examined.SubscribedAt {
+		t.Fatalf("scenario drift: renewal moved the clock, examined %+v renewed %+v", examined, renewed)
+	}
+	if renewed.Instance == examined.Instance {
+		t.Fatalf("renewal reused the instance token: %+v", renewed)
+	}
+	release()
+	done()
+	sub, err := readSubscription(x.b.c.State)
+	if err != nil || sub == nil || sub.Session != "SUB" || sub.Instance != renewed.Instance {
+		t.Fatalf("stale dead result removed the renewal: %+v %v", sub, err)
+	}
+	if un, _ := x.b.store.Unnotified(); len(un) != 1 {
+		t.Fatalf("stale dead result consumed the batch: %+v", un)
+	}
+	if got := notifiedSeq(t, x.b.store); got != 0 {
+		t.Fatalf("stale dead result advanced notified_seq to %d", got)
+	}
+	if sends := x.f.sub(t, "send"); len(sends) != 0 {
+		t.Fatalf("batch sent from the stale dead result: %q", sends)
+	}
+	x.removeBarrier(t, "listready", "listrelease")
+	x.alive(t, "SUB", true)
+	x.setClock(passNow)
+	x.advance(deliverRetry)
+	x.pass(t)
+	sends := x.f.sub(t, "send")
+	if len(sends) != 1 || sends[0][2] != "SUB" {
+		t.Fatalf("renewal did not receive the batch: %q", sends)
+	}
+	if un, _ := x.b.store.Unnotified(); len(un) != 0 {
+		t.Fatalf("renewal batch not consumed: %+v", un)
+	}
+}
+
+// notifiedSeq reads the raw watermark, so an assertion cannot be satisfied by
+// the un-notified view alone.
+func notifiedSeq(t *testing.T, s *pendingStore) uint64 {
+	t.Helper()
+	b, err := os.ReadFile(s.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var f pendingFile
+	if err := json.Unmarshal(b, &f); err != nil {
+		t.Fatal(err)
+	}
+	return f.NotifiedSeq
 }
 
 // TestBatchRetryRespectsQuietWindow guards IS-6: a done recorded during a

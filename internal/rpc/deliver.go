@@ -3,6 +3,7 @@ package rpc
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -155,7 +156,7 @@ func (b *batcher) pass(ctx context.Context) {
 		return
 	}
 	if !alive {
-		removed, err := removeSubscriptionIf(b.c.State, sub.Session)
+		removed, err := removeSubscriptionIf(b.c.State, sub)
 		if err != nil {
 			b.note("rpc subscription: " + err.Error())
 			b.retryAt = now.Add(deliverRetry)
@@ -164,7 +165,8 @@ func (b *batcher) pass(ctx context.Context) {
 		if !removed {
 			// The subscription changed while its liveness was being checked:
 			// the stale result is discarded, the batch is not consumed, and the
-			// next pass re-evaluates the replacement (IS-7).
+			// next pass re-evaluates the replacement - even when the replacement
+			// renews the same session (IS-7).
 			b.retryAt = now.Add(deliverRetry)
 			return
 		}
@@ -173,8 +175,9 @@ func (b *batcher) pass(ctx context.Context) {
 	}
 	// The liveness answer belongs to the subscription that was examined: if a
 	// replacement (or an unsubscribe) landed while `thread list` ran, the batch
-	// must not be sent to the old session. Re-read under the subscription lock.
-	unchanged, err := subscriptionUnchanged(b.c.State, sub.Session)
+	// must not be sent to the old session. Re-read under the subscription lock;
+	// a renewal of the same session is a different instance too.
+	unchanged, err := subscriptionUnchanged(b.c.State, sub)
 	if err != nil {
 		b.note("rpc subscription: " + err.Error())
 		b.retryAt = now.Add(deliverRetry)
@@ -278,10 +281,22 @@ func subscriberAlive(ctx context.Context, id string) (bool, error) {
 	return false, nil
 }
 
-// subscription is the folder's single rpc delivery target (IS-7).
+// subscription is the folder's single rpc delivery target (IS-7). Instance is
+// the record's identity: it is regenerated on every publish, so a renewal of
+// the same session is a new instance even when SubscribedAt repeats (core.ISO
+// has millisecond resolution).
 type subscription struct {
 	Session      string `json:"session"`
 	SubscribedAt string `json:"subscribed_at"`
+	Instance     string `json:"instance"`
+}
+
+// newSubscription builds the record `omosense rpc subscribe` publishes. The
+// instance token is a fresh 128-bit random value, so every publish - including
+// a renewal of the same session id - is distinguishable from the record it
+// replaces.
+func newSubscription(session string, at time.Time) subscription {
+	return subscription{Session: session, SubscribedAt: core.ISO(at), Instance: rand.Text()}
 }
 
 func subscriptionPath(stateDir string) string {
@@ -371,10 +386,22 @@ func writeSubscription(stateDir string, s subscription) error {
 	return os.Rename(tmp.Name(), subscriptionPath(stateDir))
 }
 
-// removeSubscriptionIf removes the subscription only when it is still the one
-// examined: a subscription replaced while the liveness check was in flight is
-// left untouched. It reports whether a removal happened (IS-7).
-func removeSubscriptionIf(stateDir, session string) (bool, error) {
+// sameInstance reports whether cur is the very record examined: the same
+// session, the same publish time and the same instance token. Comparing the
+// whole record is what keeps a renewal of the same session (unsubscribe then
+// subscribe) distinct from the record whose liveness was checked (IS-7).
+func sameInstance(cur, examined *subscription) bool {
+	return cur != nil && examined != nil &&
+		cur.Session == examined.Session &&
+		cur.SubscribedAt == examined.SubscribedAt &&
+		cur.Instance == examined.Instance
+}
+
+// removeSubscriptionIf removes the subscription only when it is still the
+// record examined: a subscription replaced while the liveness check was in
+// flight - including a renewal of the same session - is left untouched. It
+// reports whether a removal happened (IS-7).
+func removeSubscriptionIf(stateDir string, examined *subscription) (bool, error) {
 	lock, err := lockSubscription(stateDir)
 	if err != nil {
 		return false, err
@@ -384,7 +411,7 @@ func removeSubscriptionIf(stateDir, session string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if cur == nil || cur.Session != session {
+	if !sameInstance(cur, examined) {
 		return false, nil
 	}
 	if err := os.Remove(subscriptionPath(stateDir)); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -394,9 +421,9 @@ func removeSubscriptionIf(stateDir, session string) (bool, error) {
 }
 
 // subscriptionUnchanged reports whether the stored subscription is still the
-// one examined, read under the subscription lock so a replacement published
+// record examined, read under the subscription lock so a replacement published
 // during the liveness check cannot be sent the old subscriber's batch (IS-7).
-func subscriptionUnchanged(stateDir, session string) (bool, error) {
+func subscriptionUnchanged(stateDir string, examined *subscription) (bool, error) {
 	lock, err := lockSubscription(stateDir)
 	if err != nil {
 		return false, err
@@ -406,7 +433,7 @@ func subscriptionUnchanged(stateDir, session string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return cur != nil && cur.Session == session, nil
+	return sameInstance(cur, examined), nil
 }
 
 // takeSubscription removes and returns the current subscription under the
