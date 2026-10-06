@@ -4,9 +4,10 @@ One-time cutover of the 오우모드 install to the generalized omosense: profil
 `config.json` (new shape only), wrapper-installed binary, and the skill command swap
 (plan `.omo/plans/omosense-generalize.md`, IS-9 / IS-10 / IS-11). Performed by 오우 MAIN on the
 owner's account after the PR is merged to `main`. Expected downtime: a few minutes between
-steps (d) and (h). Rollback: section (j), restores the old binary, the old config, the old
-skill files and the pre-deployment state files (reminders, sessions, replay journals,
-Telegram offsets).
+steps (d) and (h). Rollback: section (j), restores the old binary, the old config and
+the old skill files; the live state files (reminders, sessions, replay journals,
+Telegram offsets, google seen, tidy watermark) are deliberately left untouched — the
+pre-deploy state snapshot from (b) is kept only for (j)'s emergency recovery.
 
 Ground rules:
 
@@ -35,29 +36,43 @@ tar -czf ~/.omomeow/skills-backup-$(date +%Y%m%d).tgz -C /Users/mirage/.omo/agen
   owo-mode/SKILL.md owo-mode/references/integrations.md owo-mode/references/runtime-maintenance.md \
   memory-tidy/SKILL.md
 
-# State a deploy must never lose — restored verbatim in (j). null_glob keeps the zsh
-# loop working when a per-bot file does not exist yet.
-setopt null_glob
+# State a deploy must never lose — the emergency-recovery source for (j); ordinary
+# rollback leaves live state in place. The globs expand INSIDE the state directory
+# (the subshell cd), so they match regardless of the caller's cwd or null_glob.
 sb=~/.omomeow/state-backup-$(date +%Y%m%d); mkdir -p $sb
-for f in reminders-main.json reminders-family.json sessions.json \
-         omosense-journal-main.jsonl omosense-journal-family.jsonl \
-         tg-offset-* google-seen-*.json memory-tidy.json; do
-  [[ -e ~/.omomeow/state/$f ]] && cp ~/.omomeow/state/$f $sb/
-done; unsetopt null_glob
+( cd ~/.omomeow/state && setopt null_glob
+  for f in reminders-main.json reminders-family.json sessions.json \
+           omosense-journal-main.jsonl omosense-journal-family.jsonl \
+           tg-offset-* google-seen-*.json memory-tidy.json; do
+    [[ -e $f ]] && cp -p $f $sb/
+  done; true )
+# completeness gate — every state file this install must have, verified present and
+# byte-identical; a missing or differing file fails the backup loudly
+expected=(reminders-main.json reminders-family.json sessions.json
+          omosense-journal-main.jsonl omosense-journal-family.jsonl
+          tg-offset-owo_dm tg-offset-owo google-seen-main.json google-seen-family.json
+          memory-tidy.json)
+for f in $expected; do
+  [[ -f $sb/$f ]] || { echo "BACKUP INCOMPLETE: missing $f"; exit 1; }
+  cmp -s ~/.omomeow/state/$f $sb/$f || { echo "BACKUP CORRUPT: $f differs"; exit 1; }
+done
+echo "state backup verified: ${#expected} files byte-identical"
 ls -l ~/.omomeow/config.json.bak ~/.omomeow/bin/omosense.old ~/.omomeow/skills-backup-*.tgz $sb
 ```
 
-Expect the three backup artifacts plus the state backup directory listed. Keep the date
-suffixes for (j). What each state file protects:
+Expect `state backup verified: 10 files byte-identical` before the listing of the three
+backup artifacts plus the state backup directory. Any `BACKUP INCOMPLETE`/`BACKUP CORRUPT`
+line aborts the deploy before the shutdown — a silently partial backup is worse than
+none. Keep the date suffixes for (j). What each state file protects:
 
 | File | Why it must survive the deploy |
 |---|---|
 | `reminders-main.json`, `reminders-family.json` | The scheduled reminder queues. A truthy `sent`/`skipped`/`failed`/`cancelled` marker is terminal — the scheduler never resends such an entry — so a destructive rewrite is unrecoverable from live state. |
 | `sessions.json` | Both roles' response-session registration (rpc deliver reads it; only the permanent full stop removes entries). |
 | `omosense-journal-main.jsonl`, `omosense-journal-family.jsonl` | Queued always-on replay lines; a destructive profile stop discards pending entries. |
-| `tg-offset-*` | Per-bot Telegram fetch offsets; restoring them avoids re-fetching updates already processed before the deploy. |
-| `google-seen-*.json` | Calendar seen-state; restoring avoids duplicate `CAL` re-emission. |
-| `memory-tidy.json` | Tidy watermark, kept consistent with the rolled-back skills. |
+| `tg-offset-*` | Per-bot Telegram fetch offsets; losing them would re-fetch updates that were already processed. |
+| `google-seen-*.json` | Calendar/mail seen-state; losing it would re-emit `CAL`/`MAIL` duplicates. |
+| `memory-tidy.json` | Tidy watermark; losing it would force a redundant re-tidy. |
 
 Source lock files (`listen-*.lock.json`, `watch-*.lock.json`, …) and the daemon's own
 pid/log/lock metadata are deliberately **not** backed up or restored: locks belong to
@@ -74,7 +89,10 @@ Expect one JSON line: `pid`, `version`, `features` (includes `profile-stop`), `s
 compare against it.
 
 Then record the pending-reminder baseline — the same command runs again in (d), (h), (i)
-and (j), and the counts must never change. "Pending" uses the reminder scheduler's own
+and (j). Counts may move during the deploy window only when real work happened (a due
+reminder gains a terminal marker; explicitly added entries appear) — the identity
+snapshot below makes every such change provable record-by-record, and after (j)'s
+rollback the state must equal the pre-rollback snapshot exactly. "Pending" uses the reminder scheduler's own
 semantics (`internal/remind/sched.go`): an entry counts as pending unless `sent`,
 `skipped`, `failed` or `cancelled` holds a truthy value:
 
@@ -95,6 +113,35 @@ for f in sorted(glob.glob(os.path.expanduser("~/.omomeow/state/reminders-*.json"
 ```
 
 Expect `reminders-main.json pending N` and `reminders-family.json pending M`; record N and M.
+
+Alongside the count, record the identity snapshot — ids with their terminal markers,
+offsets, seen keys, watermark — at every checkpoint ((d), (h), (i) and twice in (j));
+it is the evidence that nothing was lost or rewound. The journal is deliberately not
+in it: the daemon legitimately rewrites its frame file on every open, so (j) checks it
+by content greps instead:
+
+```zsh
+cat > /tmp/omostate-id.py <<'PY'
+import json, glob, os
+state = os.path.expanduser("~/.omomeow/state")
+def mark(r):
+    for k in ("sent", "skipped", "failed", "cancelled"):
+        if r.get(k): return k
+    return "pending"
+for f in sorted(glob.glob(state + "/reminders-*.json")):
+    print(os.path.basename(f), sorted((str(r.get("id")), mark(r)) for r in json.load(open(f))))
+for f in sorted(glob.glob(state + "/tg-offset-*")):
+    print(os.path.basename(f), open(f).read().strip())
+for f in sorted(glob.glob(state + "/google-seen-*.json")):
+    print(os.path.basename(f), sorted(json.load(open(f))))
+wm = json.load(open(state + "/memory-tidy.json"))
+print("memory-tidy.json", sorted((k, str(v)) for k, v in (wm.get("repos") or {}).items()))
+PY
+python3 /tmp/omostate-id.py
+```
+
+Expect the seeded ids with their markers, both bots' offset values, the seen keys and
+the watermark repos. Record this output at every checkpoint.
 
 ## (d) Shutdown (state-preserving — never `daemon stop --profile`)
 
@@ -137,8 +184,9 @@ Herdr panes and both registrations stay.
 ~/.omomeow/bin/omosense daemon status                  # expect: dial unix ... omosense.sock: no such file or directory (exit 1)
 ```
 
-Re-run the (c) pending-reminder count command: `N` and `M` must be unchanged — nothing
-was cancelled. Keep both Herdr panes open and both `sessions.json` entries registered;
+Re-run the (c) count and identity commands: nothing was cancelled — pending ids keep
+their markers, and any new terminal marker names a reminder that actually came due
+while the daemon was still running. Keep both Herdr panes open and both `sessions.json` entries registered;
 (h) re-arms the same monitors and the registrations stay valid. Do not close the FAMILY
 tab and do not remove any registration — that happens only in the skill's permanent
 full stop. Report that `오우모드` keeps both panes and will re-arm after (h).
@@ -263,8 +311,9 @@ Expect every expected worker `running` (FAMILY's unsubscribed `herdr` worker may
 per armed matrix row for **both** roles — `listen-family`, `google-family`,
 `remind-family` alongside the MAIN rows.
 
-Then re-run the (c) pending-reminder count command (`N`/`M` unchanged — the deploy did
-not touch the queues) and confirm the registrations survived the binary swap:
+Then re-run the (c) count and identity commands (the swap itself must not touch the
+queues — any change must name work that really happened while the new binary ran) and
+confirm the registrations survived the binary swap:
 
 ```zsh
 cat ~/.omomeow/state/sessions.json   # both main and family entries, panes unchanged
@@ -302,35 +351,71 @@ watermark — that is a normal incremental report, handle per the memory-tidy sk
 `--profile family` prints exactly `LOG tidy disabled for profile family` and exits 0; the
 three greps print nothing.
 
-Finally, re-run the (c) pending-reminder count command and `daemon status` once more:
-the counts are still `N`/`M`, and sources/clients match the (h) armed state.
+Finally, re-run the (c) count and identity commands and `daemon status` once more:
+every difference from (c) names work that really happened in the window (a due reminder
+now `sent`, an explicitly added reminder now pending), sources/clients match the (h)
+armed state, and this identity output is the pre-rollback snapshot (j) compares against.
 
 ## (j) Rollback
 
 Only if (i) failed. Stop exactly as in (d) — detach every FAMILY and MAIN monitor, then
 plain `daemon stop` (**never** `daemon stop --profile family`; the (d) warning applies
-unchanged) — and verify the daemon is gone, then restore binary, config, skills **and
-state**:
+unchanged) — and verify the daemon is gone. With the daemon down, freeze the identity
+snapshot the rollback must preserve, then restore binary, config and skills — and
+never touch state:
+
+```zsh
+python3 /tmp/omostate-id.py > /tmp/omostate-rb0.txt && wc -l < /tmp/omostate-rb0.txt   # frozen pre-rollback state
+```
 
 ```zsh
 mv ~/.omomeow/bin/omosense.old ~/.omomeow/bin/omosense
 rm -f ~/.omomeow/bin/omosense.real
 cp ~/.omomeow/config.json.bak ~/.omomeow/config.json
 tar -xzf ~/.omomeow/skills-backup-<DATE>.tgz -C /Users/mirage/.omo/agent/skills   # same date suffix as (b)
-cp ~/.omomeow/state-backup-<DATE>/* ~/.omomeow/state/                            # reminders, sessions, journals, offsets, seen, watermark
+# NOTE: nothing writes to ~/.omomeow/state here — live state survives the rollback
+# exactly as the workers left it (the (b) snapshot is for emergencies only, below).
 
 # restoration proofs
 cmp ~/.omomeow/config.json ~/.omomeow/config.json.bak && echo "config identical to backup"
 file ~/.omomeow/bin/omosense | cut -d: -f2                 # Mach-O 64-bit executable arm64 — not the #!/bin/sh wrapper
 grep -c 'bun ~/.omomeow' /Users/mirage/.omo/agent/skills/owo-mode/SKILL.md   # old skill text is back (> 0)
+
+# preservation proof — rb0 was frozen after the stop, rb1 is taken now: the rollback
+# copied nothing over state, so the two identity snapshots must be identical
+python3 /tmp/omostate-id.py > /tmp/omostate-rb1.txt
+diff /tmp/omostate-rb0.txt /tmp/omostate-rb1.txt && echo "state untouched by rollback"
 ```
 
-The state restore returns reminders, replay journals, registrations and Telegram offsets
-to their pre-deployment values even if something destructive ran by accident during the
-attempt; re-delivering an update that was already processed inside the deploy window is
-the safe direction compared with losing scheduled work. Lock files were never backed up
-and must not exist for a stopped daemon; if a stale lock survived an abnormal exit,
-resolve it per the skill's lock-conflict diagnosis — never delete a live holder's lock.
+Nothing here rewrites state: reminders added while the new binary ran stay, terminal
+markers (`sent`/`skipped`/`failed`/`cancelled`) taken in the window stay terminal — the
+scheduler never resends them — Telegram offsets stay advanced so no update is fetched
+twice, calendar/mail seen keys and the tidy watermark stay where the new binary left
+them, and the replay journals keep every queued line. The old binary reads all of
+these files unchanged (the state formats are identical across the two binaries), so
+the restart below continues exactly where the deploy was abandoned. Lock files were
+never backed up and must not exist for a stopped daemon; if a stale lock survived an
+abnormal exit, resolve it per the skill's lock-conflict diagnosis — never delete a
+live holder's lock.
+
+### Emergency state recovery — rewind, not rollback (corrupted state dir only)
+
+Only when the state directory itself was damaged by the failed attempt (an unparseable
+reminders file, a truncated journal) — never as a routine step, never while a daemon
+is running, and never to "undo" work that happened in the window. Restoring the (b)
+snapshot rewinds everything processed since (b): reminders added in the window vanish,
+terminal markers taken in the window are erased (those entries become pending again
+and WILL be re-delivered), Telegram offsets regress (updates processed in the window
+arrive again), seen keys regress (duplicate `CAL`/`MAIL`), and the tidy watermark
+rewinds (a redundant re-tidy). Quarantine the damaged state first, diff it, then
+rewind:
+
+```zsh
+q=~/.omomeow/state-rewind-$(date +%Y%m%d%H%M%S); mkdir -p $q
+( cd ~/.omomeow/state && setopt null_glob
+  for f in *.json *.jsonl tg-offset-*; do cp -p $f $q/; done )   # quarantine the damaged files
+cp ~/.omomeow/state-backup-<DATE>/* ~/.omomeow/state/            # LAST RESORT — rewinds processed state
+```
 
 Restart as in (h): re-arm every source-matrix row for **both** profiles (the old binary
 reads `~/.omomeow` by default — no wrapper, no `OMOSENSE_DIR` involved), then verify the
@@ -341,15 +426,23 @@ same armed state as (c)/(h):
 ```
 
 Expect the pre-deployment shape from (c): both profiles' sources with the expected
-workers `running`, `clients` for both roles, no wrapper. Re-run the (c) pending-reminder
-count command — still `N`/`M` — and confirm `sessions.json` still holds both roles'
-entries.
+workers `running`, `clients` for both roles, no wrapper. Re-run the (c) identity
+command: the output equals the pre-rollback snapshot — pending entries (including any
+added while the new binary ran) are scheduled again, terminal entries are not
+re-delivered (no duplicate send in the bots' history), offsets continue from their
+advanced values — and `sessions.json` still holds both roles' entries. Confirm the
+window's journal lines survived the old binary's restart: `grep -c` a marker from an
+event delivered while the new binary ran (e.g. its message text) in
+`~/.omomeow/state/omosense-journal-family.jsonl` before and after the restart — same
+count (the old binary replay-parses the journal the new binary wrote; a format drift
+would have failed the daemon's start).
 
 After a successful (i), clean up the rollback aids when the install has been stable:
 
 ```zsh
 rm -f ~/.omomeow/bin/omosense.old /tmp/omosense.new
-rm -rf ~/.omomeow/state-backup-<DATE>
+# state-backup-<DATE> is the emergency-recovery source — keep it for a few stable
+# days before `rm -rf ~/.omomeow/state-backup-<DATE>`
 ```
 
 Keep `config.json.bak` and the skills tarball.
