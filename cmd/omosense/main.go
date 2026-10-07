@@ -18,6 +18,7 @@ import (
 	"github.com/DevNewbie1826/omosense/internal/remind"
 	"github.com/DevNewbie1826/omosense/internal/rpc"
 	"github.com/DevNewbie1826/omosense/internal/say"
+	"github.com/DevNewbie1826/omosense/internal/thread"
 	"github.com/DevNewbie1826/omosense/internal/tidy"
 )
 
@@ -47,7 +48,7 @@ func run(args []string) int {
 	}
 
 	switch sub {
-	case "listen", "google", "remind", "herdr", "rpc", "tidy", "say":
+	case "listen", "google", "remind", "herdr", "rpc", "tidy", "say", "thread":
 		if hasHelp(rest) {
 			fmt.Print(subHelp(sub))
 			return 0
@@ -74,6 +75,8 @@ func run(args []string) int {
 			return rpc.Run(ctx, rest)
 		case "tidy":
 			return tidy.Run(ctx, rest)
+		case "thread":
+			return thread.Run(ctx, rest)
 		default:
 			return say.Run(ctx, rest)
 		}
@@ -123,6 +126,8 @@ func subHelp(sub string) string {
 		return rpc.Help
 	case "tidy":
 		return tidy.Help
+	case "thread":
+		return thread.Help
 	default:
 		return say.Help
 	}
@@ -143,6 +148,7 @@ Subcommands:
   rpc       webchat rpc.sock session watcher (RPC)
   tidy      memory tidy watcher (TIDY)
   say       outbound message sender
+  thread    register or close a job thread in threads.json
 
 Run omosense <subcommand> --help for per-subcommand help.
 `)
