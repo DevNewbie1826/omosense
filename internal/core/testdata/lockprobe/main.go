@@ -4,7 +4,6 @@
 package main
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -17,10 +16,6 @@ func main() {
 	ctx, err := core.Load(pa, true)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
-		var up core.UnknownProfileError
-		if errors.As(err, &up) {
-			os.Exit(2)
-		}
 		os.Exit(1)
 	}
 	name := os.Getenv("PROBE_LOCK")

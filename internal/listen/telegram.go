@@ -63,8 +63,8 @@ func (s src) telegram(ctx context.Context, sink core.Sink) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var wg sync.WaitGroup
-	errs := make(chan error, len(s.cfg.Profile.Telegram.Bots))
-	for _, bot := range s.cfg.Profile.Telegram.Bots {
+	errs := make(chan error, 1)
+	for _, bot := range platformBots(s.cfg.Profile.Telegram.Bot) {
 		token, err := core.Cred(os.Getenv("HOME"), "telegrambot-credentials.json", bot)
 		if err != nil {
 			cancel()

@@ -11,7 +11,7 @@ import (
 )
 
 // Help is the usage text printed by omosense herdr --help.
-const Help = `Usage: omosense herdr [--profile P] [--once]
+const Help = `Usage: omosense herdr [--once]
 
 Watches herdr panes every 5 seconds, printing HERDR and LOG lines to
 stdout.
@@ -29,7 +29,7 @@ func Run(c *core.Ctx, args []string) int {
 		newWatcher(c, c.Out).once(context.Background())
 		return 0
 	}
-	release := c.Acquire("watch-herdr-"+c.Profile.Name, "")
+	release := c.Acquire("watch-herdr", "")
 	defer release()
 	if err := newWatcher(c, c.Out).run(context.Background()); err != nil {
 		fmt.Fprintln(os.Stderr, "omosense:", err)
@@ -38,31 +38,31 @@ func Run(c *core.Ctx, args []string) int {
 	return 0
 }
 
-// Sources returns the herdr source of c's profile. It is pause-while-idle
-// (IS-13) and takes watch-herdr-<profile> with no legacy lock name.
+// Sources returns the herdr source. It is a default source (the host
+// registers it unless herdr.enabled is explicitly false) and takes the
+// watch-herdr lock.
 func Sources(c *core.Ctx) []core.Source {
 	return []core.Source{src{
 		c:        c,
 		name:     "herdr",
 		prefixes: []string{"HERDR"},
-		lock:     "watch-herdr-" + c.Profile.Name,
+		lock:     "watch-herdr",
 	}}
 }
 
-// src is the daemon-hosted herdr source. The daemon owns the lock (IS-15),
-// so Run only watches.
+// src is the host's herdr source. The host owns the lock (IS-15), so Run
+// only watches.
 type src struct {
 	c        *core.Ctx
 	name     string
 	prefixes []string
 	lock     string
-	legacy   string
 }
 
 func (s src) Name() string               { return s.name }
 func (s src) Prefixes() []string         { return s.prefixes }
 func (s src) AlwaysOn() bool             { return false }
-func (s src) LockName() (string, string) { return s.lock, s.legacy }
+func (s src) LockName() (string, string) { return s.lock, "" }
 
 func (s src) Run(ctx context.Context, sink core.Sink) error {
 	return newWatcher(s.c, sink).run(ctx)

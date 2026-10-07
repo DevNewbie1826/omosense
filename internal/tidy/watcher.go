@@ -63,11 +63,10 @@ type emitRec struct {
 	at float64
 }
 
-// tidyer is one profile's memory-tidy watcher: resolved paths, which repos
-// heads() may report, thresholds, and the injected clock/sleep.
+// tidyer is the memory-tidy watcher: resolved paths, which repos heads()
+// may report, thresholds, and the injected clock/sleep.
 type tidyer struct {
 	state       string
-	profile     string
 	memory      string
 	exclude     map[string]bool
 	learnOthers bool
@@ -95,7 +94,6 @@ func newTidyer(c *core.Ctx, sink core.Sink) *tidyer {
 	}
 	return &tidyer{
 		state:       c.State,
-		profile:     c.Profile.Name,
 		memory:      c.Profile.Memory,
 		exclude:     exclude,
 		learnOthers: c.Profile.Tidy.LearnOthers,
@@ -114,8 +112,8 @@ func newTidyer(c *core.Ctx, sink core.Sink) *tidyer {
 // check-interval forever. Tick errors are logged and the loop continues,
 // matching the TS try/catch; ctx cancellation (a daemon stop) returns nil.
 func (t *tidyer) runLoop(ctx context.Context) error {
-	t.sink.Log(fmt.Sprintf("memory-tidy watcher starting (profile %s, check %sm, quiet %sm, max %sm)",
-		t.profile, minStr(t.checkMs), minStr(t.quietMs), minStr(t.maxMs)))
+	t.sink.Log(fmt.Sprintf("memory-tidy watcher starting (check %sm, quiet %sm, max %sm)",
+		minStr(t.checkMs), minStr(t.quietMs), minStr(t.maxMs)))
 	pendingSince := map[string]float64{}
 	emitted := map[string]emitRec{}
 	for {

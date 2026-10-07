@@ -88,7 +88,7 @@ type watcher struct {
 // clock / sleep dependencies. writable false is the read-only --once shape:
 // save becomes a no-op and nothing is ever created or written.
 func newWatcher(c *core.Ctx, sink core.Sink, writable bool) (*watcher, error) {
-	path := filepath.Join(c.State, "google-seen-"+c.Profile.Name+".json")
+	path := filepath.Join(c.State, "google-seen.json")
 	seen := core.NewOMap()
 	if b, err := os.ReadFile(path); err == nil {
 		v, err := core.ParseJSON(b)
@@ -246,7 +246,7 @@ func (w *watcher) save() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(w.state, "google-seen-"+w.prof.Name+".json"), b, 0o644)
+	return os.WriteFile(filepath.Join(w.state, "google-seen.json"), b, 0o644)
 }
 
 // once is the read-only --once pass (IS-9): calendar plus non-silent mail
@@ -268,7 +268,7 @@ func (w *watcher) once(ctx context.Context) {
 // stopping. It returns nil when ctx is cancelled, and the pre-loop mail
 // error otherwise (the TS script dies on it).
 func (w *watcher) run(ctx context.Context) error {
-	w.sink.Log(fmt.Sprintf("google watcher starting (profile %s)", w.prof.Name))
+	w.sink.Log("google watcher starting")
 	if w.prof.Mail {
 		if err := w.mail(ctx, w.firstRun); err != nil {
 			if ctx.Err() != nil {

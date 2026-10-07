@@ -14,7 +14,7 @@ import (
 )
 
 // Help is the usage text printed by omosense tidy --help.
-const Help = `Usage: omosense tidy [--profile P] [--once|--now] [flags]
+const Help = `Usage: omosense tidy [--once|--now] [flags]
 
 Runs the memory tidy watcher, printing TIDY and LOG lines to stdout.
 
@@ -38,7 +38,7 @@ func Run(c *core.Ctx, args []string) int {
 	}
 	t.checkMs, t.quietMs, t.maxMs = checkMs, quietMs, maxMs
 	if !c.Profile.Tidy.Enabled {
-		t.sink.Log(fmt.Sprintf("tidy disabled for profile %s", c.Profile.Name))
+		t.sink.Log("tidy disabled")
 		return 0
 	}
 
@@ -66,7 +66,7 @@ func Run(c *core.Ctx, args []string) int {
 		}
 		return 0
 	}
-	release := c.Acquire("memory-tidy-"+c.Profile.Name, "")
+	release := c.Acquire("memory-tidy", "")
 	defer release()
 	if err := t.runLoop(context.Background()); err != nil {
 		fmt.Fprintln(os.Stderr, "omosense:", err)
@@ -136,9 +136,8 @@ func (t *tidyer) nowOnce(ctx context.Context) error {
 	return nil
 }
 
-// Sources returns the tidy source of c's profile when tidy is enabled, and
-// no source otherwise. It is pause-while-idle (IS-13) and takes
-// memory-tidy-<profile> with no legacy lock name.
+// Sources returns the tidy source when tidy.enabled is set, and no source
+// otherwise. It takes the memory-tidy lock.
 func Sources(c *core.Ctx) []core.Source {
 	if !c.Profile.Tidy.Enabled {
 		return nil
@@ -147,12 +146,12 @@ func Sources(c *core.Ctx) []core.Source {
 		c:        c,
 		name:     "tidy",
 		prefixes: []string{"TIDY"},
-		lock:     "memory-tidy-" + c.Profile.Name,
+		lock:     "memory-tidy",
 	}}
 }
 
-// src is the daemon-hosted tidy source. The daemon owns the lock (IS-15),
-// so Run only watches, with the TS default thresholds.
+// src is the host's tidy source. The host owns the lock (IS-15), so Run only
+// watches, with the TS default thresholds.
 type src struct {
 	c        *core.Ctx
 	name     string

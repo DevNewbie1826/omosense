@@ -120,28 +120,26 @@ type target struct {
 	args    []string
 }
 
-// watcher is one profile's herdr source: seen statuses and the last logged
-// error per machine survive across ticks, matching the module-level maps
-// in watch-herdr.ts.
+// watcher is the herdr source: seen statuses and the last logged error per
+// machine survive across ticks, matching the module-level maps in
+// watch-herdr.ts.
 type watcher struct {
-	profile string
-	state   string
-	sink    core.Sink
-	own     paneID
-	seen    map[string]seenRec
-	errs    map[string]string
-	sleep   func(context.Context, time.Duration) error
+	state string
+	sink  core.Sink
+	own   paneID
+	seen  map[string]seenRec
+	errs  map[string]string
+	sleep func(context.Context, time.Duration) error
 }
 
 func newWatcher(c *core.Ctx, sink core.Sink) *watcher {
 	return &watcher{
-		profile: c.Profile.Name,
-		state:   c.State,
-		sink:    sink,
-		own:     ownPane(),
-		seen:    map[string]seenRec{},
-		errs:    map[string]string{},
-		sleep:   sleepFn,
+		state: c.State,
+		sink:  sink,
+		own:   ownPane(),
+		seen:  map[string]seenRec{},
+		errs:  map[string]string{},
+		sleep: sleepFn,
 	}
 }
 
@@ -163,7 +161,7 @@ func (w *watcher) run(ctx context.Context) error {
 	if w.own.kind == kindValue {
 		skip = w.own.s
 	}
-	w.sink.Log(fmt.Sprintf("herdr watcher starting (profile %s, every %ds, skip %s)", w.profile, int(interval/time.Second), skip))
+	w.sink.Log(fmt.Sprintf("herdr watcher starting (every %ds, skip %s)", int(interval/time.Second), skip))
 	first := true
 	for {
 		if ctx.Err() != nil {

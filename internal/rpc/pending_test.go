@@ -35,14 +35,14 @@ func pendingList(t *testing.T, s *pendingStore) []pendingEntry {
 
 func TestPendingRestartHandleChange(t *testing.T) {
 	dir := t.TempDir()
-	s := newPendingStore(dir, "main")
+	s := newPendingStore(dir)
 	first := pendingRecord(t, s, "D7", "rpc-7")
-	restarted := newPendingStore(dir, "main")
+	restarted := newPendingStore(dir)
 	if es := pendingList(t, restarted); len(es) != 1 || es[0].ID != "D7" {
 		t.Fatalf("restart lost durable completion: %+v", es)
 	}
 	second := pendingRecord(t, restarted, "D7", "rpc-9")
-	es := pendingList(t, newPendingStore(dir, "main"))
+	es := pendingList(t, newPendingStore(dir))
 	if len(es) != 1 || es[0].ID != "D7" || second.Seq != 2 || second.Count != 2 ||
 		es[0].Session != "rpc-9" || second.FirstAt != first.FirstAt {
 		t.Fatalf("handle change split or lost completion: %+v", es)
@@ -50,7 +50,7 @@ func TestPendingRestartHandleChange(t *testing.T) {
 }
 
 func TestPendingStaleAck(t *testing.T) {
-	s := newPendingStore(t.TempDir(), "main")
+	s := newPendingStore(t.TempDir())
 	first := pendingRecord(t, s, "D7", "rpc-7")
 	second := pendingRecord(t, s, "D7", "rpc-7")
 	result, err := s.Ack("D7", first.Seq, true)
@@ -70,7 +70,7 @@ func TestPendingStaleAck(t *testing.T) {
 
 func TestPendingConcurrentRecordAck(t *testing.T) {
 	dir := t.TempDir()
-	s := newPendingStore(dir, "main")
+	s := newPendingStore(dir)
 	pendingRecord(t, s, "D7", "rpc-7")
 	// Probe from inside Record's timestamp hook. LOCK_NB must fail on an
 	// independent descriptor; this proves the real critical section without
@@ -101,7 +101,7 @@ func TestPendingConcurrentRecordAck(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			other := newPendingStore(dir, "main")
+			other := newPendingStore(dir)
 			if _, err := other.Record("D7", rpcEvent{Session: "rpc-9"}); err != nil {
 				errs <- err
 			}
@@ -123,7 +123,7 @@ func TestPendingConcurrentRecordAck(t *testing.T) {
 }
 
 func TestPendingEmptyID(t *testing.T) {
-	s := newPendingStore(t.TempDir(), "main")
+	s := newPendingStore(t.TempDir())
 	if _, err := s.Record("", rpcEvent{Session: "rpc-7"}); err == nil {
 		t.Fatal("accepted empty durable id")
 	}
@@ -135,7 +135,7 @@ func TestPendingEmptyID(t *testing.T) {
 func TestPendingCorruptFile(t *testing.T) {
 	for _, data := range []string{`{`, `null`, `{"version":2,"entries":{}}`, `{"version":1,"entries":null}`} {
 		t.Run(data, func(t *testing.T) {
-			s := newPendingStore(t.TempDir(), "main")
+			s := newPendingStore(t.TempDir())
 			if err := os.WriteFile(s.path, []byte(data), 0o600); err != nil {
 				t.Fatal(err)
 			}
@@ -156,8 +156,44 @@ func TestPendingCorruptFile(t *testing.T) {
 	}
 }
 
+// TestPendingNotifiedSeq pins the IS-6 file contract: un-notified means
+// seq > notified_seq, and notified_seq never regresses.
+func TestPendingNotifiedSeq(t *testing.T) {
+	s := newPendingStore(t.TempDir())
+	pendingRecord(t, s, "Z", "rpc-1")
+	second := pendingRecord(t, s, "A", "rpc-2")
+	un, err := s.Unnotified()
+	if err != nil || len(un) != 2 || un[0].ID != "Z" || un[1].ID != "A" {
+		t.Fatalf("un-notified = %+v %v", un, err)
+	}
+	if changed, err := s.MarkNotified(1); err != nil || !changed {
+		t.Fatalf("first mark = %v %v", changed, err)
+	}
+	un, err = s.Unnotified()
+	if err != nil || len(un) != 1 || un[0].ID != "A" || un[0].Seq != second.Seq {
+		t.Fatalf("after mark = %+v %v", un, err)
+	}
+	if changed, err := s.MarkNotified(1); err != nil || changed {
+		t.Fatalf("notified_seq regressed: %v %v", changed, err)
+	}
+	if changed, err := s.MarkNotified(second.Seq); err != nil || !changed {
+		t.Fatalf("second mark = %v %v", changed, err)
+	}
+	if un, err = s.Unnotified(); err != nil || len(un) != 0 {
+		t.Fatalf("un-notified after the batch = %+v %v", un, err)
+	}
+	b, err := os.ReadFile(s.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var f pendingFile
+	if err := json.Unmarshal(b, &f); err != nil || f.NotifiedSeq != second.Seq || len(f.Entries) != 2 {
+		t.Fatalf("file = %s, %v", b, err)
+	}
+}
+
 func TestPendingOrderingAndFormat(t *testing.T) {
-	s := newPendingStore(t.TempDir(), "family")
+	s := newPendingStore(t.TempDir())
 	if es := pendingList(t, s); len(es) != 0 {
 		t.Fatal(es)
 	}
@@ -167,12 +203,12 @@ func TestPendingOrderingAndFormat(t *testing.T) {
 	if len(es) != 2 || es[0].ID != "Z" || es[1].ID != "A" {
 		t.Fatal(es)
 	}
-	b, err := os.ReadFile(filepath.Join(filepath.Dir(s.path), "rpc-pending-family.json"))
+	b, err := os.ReadFile(filepath.Join(filepath.Dir(s.path), "rpc-pending.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	var f pendingFile
-	if err := json.Unmarshal(b, &f); err != nil || f.Version != 1 || f.Seq != 2 {
+	if err := json.Unmarshal(b, &f); err != nil || f.Version != 1 || f.Seq != 2 || f.NotifiedSeq != 0 {
 		t.Fatalf("file format: %s, %v", b, err)
 	}
 	if _, err := time.Parse("2006-01-02T15:04:05.000Z", es[0].DoneAt); err != nil {

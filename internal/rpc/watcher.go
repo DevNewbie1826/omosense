@@ -32,29 +32,29 @@ type record struct {
 }
 
 type watcher struct {
-	profile, stateDir, socket string
-	all, first, ready         bool
-	sink                      core.Sink
-	seen                      map[string]record
-	listed                    map[string]bool
-	errs                      map[string]string
-	sleep                     func(context.Context, time.Duration) error
-	record                    func(durable string, ev rpcEvent)
-	handles                   map[string]sessionInfo
-	turns                     map[string]streamTurn
-	closed                    map[string]string
-	deferred                  map[string][]deferredDone
-	streamErrors              map[string]bool
-	streamUp, draining        bool
-	snapshotHeld              bool
-	streamEpoch               int
-	streamSeq                 uint64
-	queue                     *streamFIFO
+	folder, stateDir, socket string
+	all, first, ready        bool
+	sink                     core.Sink
+	seen                     map[string]record
+	listed                   map[string]bool
+	errs                     map[string]string
+	sleep                    func(context.Context, time.Duration) error
+	record                   func(durable string, ev rpcEvent)
+	handles                  map[string]sessionInfo
+	turns                    map[string]streamTurn
+	closed                   map[string]string
+	deferred                 map[string][]deferredDone
+	streamErrors             map[string]bool
+	streamUp, draining       bool
+	snapshotHeld             bool
+	streamEpoch              int
+	streamSeq                uint64
+	queue                    *streamFIFO
 }
 
 func newWatcher(c *core.Ctx, sink core.Sink) *watcher {
 	return &watcher{
-		profile: c.Profile.Name, stateDir: c.State, socket: socketPath(),
+		folder: configName(c), stateDir: c.State, socket: socketPath(),
 		all: watchAll(c), first: true, sink: sink, sleep: sleepFn,
 		seen: map[string]record{}, listed: map[string]bool{}, errs: map[string]string{},
 		handles: map[string]sessionInfo{}, turns: map[string]streamTurn{},
@@ -70,7 +70,7 @@ func (w *watcher) run(ctx context.Context) error {
 	if w.all {
 		mode = "all"
 	}
-	w.sink.Log(fmt.Sprintf("rpc watcher starting (profile %s, every 5s, watch %s, sock %s)", w.profile, mode, w.socket))
+	w.sink.Log(fmt.Sprintf("rpc watcher starting (every 5s, watch %s, sock %s)", mode, w.socket))
 	w.queue = newStreamFIFO()
 	readerDone := make(chan struct{})
 	go func() {
@@ -277,7 +277,19 @@ type rpcEvent struct {
 	Questions []string `json:"questions"`
 }
 
+// emit reports one lifecycle transition. A done is not printed: it is recorded
+// for the batch instead, so a session's monitor no longer wakes per completion
+// (IS-8).
 func (w *watcher) emit(event string, e entry, from *string, to string) {
+	if event == "done" {
+		ev := rpcEvent{event, e.info.Session, e.info.id(), e.info.Name, e.info.Cwd, e.thread, from, to, []string{}}
+		if e.info.Durable == "" {
+			w.deferred[e.info.Session] = append(w.deferred[e.info.Session], deferredDone{ev, nowFn()})
+		} else if w.record != nil {
+			w.record(e.info.Durable, ev)
+		}
+		return
+	}
 	questions := []string{}
 	if event == "blocked" {
 		for _, p := range e.state.Pending {
@@ -290,15 +302,7 @@ func (w *watcher) emit(event string, e entry, from *string, to string) {
 			}
 		}
 	}
-	ev := rpcEvent{event, e.info.Session, e.info.id(), e.info.Name, e.info.Cwd, e.thread, from, to, questions}
-	w.sink.Emit("RPC", ev)
-	if event == "done" {
-		if e.info.Durable == "" {
-			w.deferred[e.info.Session] = append(w.deferred[e.info.Session], deferredDone{ev, nowFn()})
-		} else if w.record != nil {
-			w.record(e.info.Durable, ev)
-		}
-	}
+	w.sink.Emit("RPC", rpcEvent{event, e.info.Session, e.info.id(), e.info.Name, e.info.Cwd, e.thread, from, to, questions})
 }
 
 func ptr(s string) *string { return &s }

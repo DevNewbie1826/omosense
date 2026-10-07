@@ -85,7 +85,7 @@ func TestCalendarOnceThenSeenKeys(t *testing.T) {
 	var buf bytes.Buffer
 	sink := core.NewOut(&buf)
 	dir := t.TempDir()
-	w, err := newWatcher(newTestCtx(dir, core.Profile{Name: "main", Mail: true}, sink), sink, true)
+	w, err := newWatcher(newTestCtx(dir, core.Profile{Mail: true}, sink), sink, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,7 +122,7 @@ func soonFires(t *testing.T, dir string, now time.Time) int {
 	t.Helper()
 	var buf bytes.Buffer
 	sink := core.NewOut(&buf)
-	w, err := newWatcher(newTestCtx(dir, core.Profile{Name: "main", Mail: true}, sink), sink, true)
+	w, err := newWatcher(newTestCtx(dir, core.Profile{Mail: true}, sink), sink, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,7 +167,7 @@ func TestMailSilentNoiseTrunc(t *testing.T) {
 	mk := func() *watcher {
 		t.Helper()
 		buf.Reset()
-		w, err := newWatcher(newTestCtx(dir, core.Profile{Name: "main", Mail: true}, sink), sink, true)
+		w, err := newWatcher(newTestCtx(dir, core.Profile{Mail: true}, sink), sink, true)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -217,7 +217,7 @@ func TestMailFieldOmission(t *testing.T) {
 	doc := "summary: 1 threads (inbox)\nitems:\n  - account: a@masked.example\n    id: ffeeddccbbaa0099\n    date: 1h ago\n"
 	var buf bytes.Buffer
 	sink := core.NewOut(&buf)
-	w, err := newWatcher(newTestCtx(t.TempDir(), core.Profile{Name: "main", Mail: true}, sink), sink, true)
+	w, err := newWatcher(newTestCtx(t.TempDir(), core.Profile{Mail: true}, sink), sink, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -262,7 +262,7 @@ func TestZeleFailureLogs(t *testing.T) {
 	long := strings.Repeat("에러", 150)
 	var buf bytes.Buffer
 	sink := core.NewOut(&buf)
-	w, err := newWatcher(newTestCtx(t.TempDir(), core.Profile{Name: "main", Mail: true}, sink), sink, true)
+	w, err := newWatcher(newTestCtx(t.TempDir(), core.Profile{Mail: true}, sink), sink, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -286,14 +286,14 @@ func TestZeleFailureLogs(t *testing.T) {
 func TestOnceReadOnly(t *testing.T) {
 	mustSeoul(t)
 	dir := t.TempDir()
-	path := filepath.Join(dir, "google-seen-main.json")
+	path := filepath.Join(dir, "google-seen.json")
 	seed := []byte(`{"mail:fixturemain@gmail.com:1a10300000000001":100,"cal:20261005_a3v3ietd9obqpnrv5hg4emhmvc@google.com@1002207600000":100}`)
 	if err := os.WriteFile(path, seed, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	var buf bytes.Buffer
 	sink := core.NewOut(&buf)
-	w, err := newWatcher(newTestCtx(dir, core.Profile{Name: "main", Mail: true}, sink), sink, false)
+	w, err := newWatcher(newTestCtx(dir, core.Profile{Mail: true}, sink), sink, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -314,7 +314,7 @@ func TestOnceReadOnly(t *testing.T) {
 		t.Errorf("seen file changed by --once: %q", after)
 	}
 	ents, _ := os.ReadDir(dir)
-	if len(ents) != 1 || ents[0].Name() != "google-seen-main.json" {
+	if len(ents) != 1 || ents[0].Name() != "google-seen.json" {
 		t.Errorf("state dir entries = %v, want only the seen file (no lock, no writes)", ents)
 	}
 }
@@ -326,7 +326,7 @@ func TestOnceFamilyNoMail(t *testing.T) {
 	var calls []string
 	var buf bytes.Buffer
 	sink := core.NewOut(&buf)
-	w, err := newWatcher(newTestCtx(t.TempDir(), core.Profile{Name: "family", Mail: false}, sink), sink, false)
+	w, err := newWatcher(newTestCtx(t.TempDir(), core.Profile{Mail: false}, sink), sink, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -354,7 +354,7 @@ func TestLoopTicks(t *testing.T) {
 	dir := t.TempDir()
 	var buf bytes.Buffer
 	sink := core.NewOut(&buf)
-	w, err := newWatcher(newTestCtx(dir, core.Profile{Name: "main", Mail: true}, sink), sink, true)
+	w, err := newWatcher(newTestCtx(dir, core.Profile{Mail: true}, sink), sink, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -385,7 +385,7 @@ func TestLoopTicks(t *testing.T) {
 		}
 	}
 	lines := linesOf(&buf)
-	if len(lines) == 0 || lines[0] != "LOG google watcher starting (profile main)" {
+	if len(lines) == 0 || lines[0] != "LOG google watcher starting" {
 		t.Errorf("first line = %v, want the starting LOG", lines)
 	}
 	if cals := len(linesWith(&buf, "CAL")); cals != 4 {
@@ -394,7 +394,7 @@ func TestLoopTicks(t *testing.T) {
 	if mails := len(linesWith(&buf, "MAIL")); mails != 0 {
 		t.Errorf("MAIL lines = %d, want 0 (firstRun seeds silently)", mails)
 	}
-	b, err := os.ReadFile(filepath.Join(dir, "google-seen-main.json"))
+	b, err := os.ReadFile(filepath.Join(dir, "google-seen.json"))
 	if err != nil {
 		t.Fatalf("seen file not written: %v", err)
 	}
@@ -427,7 +427,7 @@ func TestLoopZeleParseErrorSkipsIteration(t *testing.T) {
 	dir := t.TempDir()
 	var buf bytes.Buffer
 	sink := core.NewOut(&buf)
-	w, err := newWatcher(newTestCtx(dir, core.Profile{Name: "main", Mail: true}, sink), sink, true)
+	w, err := newWatcher(newTestCtx(dir, core.Profile{Mail: true}, sink), sink, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -453,13 +453,13 @@ func TestLoopZeleParseErrorSkipsIteration(t *testing.T) {
 		t.Fatalf("run: %v", err)
 	}
 	logs := linesWith(&buf, "LOG")
-	if len(logs) != 2 || logs[1] == "LOG google watcher starting (profile main)" {
+	if len(logs) != 2 || logs[1] == "LOG google watcher starting" {
 		t.Errorf("LOG lines = %q, want starting plus one parse-error line", logs)
 	}
 	if cals := len(linesWith(&buf, "CAL")); cals != 0 {
 		t.Errorf("CAL = %d, want 0", cals)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "google-seen-main.json")); err != nil {
+	if _, err := os.Stat(filepath.Join(dir, "google-seen.json")); err != nil {
 		t.Errorf("seen file missing after the recovered tick 1: %v", err)
 	}
 }
@@ -488,7 +488,7 @@ items:
 `)
 	var buf bytes.Buffer
 	sink := core.NewOut(&buf)
-	w, err := newWatcher(newTestCtx(t.TempDir(), core.Profile{Name: "main", Mail: true}, sink), sink, true)
+	w, err := newWatcher(newTestCtx(t.TempDir(), core.Profile{Mail: true}, sink), sink, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -517,7 +517,7 @@ items:
 	}
 }
 
-// TestCalendarFilter pins the profile.calendars allow-list: nil means
+// TestCalendarFilter pins the calendars allow-list: nil means
 // all calendars, a list passes only events whose calendar is in it.
 func TestCalendarFilter(t *testing.T) {
 	mustSeoul(t)
@@ -542,7 +542,7 @@ func TestCalendarFilter(t *testing.T) {
 	} {
 		var buf bytes.Buffer
 		sink := core.NewOut(&buf)
-		w, err := newWatcher(newTestCtx(t.TempDir(), core.Profile{Name: "main", Mail: true, Calendars: tc.list}, sink), sink, true)
+		w, err := newWatcher(newTestCtx(t.TempDir(), core.Profile{Mail: true, Calendars: tc.list}, sink), sink, true)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -564,29 +564,26 @@ func TestCalendarFilter(t *testing.T) {
 	}
 }
 
-// TestSourcesMetadata pins the daemon contract: one pausable google source
-// with the watch-google-<profile> lock and the legacy watch-google
-// fallback.
+// TestSourcesMetadata pins the source contract: one google source with the
+// watch-google lock and no legacy fallback name.
 func TestSourcesMetadata(t *testing.T) {
-	for _, prof := range []string{"main", "family"} {
-		srcs := Sources(&core.Ctx{Profile: core.Profile{Name: prof}})
-		if len(srcs) != 1 {
-			t.Fatalf("profile %s: Sources = %d, want 1", prof, len(srcs))
-		}
-		s := srcs[0]
-		if s.Name() != "google" {
-			t.Errorf("name = %q", s.Name())
-		}
-		if !reflect.DeepEqual(s.Prefixes(), []string{"CAL", "SOON", "MAIL"}) {
-			t.Errorf("prefixes = %v", s.Prefixes())
-		}
-		if s.AlwaysOn() {
-			t.Errorf("google source must be pausable (pause-while-idle)")
-		}
-		name, legacy := s.LockName()
-		if name != "watch-google-"+prof || legacy != "watch-google" {
-			t.Errorf("lock = %q/%q, want watch-google-%s/watch-google", name, legacy, prof)
-		}
+	srcs := Sources(&core.Ctx{Profile: core.Profile{}})
+	if len(srcs) != 1 {
+		t.Fatalf("Sources = %d, want 1", len(srcs))
+	}
+	s := srcs[0]
+	if s.Name() != "google" {
+		t.Errorf("name = %q", s.Name())
+	}
+	if !reflect.DeepEqual(s.Prefixes(), []string{"CAL", "SOON", "MAIL"}) {
+		t.Errorf("prefixes = %v", s.Prefixes())
+	}
+	if s.AlwaysOn() {
+		t.Errorf("google source must be pausable (pause-while-idle)")
+	}
+	name, legacy := s.LockName()
+	if name != "watch-google" || legacy != "" {
+		t.Errorf("lock = %q/%q, want watch-google with no legacy", name, legacy)
 	}
 }
 
@@ -605,9 +602,8 @@ func TestZeleMissingBinaryLogsLikeBun(t *testing.T) {
 	}
 }
 
-// TestRunOnceCompatReadOnly drives the real compat entry point: --once
-// under a family profile (mail:false) loads read-only, prints CAL only and
-// writes nothing.
+// TestRunOnceCompatReadOnly drives the real compat entry point: --once with
+// mail off loads read-only, prints CAL only and writes nothing.
 func TestRunOnceCompatReadOnly(t *testing.T) {
 	mustSeoul(t)
 	dir := t.TempDir()
@@ -615,18 +611,18 @@ func TestRunOnceCompatReadOnly(t *testing.T) {
 	if err := os.MkdirAll(state, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	cfg := []byte(`{"profiles":{"family":{"telegram":{"bots":["t"]},"discord":{},"mail":false}}}`)
+	cfg := []byte(`{"telegram":{"bot":"t"},"discord":{},"mail":false}`)
 	if err := os.WriteFile(filepath.Join(dir, "config.json"), cfg, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	seed := []byte(`{"mail:fixturemain@gmail.com:1a10300000000001":100}`)
-	seenPath := filepath.Join(state, "google-seen-family.json")
+	seenPath := filepath.Join(state, "google-seen.json")
 	if err := os.WriteFile(seenPath, seed, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("OMOSENSE_DIR", dir)
 	t.Setenv("OMOSENSE_STATE", state)
-	pa := core.ParseArgs([]string{"--profile", "family", "--once"})
+	pa := core.ParseArgs([]string{"--once"})
 	ctx, err := core.Load(pa, false)
 	if err != nil {
 		t.Fatal(err)
@@ -636,18 +632,18 @@ func TestRunOnceCompatReadOnly(t *testing.T) {
 	old := execZele
 	execZele = fakeZele(fixture(t, "cal.yaml"), fixture(t, "mail.yaml"), nil)
 	defer func() { execZele = old }()
-	if code := Run(ctx, []string{"--profile", "family", "--once"}); code != 0 {
+	if code := Run(ctx, []string{"--once"}); code != 0 {
 		t.Fatalf("Run --once exit = %d, want 0", code)
 	}
 	if cals := len(linesWith(&buf, "CAL")); cals != 4 {
 		t.Fatalf("CAL lines = %d, want 4:\n%s", cals, buf.String())
 	}
 	if mails := len(linesWith(&buf, "MAIL")); mails != 0 {
-		t.Errorf("MAIL lines = %d, want 0 (family has mail:false)", mails)
+		t.Errorf("MAIL lines = %d, want 0 (mail:false)", mails)
 	}
 	after, err := os.ReadFile(seenPath)
 	if err != nil || string(after) != string(seed) {
-		t.Errorf("family seen file changed by --once: %q", after)
+		t.Errorf("seen file changed by --once: %q", after)
 	}
 	ents, _ := os.ReadDir(state)
 	if len(ents) != 1 {

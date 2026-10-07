@@ -58,7 +58,7 @@ func newScheduler(c *core.Ctx, sink core.Sink) *scheduler {
 }
 
 func reminderFile(c *core.Ctx) string {
-	return filepath.Join(c.State, "reminders-"+c.Profile.Name+".json")
+	return filepath.Join(c.State, "reminders.json")
 }
 
 // CancelPending marks every pending reminder of c's profile with
@@ -66,7 +66,7 @@ func reminderFile(c *core.Ctx) string {
 // skipped, failed and cancelled are all missing or falsy. Unknown fields
 // and key order are preserved.
 //
-// The file is <State>/reminders-<profile>.json. A missing file returns
+// The file is <State>/reminders.json. A missing file returns
 // 0, nil. A parse error is returned and the file is left untouched. The
 // file is rewritten with marshalIndent2Array only when n > 0, where n is
 // the number of entries marked.
@@ -120,7 +120,7 @@ func CancelPending(c *core.Ctx, now time.Time) (int, error) {
 // error as "LOG remind <err>" (remind.ts try/catch), until ctx is
 // cancelled, which ends the loop with nil.
 func (s *scheduler) run(ctx context.Context) error {
-	s.sink.Log(fmt.Sprintf("reminder scheduler starting (profile %s)", s.c.Profile.Name))
+	s.sink.Log("reminder scheduler starting")
 	for {
 		if ctx.Err() != nil {
 			return nil
@@ -239,11 +239,11 @@ func entryLine(verb string, r *core.OMap) pendingLine {
 	return pendingLine{prefix: "REMIND", text: verb + " " + string(b)}
 }
 
-// sendViaSay execs "<self> say --profile <profile> <platform> send <json>"
-// with the target object plus text (remind.ts's argument list plus the
-// profile flag: say's default bot comes from the profile, so the child
-// must run under this scheduler's profile). It returns the exit code and
-// the captured stdout/stderr; only a failure to spawn is an error.
+// sendViaSay execs "<self> say <platform> send <json>" with the target
+// object plus text, in the scheduler's own folder: the child inherits
+// OMOSENSE_DIR/OMOSENSE_STATE so say reads the same config.json and resolves
+// the same default bot. It returns the exit code and the captured
+// stdout/stderr; only a failure to spawn is an error.
 func (s *scheduler) sendViaSay(ctx context.Context, r *core.OMap) (code int, out, errOut string, err error) {
 	body := core.NewOMap()
 	if t, _ := getOMap(r, "target"); t != nil {
@@ -267,7 +267,8 @@ func (s *scheduler) sendViaSay(ctx context.Context, r *core.OMap) (code int, out
 			return 0, "", "", err
 		}
 	}
-	cmd := core.SourceCommand(ctx, bin, "say", "--profile", s.c.Profile.Name, fieldStr(r, "platform"), "send", string(j))
+	cmd := core.SourceCommand(ctx, bin, "say", fieldStr(r, "platform"), "send", string(j))
+	cmd.Env = append(os.Environ(), "OMOSENSE_DIR="+s.c.Dir, "OMOSENSE_STATE="+s.c.State)
 	var ob, eb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &ob, &eb
 	if err := core.RunSource(cmd); err != nil {

@@ -1,7 +1,7 @@
 {
   "name": "omosense",
   "version": "0.0.2",
-  "description": "omosense - messenger/agent monitor daemon and CLI (prebuilt Go binaries for macOS and Linux)",
+  "description": "omosense - one foreground messenger/agent monitor per project folder, plus CLI (prebuilt Go binaries for macOS and Linux)",
   "license": "MIT",
   "repository": {
     "type": "git",

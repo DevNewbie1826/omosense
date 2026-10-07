@@ -46,7 +46,7 @@ npm view omosense@X.Y.Z version dist.attestations
 npx --yes omosense@X.Y.Z --help
 ```
 
-The first command should print the version and an attestations entry (the provenance). The second should print usage starting with `Usage: omosense <subcommand>` and exit 0.
+The first command should print the version and an attestations entry (the provenance). The second should print usage starting with `Usage: omosense [<subcommand> [flags]]` and exit 0.
 
 ## Troubleshooting
 

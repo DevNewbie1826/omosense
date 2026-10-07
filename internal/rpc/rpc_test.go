@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"syscall"
 	"testing"
@@ -32,6 +33,20 @@ func TestRPCProcess(t *testing.T) {
 		}
 	}
 	pa := core.ParseArgs(args)
+	// Test seam: the child process configures the batcher's quiet window and
+	// its poll so the real subprocess batch path runs without a five-minute
+	// wait and without depending on the 30s poll granularity.
+	if q := os.Getenv("OMOSENSE_RPC_TEST_QUIET"); q != "" {
+		d, err := time.ParseDuration(q)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "bad OMOSENSE_RPC_TEST_QUIET:", err)
+			os.Exit(1)
+		}
+		batchQuiet = d
+		if poll := d / 2; poll > time.Millisecond {
+			deliverPoll = poll
+		}
+	}
 	c, err := core.Load(pa, !pa.Flags["--once"])
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -75,21 +90,23 @@ func rpcProcess(t *testing.T, args ...string) *exec.Cmd {
 	return cmd
 }
 
+// rpcFolder is the run folder's base name.
+const rpcFolder = "proj"
+
 func integrationFixture(t *testing.T) (string, *fakeDelivery) {
 	t.Helper()
 	f := fakeDeliveryCLI(t)
-	dir := t.TempDir()
+	root := t.TempDir()
+	dir := filepath.Join(root, rpcFolder)
 	stateDir := filepath.Join(dir, "state")
-	if err := os.Mkdir(stateDir, 0o700); err != nil {
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	deliveryWrite(t, filepath.Join(dir, "config.json"), `{"profiles":{"main":{},"family":{}}}`)
-	deliveryWrite(t, filepath.Join(stateDir, "sessions.json"), `{"main":{"session_id":"MAINQA"},"family":{"session_id":"FAMILYQA"}}`)
-	t.Setenv("HOME", dir)
+	deliveryWrite(t, filepath.Join(dir, "config.json"), `{"telegram":{"bot":""}}`)
+	t.Setenv("HOME", root)
 	t.Setenv("OMOSENSE_DIR", dir)
 	t.Setenv("OMOSENSE_STATE", stateDir)
-	t.Setenv("OMOSENSE_RPC_SOCK", filepath.Join(dir, "absent.sock"))
-	t.Setenv("OMOSENSE_SOCK", filepath.Join(dir, "absent-daemon.sock"))
+	t.Setenv("OMOSENSE_RPC_SOCK", filepath.Join(root, "absent.sock"))
 	return stateDir, f
 }
 
@@ -119,13 +136,19 @@ func requireCommand(t *testing.T, want string, args ...string) {
 	}
 }
 
-// The observer is subscribed before starting the process. A delivered log is
-// emitted after the real shell exits and its result is committed to the store.
-func runCompletion(t *testing.T, profile string, source bool) (string, *fakeDelivery, []string) {
+// The observer and the subscription are in place before starting the process.
+// The batch is emitted after the real shell exits and its result is committed
+// to the store, and the done is never printed (IS-8).
+func runCompletion(t *testing.T, source bool) (string, *fakeDelivery, []string) {
 	t.Helper()
 	stateDir, f := integrationFixture(t)
+	deliveryWrite(t, filepath.Join(f.dir, "list"), fmt.Sprintf(`[{"thread_id":"%s","sessionId":"%s","alive":true}]`+"\n", rpcSubscriber, rpcSubscriber))
+	if err := writeSubscription(stateDir, newSubscription(rpcSubscriber, time.Now())); err != nil {
+		t.Fatal(err)
+	}
 	s := serveLiveStream(t, false)
-	cmd := rpcProcess(t, "--all", "--profile", profile)
+	cmd := rpcProcess(t, "--all")
+	cmd.Env = append(cmd.Env, "OMOSENSE_RPC_TEST_QUIET=50ms")
 	if source {
 		cmd.Env = append(cmd.Env, "OMOSENSE_RPC_TEST_SOURCE=1")
 	}
@@ -185,17 +208,17 @@ func runCompletion(t *testing.T, profile string, source bool) (string, *fakeDeli
 	write(map[string]any{"type": "agent_settled", "sessionId": "H"})
 	timer := time.NewTimer(runBound)
 	defer timer.Stop()
-delivered:
+batched:
 	for {
 		select {
 		case line := <-lines:
-			if line == "LOG rpc delivered A seq 1 attempt 1" {
-				break delivered
+			if strings.HasPrefix(line, "LOG rpc batch sent ") {
+				break batched
 			}
 		case <-scanned:
-			t.Fatal("watcher exited before delivery")
+			t.Fatal("watcher exited before the batch")
 		case <-timer.C:
-			t.Fatal("completion was not delivered")
+			t.Fatal("completion was not batched")
 		}
 	}
 	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
@@ -213,39 +236,42 @@ delivered:
 			if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "RPC ")), &ev); err != nil {
 				t.Fatal(err)
 			}
-			if ev.Event == "done" && ev.ID == "A" {
+			if ev.Event == "done" {
 				doneCount++
 			}
 		}
+		if strings.HasPrefix(line, "LOG rpc pending ") {
+			t.Fatalf("per-done LOG survived IS-8: %q", line)
+		}
 	}
-	entries := pendingList(t, newPendingStore(stateDir, profile))
+	entries := pendingList(t, newPendingStore(stateDir))
 	calls := f.calls(t)
-	if doneCount != 1 || len(entries) != 1 || entries[0].Attempts != 1 || len(calls) != 1 {
+	if doneCount != 0 || len(entries) != 1 || len(calls) != 2 {
 		t.Fatalf("done=%d entries=%+v calls=%q", doneCount, entries, calls)
 	}
-	call := calls[0]
-	target := "MAINQA"
-	if profile == "family" {
-		target = "FAMILYQA"
-	}
-	if len(call) != 8 || call[0] != "thread" || call[1] != "send" || call[2] != target ||
-		call[4] != "--all-scope" || call[5] != "--idempotency-key" ||
-		call[6] != "omosense-rpc-"+profile+"-A-1-1" || call[7] != "--json" {
+	call := calls[1]
+	if calls[0][1] != "list" || len(call) != 8 || call[0] != "thread" || call[1] != "send" ||
+		call[2] != rpcSubscriber || call[4] != "--all-scope" || call[5] != "--idempotency-key" ||
+		call[6] != "omosense-rpc-batch-1" || call[7] != "--json" {
 		t.Fatalf("send argv = %q", call)
 	}
-	if _, err := os.Stat(filepath.Join(stateDir, "watch-rpc-"+profile+".lock.json")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(stateDir, "watch-rpc.lock.json")); !os.IsNotExist(err) {
 		t.Fatalf("watch lock was not released: %v", err)
 	}
 	return stateDir, f, call
 }
 
+// rpcSubscriber is the session the subprocess batch is pushed to.
+const rpcSubscriber = "MAINQA"
+
 func TestRunCompletionDelivery(t *testing.T) {
 	// Given a real Run process and wire-level idle snapshots, When a short turn
-	// settles, Then it is pushed once and an offline ACK closes the pending loop.
+	// settles, Then it is recorded and batched once, and an offline ACK closes
+	// the pending loop.
 	for _, source := range []bool{false, true} {
-		t.Run(fmt.Sprintf("daemon_%t", source), func(t *testing.T) {
-			stateDir, _, _ := runCompletion(t, "main", source)
-			entries := pendingList(t, newPendingStore(stateDir, "main"))
+		t.Run(fmt.Sprintf("source_%t", source), func(t *testing.T) {
+			stateDir, _, _ := runCompletion(t, source)
+			entries := pendingList(t, newPendingStore(stateDir))
 			code, out, _ := runCommand(t, "pending")
 			if code != 0 || strings.Count(out, "PENDING ") != 1 {
 				t.Fatalf("pending exit=%d stdout=%q", code, out)
@@ -256,37 +282,65 @@ func TestRunCompletionDelivery(t *testing.T) {
 	}
 }
 
-func TestRunFamilyAck(t *testing.T) {
-	// Given a family delivery, When its machine-consumed command is run, Then
-	// family is cleared without creating or changing main's pending file.
-	stateDir, _, call := runCompletion(t, "family", false)
-	mainPath := filepath.Join(stateDir, "rpc-pending-main.json")
-	if _, err := os.Stat(mainPath); !os.IsNotExist(err) {
-		t.Fatalf("family watch touched main pending: %v", err)
+// TestRunAckCommandFromBatch runs the ACK command the batch text itself
+// carries: it must be valid verbatim (absolute env-pinned paths, no --profile)
+// and clear the entry (B1).
+func TestRunAckCommandFromBatch(t *testing.T) {
+	stateDir, _, call := runCompletion(t, false)
+	dir, state := os.Getenv("OMOSENSE_DIR"), os.Getenv("OMOSENSE_STATE")
+	m := regexp.MustCompile(`OMOSENSE_DIR='([^']*)' OMOSENSE_STATE='([^']*)' omosense rpc ack (\S+) (\d+)`).FindStringSubmatch(call[3])
+	if m == nil {
+		t.Fatalf("batch lacks the machine-consumed ACK command: %q", call[3])
 	}
-	mainStore := newPendingStore(stateDir, "main")
-	pendingRecord(t, mainStore, "A", "main-handle")
-	before, err := os.ReadFile(mainPath)
+	if m[1] != dir || m[2] != state {
+		t.Fatalf("ack command paths = %q %q, want %q %q", m[1], m[2], dir, state)
+	}
+	if strings.Contains(m[0], "--profile") {
+		t.Fatalf("ack command still names a profile: %q", m[0])
+	}
+	requireCommand(t, fmt.Sprintf("ACK {\"id\":\"A\",\"seq\":%s,\"result\":\"acked\"}\n", m[4]), "ack", m[3], m[4])
+	requireCommand(t, "", "pending")
+	if entries := pendingList(t, newPendingStore(stateDir)); len(entries) != 0 {
+		t.Fatalf("ack left entries pending: %+v", entries)
+	}
+}
+
+// TestRunSubscribeRoundTrip covers the IS-7 CLI: subscribe writes the file and
+// prints it, subscription prints it, unsubscribe removes it.
+func TestRunSubscribeRoundTrip(t *testing.T) {
+	stateDir, _ := integrationFixture(t)
+	code, out, stderr := runCommand(t, "subscribe", rpcSubscriber)
+	var sub subscription
+	if code != 0 || stderr != "" || !strings.HasPrefix(out, "SUB ") ||
+		json.Unmarshal([]byte(strings.TrimPrefix(out, "SUB ")), &sub) != nil ||
+		sub.Session != rpcSubscriber || sub.SubscribedAt == "" {
+		t.Fatalf("subscribe exit=%d stdout=%q stderr=%q", code, out, stderr)
+	}
+	b, err := os.ReadFile(subscriptionPath(stateDir))
+	if err != nil || json.Unmarshal(b, &sub) != nil || sub.Session != rpcSubscriber {
+		t.Fatalf("subscription file = %s %v", b, err)
+	}
+	requireCommand(t, out, "subscription")
+	requireCommand(t, "UNSUB {\"session\":\""+rpcSubscriber+"\"}\n", "unsubscribe")
+	if _, err := os.Stat(subscriptionPath(stateDir)); !os.IsNotExist(err) {
+		t.Fatalf("unsubscribe kept the file: %v", err)
+	}
+	requireCommand(t, "", "subscription")
+	requireCommand(t, "UNSUB {\"session\":null}\n", "unsubscribe")
+	names, err := os.ReadDir(stateDir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	start := strings.Index(call[3], "omosense rpc ack ")
-	if start < 0 {
-		t.Fatal("delivery lacks machine-consumed ACK command")
-	}
-	command := strings.SplitN(call[3][start:], "\n", 2)[0]
-	args := strings.Fields(command)[2:]
-	requireCommand(t, "ACK {\"id\":\"A\",\"seq\":1,\"result\":\"acked\"}\n", args...)
-	requireCommand(t, "", "pending", "--profile", "family")
-	after, err := os.ReadFile(mainPath)
-	if err != nil || !bytes.Equal(before, after) {
-		t.Fatalf("family ACK modified main: %s -> %s, %v", before, after, err)
+	for _, n := range names {
+		if strings.HasPrefix(n.Name(), ".rpc-subscription-") {
+			t.Fatalf("temp file left behind: %s", n.Name())
+		}
 	}
 }
 
 func TestRunMalformedAck(t *testing.T) {
 	stateDir, _ := integrationFixture(t)
-	store := newPendingStore(stateDir, "main")
+	store := newPendingStore(stateDir)
 	pendingRecord(t, store, "A", "H")
 	before, err := os.ReadFile(store.path)
 	if err != nil {
@@ -296,6 +350,8 @@ func TestRunMalformedAck(t *testing.T) {
 		{"ack"}, {"ack", ""}, {"ack", "A", "0"}, {"ack", "A", "-1"},
 		{"ack", "A", "1.5"}, {"ack", "A", "x"}, {"ack", "A", "0x1"}, {"ack", "A", "+1"},
 		{"ack", "A", "18446744073709551616"}, {"ack", "A", "1", "extra"}, {"pending", "extra"},
+		{"subscribe"}, {"subscribe", ""}, {"subscribe", "A", "extra"},
+		{"unsubscribe", "extra"}, {"subscription", "extra"},
 	} {
 		t.Run(strings.Join(args, "_"), func(t *testing.T) {
 			code, out, stderr := runCommand(t, args...)
@@ -303,8 +359,11 @@ func TestRunMalformedAck(t *testing.T) {
 			if code != 2 || out != "" || !strings.HasPrefix(stderr, "Usage:") || err != nil || !bytes.Equal(before, after) {
 				t.Fatalf("invalid args accepted or changed file: exit=%d out=%q stderr=%q file=%s err=%v", code, out, stderr, after, err)
 			}
-			if _, err := os.Stat(filepath.Join(stateDir, "watch-rpc-main.lock.json")); !os.IsNotExist(err) {
+			if _, err := os.Stat(filepath.Join(stateDir, "watch-rpc.lock.json")); !os.IsNotExist(err) {
 				t.Fatalf("invalid args took watch lock: %v", err)
+			}
+			if _, err := os.Stat(subscriptionPath(stateDir)); !os.IsNotExist(err) {
+				t.Fatalf("invalid args wrote a subscription: %v", err)
 			}
 		})
 	}
@@ -312,11 +371,11 @@ func TestRunMalformedAck(t *testing.T) {
 
 func TestRunOfflineCommands(t *testing.T) {
 	stateDir, _ := integrationFixture(t)
-	store := newPendingStore(stateDir, "main")
+	store := newPendingStore(stateDir)
 	pendingRecord(t, store, "Z", "H1")
 	pendingRecord(t, store, "A", "H2")
 	// A corrupt watch lock and absent sockets must not impede offline commands.
-	deliveryWrite(t, filepath.Join(stateDir, "watch-rpc-main.lock.json"), "invalid")
+	deliveryWrite(t, filepath.Join(stateDir, "watch-rpc.lock.json"), "invalid")
 	code, out, _ := runCommand(t, "pending")
 	var ids []string
 	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
@@ -345,7 +404,7 @@ func TestRunOfflineCommands(t *testing.T) {
 
 func TestRunOnceDoesNotDeliver(t *testing.T) {
 	stateDir, f := integrationFixture(t)
-	store := newPendingStore(stateDir, "main")
+	store := newPendingStore(stateDir)
 	pendingRecord(t, store, "A", "H")
 	before, err := os.ReadFile(store.path)
 	if err != nil {
@@ -358,7 +417,7 @@ func TestRunOnceDoesNotDeliver(t *testing.T) {
 		!bytes.Equal(before, after) || len(f.calls(t)) != 0 {
 		t.Fatalf("once side effects: exit=%d stdout=%q stderr=%q file=%s err=%v", code, out, stderr, after, err)
 	}
-	if _, err := os.Stat(filepath.Join(stateDir, "watch-rpc-main.lock.json")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(stateDir, "watch-rpc.lock.json")); !os.IsNotExist(err) {
 		t.Fatalf("once took lock: %v", err)
 	}
 }

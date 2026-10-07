@@ -154,7 +154,7 @@ func ready(t *testing.T, p *gatewayPeer, kind string) {
 }
 func startDiscord(t *testing.T, cfg *core.Ctx, cl *fakeClock) (*recordingSink, <-chan error, context.CancelFunc) {
 	t.Helper()
-	cfg.Profile.Discord.Bots = []string{"test"}
+	cfg.Profile.Discord.Bot = "test"
 	s := Sources(cfg)[1].(src)
 	s.clock = cl
 	// Reconnect is released explicitly by the test, never by timing luck.
@@ -231,9 +231,14 @@ func TestDiscordGatewayIdentifyRawEventsAndGuard(t *testing.T) {
 	t.Log("PASS: fake gateway identify, raw EVENT, bot skip and second-session guard; cleanup: source canceled and fake gateway closed")
 }
 
-func TestDiscordMultiBotSessionsAndEvents(t *testing.T) {
+// TestDiscordSingleBotSession pins the one-bot-per-session shape: the
+// configured discord.bot opens exactly one gateway session, identified with
+// its own token, and its ready LOG line and EVENTs carry that bot's name.
+// The previous two-sessions-per-platform shape is gone with the bots array
+// (owner decision: one bot belongs to one session).
+func TestDiscordSingleBotSession(t *testing.T) {
 	c := testCtx(t)
-	c.Profile.Discord.Bots = []string{"a", "b"}
+	c.Profile.Discord.Bot = "a"
 	writeDiscordCreds(t, `{"bots":{"a":{"token":"token-a"},"b":{"token":"token-b"}}}`)
 	peers, cleanup := fakeGateway(t)
 	t.Cleanup(cleanup)
@@ -251,41 +256,29 @@ func TestDiscordMultiBotSessionsAndEvents(t *testing.T) {
 			t.Error(err)
 		}
 	})
-	// Two concurrent gateway sessions, each identified by its own bot token.
-	peer := map[string]*gatewayPeer{}
-	for range 2 {
-		p := await(t, peers)
-		identify := p.packet(t, 2)
-		var data map[string]any
-		if err := json.Unmarshal(identify.Data, &data); err != nil {
-			t.Fatal(err)
-		}
-		token, _ := data["token"].(string)
-		bot := map[string]string{"token-a": "a", "token-b": "b"}[strings.TrimPrefix(token, "Bot ")]
-		if bot == "" {
-			t.Fatalf("unexpected identify token %q", token)
-		}
-		peer[bot] = p
+	// Exactly one gateway session, identified with the configured bot's token.
+	p := await(t, peers)
+	identify := p.packet(t, 2)
+	var data map[string]any
+	if err := json.Unmarshal(identify.Data, &data); err != nil {
+		t.Fatal(err)
 	}
-	if len(peer) != 2 {
-		t.Fatalf("sessions = %v, want one per bot", peer)
+	token, _ := data["token"].(string)
+	if got := strings.TrimPrefix(token, "Bot "); got != "token-a" {
+		t.Fatalf("identify token = %q, want the configured bot's token-a", token)
 	}
-	// Each session's ready LOG line names its own bot.
-	for _, bot := range []string{"a", "b"} {
-		ready(t, peer[bot], "READY")
-		if line := await(t, sink.signal); line.value != "discord "+bot+" ready as test-bot" {
-			t.Fatal(line)
-		}
+	// The session's ready LOG line names the configured bot.
+	ready(t, p, "READY")
+	if line := await(t, sink.signal); line.value != "discord a ready as test-bot" {
+		t.Fatal(line)
 	}
-	// Each session's messages carry their own bot name.
-	for _, bot := range []string{"a", "b"} {
-		peer[bot].write(t, map[string]any{"op": 0, "t": "MESSAGE_CREATE", "s": 2, "d": map[string]any{"id": "m-" + bot, "channel_id": "channel", "author": map[string]any{"id": "owner", "username": "u"}, "content": "hi-" + bot}})
-		ev := await(t, sink.signal).value.(map[string]any)
-		if ev["bot"] != bot || ev["message_id"] != "m-"+bot || ev["role"] != "owner" {
-			t.Fatalf("event %#v want bot %s", ev, bot)
-		}
+	// Its messages carry that bot's name.
+	p.write(t, map[string]any{"op": 0, "t": "MESSAGE_CREATE", "s": 2, "d": map[string]any{"id": "m-a", "channel_id": "channel", "author": map[string]any{"id": "owner", "username": "u"}, "content": "hi-a"}})
+	ev := await(t, sink.signal).value.(map[string]any)
+	if ev["bot"] != "a" || ev["message_id"] != "m-a" || ev["role"] != "owner" {
+		t.Fatalf("event %#v want bot a", ev)
 	}
-	t.Log("PASS: two bots -> two gateway sessions, ready LOG lines and EVENTs tagged with their bot; cleanup: source canceled, fake gateway closed")
+	t.Log("PASS: one configured bot -> one gateway session, ready LOG and EVENT tagged with it; cleanup: source canceled, fake gateway closed")
 }
 
 func writeDiscordCreds(t *testing.T, body string) {

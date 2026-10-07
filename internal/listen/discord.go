@@ -72,14 +72,14 @@ func (g *gatewaySocket) close() {
 // discord runs one gateway session per configured bot, concurrently; the
 // first failure cancels the rest, exactly like the telegram fan-out.
 func (s src) discord(ctx context.Context, sink core.Sink) error {
-	if len(s.cfg.Profile.Discord.Bots) == 0 {
-		return errors.New("discord source registered without bots")
+	if s.cfg.Profile.Discord.Bot == "" {
+		return errors.New("discord source registered without a bot")
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var wg sync.WaitGroup
-	errs := make(chan error, len(s.cfg.Profile.Discord.Bots))
-	for _, bot := range s.cfg.Profile.Discord.Bots {
+	errs := make(chan error, 1)
+	for _, bot := range platformBots(s.cfg.Profile.Discord.Bot) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()

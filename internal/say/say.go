@@ -14,17 +14,16 @@ import (
 )
 
 // Help is the usage text printed by omosense say --help.
-const Help = `Usage: omosense say <platform> <action> <json> [--profile P]
+const Help = `Usage: omosense say <platform> <action> <json>
 
 Sends a message through the platform bot API and prints the response
-JSON to stdout. --profile selects the profile (default main); its
-<platform>.bots list provides the default bot, its first entry. Pass
-{"bot":"name"} in the json to override the bot on either platform
-(the field is stripped and never sent to the API). A profile with no
-bots for the platform and no override exits 2.
+JSON to stdout. The folder's config.json provides the default bot
+(<platform>.bot). Pass {"bot":"name"} in the json to override the bot
+on either platform (the field is stripped and never sent to the API).
+With no configured bot and no override, say exits 2.
 `
 
-// Sources returns no daemon sources because say is a one-shot command.
+// Sources returns no host sources because say is a one-shot command.
 func Sources(*core.Ctx) []core.Source {
 	return nil
 }
@@ -58,7 +57,7 @@ func run(ctx *core.Ctx, stdout, stderr io.Writer) int {
 	}
 	bot := botFor(ctx, a, platform)
 	if bot == "" {
-		fmt.Fprintf(stderr, "no bot: profile %s has no %s bots; pass {\"bot\":\"name\"} to choose one\n", ctx.Profile.Name, platform)
+		fmt.Fprintf(stderr, "no bot: config.json has no %s.bot; pass {\"bot\":\"name\"} to choose one\n", platform)
 		return 2
 	}
 	if platform == "telegram" {
@@ -68,16 +67,15 @@ func run(ctx *core.Ctx, stdout, stderr io.Writer) int {
 }
 
 // botFor resolves the sending bot: the {"bot":"name"} override from the
-// args when present, else the profile's first bot for the platform. The
+// args when present, else the folder's configured bot for the platform. The
 // override key is deleted from the payload on both platforms so it never
-// reaches the API. An empty result means the profile has no bot for the
-// platform and none was overridden.
+// reaches the API. An empty result means no bot is configured and none was
+// overridden.
 func botFor(ctx *core.Ctx, a *core.OMap, platform string) string {
-	bots := ctx.Profile.Telegram.Bots
+	bot := ctx.Profile.Telegram.Bot
 	if platform == "discord" {
-		bots = ctx.Profile.Discord.Bots
+		bot = ctx.Profile.Discord.Bot
 	}
-	bot := firstBot(bots)
 	if v, ok := a.Get("bot"); ok {
 		if s, is := v.(string); is {
 			bot = s
@@ -85,15 +83,6 @@ func botFor(ctx *core.Ctx, a *core.OMap, platform string) string {
 	}
 	a.Delete("bot")
 	return bot
-}
-
-// firstBot returns the profile's default bot for a platform: the first
-// entry of its bots list, or "" when the list is empty.
-func firstBot(bots []string) string {
-	if len(bots) == 0 {
-		return ""
-	}
-	return bots[0]
 }
 
 func positionals(argv []string) (platform, action, raw string) {

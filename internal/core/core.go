@@ -1,7 +1,7 @@
 // Package core is the shared foundation of omosense: the run context and
-// profile loading, the single-instance lock, the stdout line grammar
+// flat config loading, the single-instance lock, the stdout line grammar
 // (Out/Sink), order-preserving JSON (OMap), and the Source interface that
-// both the compat subcommands and the resident daemon host.
+// both the compat subcommands and the session host use.
 //
 // The package is owned by the foundation node; every other package codes
 // against this API and must not modify it.
@@ -16,58 +16,58 @@ import (
 	"strings"
 )
 
-// Profile is the resolved run profile: one self-contained block of the
-// config.json profiles object.
+// Profile is the resolved flat config.json of the folder omosense runs in.
+// There is exactly one profile per folder: the profiles object is gone.
 type Profile struct {
-	Name      string
 	Telegram  PlatformCfg
 	Discord   PlatformCfg
 	RPC       RPCCfg
 	Tidy      TidyCfg
+	Herdr     HerdrCfg
 	Memory    string
 	Calendars *[]string // nil means all calendars
 	Mail      bool
 }
 
-// PlatformCfg is a platform section of one profile: the bots the profile
-// listens on and the role of every known sender id. Role names are data;
-// only "owner" is special in code, unknown ids resolve to "other".
+// PlatformCfg is a platform section: the single bot this folder listens on
+// and the role of every known sender id. Role names are data; only "owner"
+// is special in code, unknown ids resolve to "other".
 type PlatformCfg struct {
-	Bots  []string
+	Bot   string
 	Roles map[string]string
 }
 
-// RPCCfg is the rpc section of one profile.
+// RPCCfg is the rpc section.
 type RPCCfg struct {
 	Enabled bool
-	Session string // empty means the webchat sessions.json
 	All     bool
 }
 
-// TidyCfg is the tidy section of one profile.
+// TidyCfg is the tidy section.
 type TidyCfg struct {
 	Enabled     bool
 	LearnOthers bool
 	Exclude     []string
 }
 
-// Cfg is the parsed config.json: the raw document kept in order plus the
-// profiles object. parseCfg rejects legacy documents, so Profiles is never
-// nil in a successfully loaded config.
+// HerdrCfg is the herdr section. herdr is a default source: Enabled absent
+// means on, and only an explicit false turns it off.
+type HerdrCfg struct {
+	Enabled *bool
+}
+
+// On reports whether the herdr source runs: absent means yes.
+func (h HerdrCfg) On() bool { return h.Enabled == nil || *h.Enabled }
+
+// Cfg is the parsed config.json: the raw document kept in order. parseCfg
+// rejects profiles-shaped and legacy documents, so a loaded Cfg is always
+// the flat shape.
 type Cfg struct {
-	Raw      *OMap
-	Profiles *OMap // cfg.profiles
+	Raw *OMap
 }
 
-// UnknownProfileError reports a profile name that config.json does not define.
-type UnknownProfileError struct {
-	Name string
-}
-
-func (e UnknownProfileError) Error() string { return "unknown profile " + e.Name }
-
-// Ctx is the per-run context: directories, config, the resolved profile,
-// parsed flags, positional args, and the stdout writer.
+// Ctx is the per-run context: directories, config, the resolved flat
+// profile, parsed flags, positional args, and the stdout writer.
 type Ctx struct {
 	Dir     string
 	State   string
@@ -78,8 +78,8 @@ type Ctx struct {
 	Out     *Out
 }
 
-// Sink is where a Source emits its stdout grammar lines. The compat host
-// passes the process Out; the daemon passes a client-routing sink.
+// Sink is where a Source emits its stdout grammar lines. Both the compat
+// subcommands and the session host pass the process Out.
 type Sink interface {
 	// Emit writes "PREFIX <json>\n" with the payload JSON-encoded without
 	// HTML escaping.
@@ -92,7 +92,7 @@ type Sink interface {
 }
 
 // Source is one monitor hosted either by its compat subcommand or by the
-// resident daemon. Every source may also emit LOG lines in addition to its
+// session host. Every source may also emit LOG lines in addition to its
 // Prefixes.
 type Source interface {
 	Name() string
@@ -104,29 +104,27 @@ type Source interface {
 
 // ParsedArgs is the result of ParseArgs.
 type ParsedArgs struct {
-	Profile string
-	Flags   map[string]bool
-	Rest    []string
+	// ProfileSet reports that --profile or --profile=NAME appeared. The flag
+	// was removed with the profiles object; callers reject it loudly so a
+	// stale caller never silently runs against another folder's config.
+	ProfileSet bool
+	Flags      map[string]bool
+	Rest       []string
 }
 
-// ParseArgs mirrors profile.ts argv handling: --profile NAME and
-// --profile=NAME set the profile (default "main"; a trailing --profile
-// yields the empty profile); every other --x becomes a value-less flag;
-// remaining args are positional.
+// ParseArgs splits argv: --profile NAME and --profile=NAME are consumed and
+// recorded in ProfileSet (the value is discarded), every other --x becomes
+// a value-less flag, and remaining args are positional.
 func ParseArgs(args []string) ParsedArgs {
-	pa := ParsedArgs{Profile: "main", Flags: map[string]bool{}}
+	pa := ParsedArgs{Flags: map[string]bool{}}
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		switch {
 		case arg == "--profile":
+			pa.ProfileSet = true
 			i++
-			if i < len(args) {
-				pa.Profile = args[i]
-			} else {
-				pa.Profile = ""
-			}
 		case strings.HasPrefix(arg, "--profile="):
-			pa.Profile = strings.TrimPrefix(arg, "--profile=")
+			pa.ProfileSet = true
 		case strings.HasPrefix(arg, "--"):
 			pa.Flags[arg] = true
 		default:
@@ -137,20 +135,21 @@ func ParseArgs(args []string) ParsedArgs {
 }
 
 // EnvDirs resolves the run directory and state directory: $OMOSENSE_DIR
-// else ~/.omosense, and $OMOSENSE_STATE else <dir>/state. A stale OMOMEOW_*
-// variable set without its OMOSENSE_ counterpart is an error naming the
-// replacement, so a stale environment never silently runs elsewhere.
+// else <cwd>/.omosense, and $OMOSENSE_STATE else <dir>/state. A stale
+// OMOMEOW_* variable set without its OMOSENSE_ counterpart is an error
+// naming the replacement, so a stale environment never silently runs
+// elsewhere.
 func EnvDirs() (dir, state string, err error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", "", fmt.Errorf("home dir: %w", err)
-	}
 	dir = os.Getenv("OMOSENSE_DIR")
 	if dir == "" {
 		if os.Getenv("OMOMEOW_DIR") != "" {
 			return "", "", errors.New("OMOMEOW_DIR is no longer read; set OMOSENSE_DIR")
 		}
-		dir = filepath.Join(home, ".omosense")
+		cwd, err := os.Getwd()
+		if err != nil {
+			return "", "", fmt.Errorf("cwd: %w", err)
+		}
+		dir = filepath.Join(cwd, ".omosense")
 	}
 	state = os.Getenv("OMOSENSE_STATE")
 	if state == "" {
@@ -162,11 +161,10 @@ func EnvDirs() (dir, state string, err error) {
 	return dir, state, nil
 }
 
-// Load resolves the run directories (see EnvDirs), reads config.json,
-// resolves the requested profile, and builds the Ctx with an stdout Out.
-// When writable is true the state dir is created (main loops and lock
-// holders); read-only paths must pass false and leave an absent state dir
-// absent.
+// Load resolves the run directories (see EnvDirs), reads the flat
+// config.json, parses it, and builds the Ctx with a stdout Out. When
+// writable is true the state dir is created (host loops and lock holders);
+// read-only paths must pass false and leave an absent state dir absent.
 func Load(pa ParsedArgs, writable bool) (*Ctx, error) {
 	dir, state, err := EnvDirs()
 	if err != nil {
@@ -188,7 +186,7 @@ func Load(pa ParsedArgs, writable bool) (*Ctx, error) {
 	if err != nil {
 		return nil, err
 	}
-	prof, err := cfg.Resolve(pa.Profile)
+	prof, err := parseProfile(om)
 	if err != nil {
 		return nil, err
 	}
@@ -208,96 +206,94 @@ func Load(pa ParsedArgs, writable bool) (*Ctx, error) {
 	}, nil
 }
 
-// legacyKeys are the pre-generalize top-level config sections. A config
-// still carrying one is from the old shape and must fail loudly instead of
-// silently running without bots.
-var legacyKeys = []string{"telegram", "discord", "owner", "wife", "rpc"}
-
-// parseCfg validates the document shape: no legacy top-level keys, and a
-// profiles object. Per-profile validation happens in Resolve.
+// parseCfg rejects the shapes that would otherwise load silently without
+// the bot or source the folder expects: the profiles object, the legacy
+// owner/wife keys, and the bots array of the previous per-profile shape.
+// A present key of the wrong shape is caught by parseProfile, which names
+// the exact key path.
 func parseCfg(om *OMap) (*Cfg, error) {
-	for _, k := range legacyKeys {
+	if _, ok := om.Get("profiles"); ok {
+		return nil, errors.New(`config.json: "profiles" is no longer supported; config.json is flat now (telegram, discord, rpc, tidy, herdr, memory, calendars, mail)`)
+	}
+	for _, k := range []string{"owner", "wife"} {
 		if _, ok := om.Get(k); ok {
-			return nil, fmt.Errorf("config.json: legacy top-level key %q is no longer supported; move it into profiles.<name> (see new profile shape)", k)
+			return nil, fmt.Errorf("config.json: legacy top-level key %q is no longer supported; config.json is flat now (telegram, discord, rpc, tidy, herdr, memory, calendars, mail)", k)
 		}
 	}
-	v, ok := om.Get("profiles")
-	if !ok || v == nil {
-		return nil, errors.New(`config.json: "profiles" is required`)
+	if _, ok := om.Get("bots"); ok {
+		return nil, errors.New(`config.json: "bots" is no longer supported; telegram.bot and discord.bot hold one bot name each`)
 	}
-	profiles, isObj := v.(*OMap)
-	if !isObj {
-		return nil, errors.New(`config.json: "profiles" must be an object`)
-	}
-	return &Cfg{Raw: om, Profiles: profiles}, nil
+	return &Cfg{Raw: om}, nil
 }
 
-// Resolve returns the named profile. Every profile key is optional, but a
-// present key must have the declared shape; violations name
-// profiles.<name>.<key> so the offending entry is located at a glance. An
-// unknown name yields UnknownProfileError.
-func (c *Cfg) Resolve(name string) (Profile, error) {
-	v, ok := c.Profiles.Get(name)
-	if !ok {
-		return Profile{}, UnknownProfileError{Name: name}
-	}
-	p := Profile{Name: name}
-	m, isObj := v.(*OMap)
-	if !isObj {
-		return Profile{}, fmt.Errorf("config.json: profiles.%s must be an object", name)
-	}
+// parseProfile validates the flat document. Every key is optional, but a
+// present key must have the declared shape; violations name the key path
+// (for example "config.json: telegram.bot must be a string") so the
+// offending entry is located at a glance.
+func parseProfile(om *OMap) (Profile, error) {
+	var p Profile
 	var err error
-	if p.Telegram, err = platformCfg(m, "telegram", name); err != nil {
+	if p.Telegram, err = platformCfg(om, "telegram"); err != nil {
 		return Profile{}, err
 	}
-	if p.Discord, err = platformCfg(m, "discord", name); err != nil {
+	if p.Discord, err = platformCfg(om, "discord"); err != nil {
 		return Profile{}, err
 	}
-	if p.RPC, err = sectionCfg(m, "rpc", name, func(section *OMap) (RPCCfg, error) {
+	if p.RPC, err = sectionCfg(om, "rpc", func(section *OMap) (RPCCfg, error) {
 		var out RPCCfg
 		var err error
-		if out.Enabled, err = boolKey(section, "enabled", name+".rpc.enabled"); err != nil {
+		if out.Enabled, err = boolKey(section, "enabled", "rpc.enabled"); err != nil {
 			return out, err
 		}
-		if out.Session, err = strKey(section, "session", name+".rpc.session"); err != nil {
-			return out, err
-		}
-		if out.All, err = boolKey(section, "all", name+".rpc.all"); err != nil {
+		if out.All, err = boolKey(section, "all", "rpc.all"); err != nil {
 			return out, err
 		}
 		return out, nil
 	}); err != nil {
 		return Profile{}, err
 	}
-	if p.Tidy, err = sectionCfg(m, "tidy", name, func(section *OMap) (TidyCfg, error) {
+	if p.Tidy, err = sectionCfg(om, "tidy", func(section *OMap) (TidyCfg, error) {
 		var out TidyCfg
 		var err error
-		if out.Enabled, err = boolKey(section, "enabled", name+".tidy.enabled"); err != nil {
+		if out.Enabled, err = boolKey(section, "enabled", "tidy.enabled"); err != nil {
 			return out, err
 		}
-		if out.LearnOthers, err = boolKey(section, "learnOthers", name+".tidy.learnOthers"); err != nil {
+		if out.LearnOthers, err = boolKey(section, "learnOthers", "tidy.learnOthers"); err != nil {
 			return out, err
 		}
-		if out.Exclude, err = strsKey(section, "exclude", name+".tidy.exclude"); err != nil {
+		if out.Exclude, err = strsKey(section, "exclude", "tidy.exclude"); err != nil {
 			return out, err
 		}
 		return out, nil
 	}); err != nil {
 		return Profile{}, err
 	}
-	if p.Memory, err = strKey(m, "memory", name+".memory"); err != nil {
+	if p.Herdr, err = sectionCfg(om, "herdr", func(section *OMap) (HerdrCfg, error) {
+		var out HerdrCfg
+		enabled, err := boolPtrKey(section, "enabled", "herdr.enabled")
+		if err != nil {
+			return out, err
+		}
+		out.Enabled = enabled
+		return out, nil
+	}); err != nil {
 		return Profile{}, err
 	}
-	if p.Calendars, err = calendarsCfg(m, name); err != nil {
+	if p.Memory, err = strKey(om, "memory", "memory"); err != nil {
 		return Profile{}, err
 	}
-	if p.Mail, err = boolKey(m, "mail", name+".mail"); err != nil {
+	if p.Calendars, err = calendarsCfg(om); err != nil {
+		return Profile{}, err
+	}
+	if p.Mail, err = boolKey(om, "mail", "mail"); err != nil {
 		return Profile{}, err
 	}
 	return p, nil
 }
 
-func platformCfg(m *OMap, platform, profile string) (PlatformCfg, error) {
+// platformCfg parses one platform section. A bots array is the previous
+// per-profile shape and fails loudly instead of loading with no bot.
+func platformCfg(m *OMap, platform string) (PlatformCfg, error) {
 	var out PlatformCfg
 	v, ok := m.Get(platform)
 	if !ok || v == nil {
@@ -305,10 +301,13 @@ func platformCfg(m *OMap, platform, profile string) (PlatformCfg, error) {
 	}
 	section, isObj := v.(*OMap)
 	if !isObj {
-		return out, fmt.Errorf("config.json: profiles.%s.%s must be an object", profile, platform)
+		return out, fmt.Errorf("config.json: %s must be an object", platform)
+	}
+	if _, ok := section.Get("bots"); ok {
+		return out, fmt.Errorf("config.json: %s.bots is no longer supported; %s.bot holds one bot name", platform, platform)
 	}
 	var err error
-	if out.Bots, err = strsKey(section, "bots", profile+"."+platform+".bots"); err != nil {
+	if out.Bot, err = strKey(section, "bot", platform+".bot"); err != nil {
 		return out, err
 	}
 	r, ok := section.Get("roles")
@@ -317,21 +316,21 @@ func platformCfg(m *OMap, platform, profile string) (PlatformCfg, error) {
 	}
 	roles, isObj := r.(*OMap)
 	if !isObj {
-		return out, fmt.Errorf("config.json: profiles.%s.%s.roles must be an object with string values", profile, platform)
+		return out, fmt.Errorf("config.json: %s.roles must be an object with string values", platform)
 	}
 	out.Roles = make(map[string]string, roles.Len())
 	for _, id := range roles.Keys() {
 		role, _ := roles.Get(id)
 		s, isStr := role.(string)
 		if !isStr {
-			return out, fmt.Errorf("config.json: profiles.%s.%s.roles must be an object with string values", profile, platform)
+			return out, fmt.Errorf("config.json: %s.roles must be an object with string values", platform)
 		}
 		out.Roles[id] = s
 	}
 	return out, nil
 }
 
-func sectionCfg[T any](m *OMap, key, profile string, parse func(*OMap) (T, error)) (T, error) {
+func sectionCfg[T any](m *OMap, key string, parse func(*OMap) (T, error)) (T, error) {
 	var zero T
 	v, ok := m.Get(key)
 	if !ok || v == nil {
@@ -339,17 +338,17 @@ func sectionCfg[T any](m *OMap, key, profile string, parse func(*OMap) (T, error
 	}
 	section, isObj := v.(*OMap)
 	if !isObj {
-		return zero, fmt.Errorf("config.json: profiles.%s.%s must be an object", profile, key)
+		return zero, fmt.Errorf("config.json: %s must be an object", key)
 	}
 	return parse(section)
 }
 
-func calendarsCfg(m *OMap, profile string) (*[]string, error) {
+func calendarsCfg(m *OMap) (*[]string, error) {
 	v, ok := m.Get("calendars")
 	if !ok || v == nil {
 		return nil, nil // nil means all calendars
 	}
-	s, err := strsKey(m, "calendars", profile+".calendars")
+	s, err := strsKey(m, "calendars", "calendars")
 	if err != nil {
 		return nil, err
 	}
@@ -363,9 +362,23 @@ func boolKey(m *OMap, key, path string) (bool, error) {
 	}
 	b, isBool := v.(bool)
 	if !isBool {
-		return false, fmt.Errorf("config.json: profiles.%s must be a boolean", path)
+		return false, fmt.Errorf("config.json: %s must be a boolean", path)
 	}
 	return b, nil
+}
+
+// boolPtrKey is boolKey for a tri-state key: absent and null both yield a
+// nil pointer so the caller can tell "not set" from an explicit false.
+func boolPtrKey(m *OMap, key, path string) (*bool, error) {
+	v, ok := m.Get(key)
+	if !ok || v == nil {
+		return nil, nil
+	}
+	b, isBool := v.(bool)
+	if !isBool {
+		return nil, fmt.Errorf("config.json: %s must be a boolean", path)
+	}
+	return &b, nil
 }
 
 func strKey(m *OMap, key, path string) (string, error) {
@@ -375,7 +388,7 @@ func strKey(m *OMap, key, path string) (string, error) {
 	}
 	s, isStr := v.(string)
 	if !isStr {
-		return "", fmt.Errorf("config.json: profiles.%s must be a string", path)
+		return "", fmt.Errorf("config.json: %s must be a string", path)
 	}
 	return s, nil
 }
@@ -387,13 +400,13 @@ func strsKey(m *OMap, key, path string) ([]string, error) {
 	}
 	arr, isArr := v.([]any)
 	if !isArr {
-		return nil, fmt.Errorf("config.json: profiles.%s must be an array of strings", path)
+		return nil, fmt.Errorf("config.json: %s must be an array of strings", path)
 	}
 	out := make([]string, 0, len(arr))
 	for _, e := range arr {
 		s, isStr := e.(string)
 		if !isStr {
-			return nil, fmt.Errorf("config.json: profiles.%s must be an array of strings", path)
+			return nil, fmt.Errorf("config.json: %s must be an array of strings", path)
 		}
 		out = append(out, s)
 	}

@@ -323,9 +323,13 @@ func TestTelegramFailureThresholdAndRecovery(t *testing.T) {
 	}
 }
 
-func TestTelegramBotsPollIndependently(t *testing.T) {
+// TestTelegramBotPollsContinuously pins the single configured bot's poller:
+// it keeps issuing getUpdates calls until the source is cancelled. The
+// previous two-poller-per-platform shape is gone with the bots array (one
+// bot per session).
+func TestTelegramBotPollsContinuously(t *testing.T) {
 	c := testCtx(t)
-	c.Profile.Telegram.Bots = []string{"test", "test"}
+	c.Profile.Telegram.Bot = "test"
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	calls := make(chan struct{}, 2)
@@ -334,7 +338,6 @@ func TestTelegramBotsPollIndependently(t *testing.T) {
 	t.Setenv("OMOSENSE_TELEGRAM_API", server.URL)
 	done := make(chan error, 1)
 	go func() { done <- Sources(c)[0].Run(ctx, newSink()) }()
-	await(t, calls)
 	await(t, calls)
 	cancel()
 	if err := await(t, done); err != nil {
