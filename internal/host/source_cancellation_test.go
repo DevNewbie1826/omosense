@@ -213,7 +213,7 @@ func TestSourceCommandCancellation(t *testing.T) {
 				processes = append(processes, b)
 				t.Logf("BLOCKED %s %s pid=%d; gate will not be released", tc.command, b.kind, b.pid)
 			}
-			startup := awaitLine(t, lines)
+			startup := awaitStartupLine(t, lines)
 			if !strings.Contains(startup, "sources=") || !strings.Contains(startup, tc.source) {
 				t.Fatalf("startup LOG %q does not name the %s source", startup, tc.source)
 			}
@@ -310,14 +310,22 @@ func sandboxEnv(t *testing.T, home string) []string {
 	return append(env, "HOME="+home)
 }
 
-func awaitLine(t *testing.T, lines <-chan string) string {
+// awaitStartupLine waits for the host's startup LOG, skipping any LOG lines
+// that legitimately precede it (the memory-repo check logs before the host
+// starts).
+func awaitStartupLine(t *testing.T, lines <-chan string) string {
 	t.Helper()
-	select {
-	case line := <-lines:
-		return line
-	case <-time.After(30 * time.Second):
-		t.Fatal("host printed no startup line")
-		return ""
+	deadline := time.After(30 * time.Second)
+	for {
+		select {
+		case line := <-lines:
+			if strings.Contains(line, "sources=") {
+				return line
+			}
+		case <-deadline:
+			t.Fatal("host printed no startup line")
+			return ""
+		}
 	}
 }
 
