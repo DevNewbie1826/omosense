@@ -111,11 +111,11 @@ A file missing in the old dir just means that profile never wrote it. Then confi
 
 ## 4. Start it and subscribe
 
-Arm one monitor in the session for the folder. Use `exec` so a stop signal reaches the binary, and keep `LOG` out of the filter. One monitor now carries every prefix, and a monitor is capped at 200 events per 24 hours:
+Arm one monitor in the session for the folder. Use `exec` so a stop signal reaches the binary, and keep `LOG` out of the filter except the four alert lines (see the README). One monitor now carries every prefix, and a monitor is capped at 200 events per 24 hours:
 
 ```
 command: cd /path/to/session-folder && exec omosense
-filter:  ^(EVENT|CAL|SOON|MAIL|REMIND|HERDR|RPC|TIDY) 
+filter:  ^(EVENT|CAL|SOON|MAIL|REMIND|HERDR|RPC|TIDY) |^LOG (silent-session|dead-pane|source-stopped|state-file-large) 
 ```
 
 This replaces all of that profile's old `omosense attach <source> --profile <p>` monitors.

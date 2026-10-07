@@ -41,9 +41,11 @@ Bare `omosense` (no subcommand) is the session host. It runs until it gets SIGIN
 
 Every source can also print `LOG` lines. On start the host prints one line, `LOG omosense host starting dir=<dir> sources=<names>`, so you can see what it picked up.
 
+Before any source starts, the host checks `memory`. When it's set and `<agents>/<memory>/repo` isn't a directory (agents is `$OMO_MEMORY_AGENTS`, else `~/.omo/memory/agents`), the host exits 1 with `omosense: config.json: memory "<id>": repo not found at <path>` and takes no lock. With `memory` unset and `tidy.enabled` on, it prints `LOG memory is not set; tidy has no own memory repo to skip` once and starts normally. Subcommands skip this check.
+
 herdr is on by default because for a setup without rpc it's the main signal. Turn it off with `"herdr": {"enabled": false}`.
 
-A source that crashes is restarted after a backoff that starts at 5 seconds and doubles up to 5 minutes, with `LOG omosense source <name> crashed: <err>`. If another live process already holds that source's lock (for example a second `omosense` in the same folder), the source logs `ALREADY_RUNNING ...` and retries every 30 seconds.
+A source that crashes logs `LOG omosense source <name> crashed: <err>` and is restarted after a backoff that starts at 5 seconds and doubles up to 5 minutes. It doesn't restart forever. On the sixth consecutive crash the host stops that source for good with one `LOG source-stopped {"source":<name>,"crashes":6,"last_error":<err>}` line and releases its lock. The other sources keep running. A source that ran 5 minutes or more before crashing starts the count over at one. Lock errors and `ALREADY_RUNNING` never count as crashes. If another live process already holds that source's lock (for example a second `omosense` in the same folder), the source logs `ALREADY_RUNNING ...` and retries every 30 seconds.
 
 ## Config
 
@@ -62,6 +64,19 @@ The config is flat. Every key is optional.
 }
 ```
 
+Newer optional keys, shown with example values:
+
+```json
+{
+  "verify":        { "command": ["/path/to/check-done.sh"], "timeoutSec": 60 },
+  "rpc":           { "enabled": true, "verify": true, "labels": { "task": "task", "ack": "ack" } },
+  "herdr":         { "verify": false, "agentPattern": "senpi|omo|claude|codex|opencode|(^|/)pi( |$)" },
+  "silentMinutes": 30,
+  "transcriber":   ["whisper-cli", "{audio}"],
+  "guard":         { "stateFileBytes": 16777216 }
+}
+```
+
 | Key | Meaning |
 |---|---|
 | `telegram.bot`, `discord.bot` | One bot name per platform, looked up in `~/.config/agent-messenger/<platform>bot-credentials.json` (`telegrambot-credentials.json`, `discordbot-credentials.json`). Unset means that listener doesn't run. |
@@ -72,6 +87,15 @@ The config is flat. Every key is optional.
 | `memory` | This agent's memory id. |
 | `calendars` | Calendars google watches. Absent means all of them. |
 | `mail` | Whether google also watches mail. |
+| `verify.command` | Done-verification hook, an argv array. Unset means no hook. See [Done verification](#done-verification). |
+| `verify.timeoutSec` | Hook timeout in seconds. Default `60`. |
+| `rpc.verify` | Run the hook for rpc dones. Absent means on (when `verify.command` is set); only `false` turns it off. |
+| `rpc.labels` | Overrides for the rpc batch labels. See [rpc done notifications](#rpc-done-notifications). |
+| `herdr.verify` | Run the hook for herdr working to idle/done lines. Default `false`. |
+| `herdr.agentPattern` | Go regular expression a pane's foreground command line must match to count as alive. Default `senpi\|omo\|claude\|codex\|opencode\|(^\|/)pi( \|$)`. An invalid pattern fails config load. |
+| `silentMinutes` | Minutes a working session may go without change before `silent-session`. Default `30`. |
+| `transcriber` | Voice transcriber argv. Every `{audio}` is replaced by the audio file path, or the path is appended when no element has `{audio}`. Its trimmed stdout is the transcript. Unset means the built-in ffmpeg and mlx_whisper pipeline. A failure shows up as `transcribe_error` text starting with `transcriber:`. |
+| `guard.stateFileBytes` | Size above which a state file gets `state-file-large`. Default `16777216` (16 MiB). |
 
 One bot belongs to one session. If two sessions need Telegram, give each its own bot.
 
@@ -94,7 +118,8 @@ The state dir holds:
 | `google-seen.json` | Calendar and mail items already reported. |
 | `rpc-pending.json` (+ `rpc-pending.lock`) | rpc completions not yet acked. |
 | `rpc-subscription.json` | The session that receives rpc done batches. |
-| `threads.json` | rpc session registrations. |
+| `threads.json` | Job thread registry read by herdr and rpc. Written by `omosense thread`. |
+| `threads.lock` | Lock guarding `threads.json` writes. |
 | `sessions.json` | Response session registration. |
 | `memory-tidy.json` | Tidy watermark. |
 | `tg-offset-<bot>` | Telegram fetch offset for that bot. |
@@ -108,12 +133,57 @@ Messages that arrive while the session (and its omosense) is off aren't received
 
 ## Watching it from an agent session
 
-Arm one monitor on `omosense` in the project folder. The command is `exec omosense` so a stop signal reaches the binary. Filter out `LOG` so housekeeping lines don't spend the monitor's event budget:
+Arm one monitor on `omosense` in the project folder. The command is `exec omosense` so a stop signal reaches the binary. Most `LOG` lines are housekeeping, so keep them out of the monitor's event budget, but let the four alert lines through:
 
 ```
 command: cd ~/work/my-agent && exec omosense
-filter:  ^(EVENT|CAL|SOON|MAIL|REMIND|HERDR|RPC|TIDY) 
+filter:  ^(EVENT|CAL|SOON|MAIL|REMIND|HERDR|RPC|TIDY) |^LOG (silent-session|dead-pane|source-stopped|state-file-large) 
 ```
+
+The alert lines:
+
+| Line | When | JSON fields |
+|---|---|---|
+| `LOG dead-pane {json}` | A registered pane is gone from `herdr pane list`, or no foreground process matches `herdr.agentPattern`. Checked once a minute, printed once until the pane is alive again. | `machine`, `pane`, `thread`, `reason` (`pane gone` or `no agent process`), `foreground`, `pattern` |
+| `LOG silent-session {json}` | A registered session stays `working` with no status change and no output growth for `silentMinutes`. Printed once until something changes. | rpc: `source`, `session`, `id`, `thread`, `since`, `minutes`, `messageCount`. herdr: `source`, `machine`, `pane`, `thread`, `since`, `minutes`, `signal` |
+| `LOG source-stopped {json}` | A source hit six consecutive crashes and was stopped. | `source`, `crashes`, `last_error` |
+| `LOG state-file-large {json}` | A file in the state dir is over `guard.stateFileBytes`. Checked at start and every 10 minutes, printed once until it shrinks. | `path`, `bytes`, `limit` |
+
+Silent isn't dead. A long tool call that adds no new messages can trip `silent-session` too. A herdr command that fails is never reported as `dead-pane`; it shows up as `LOG herdr <machine> <err>` instead.
+
+## Threads
+
+`threads.json` tells herdr and rpc which panes and sessions are jobs to watch. Write it with `omosense thread` instead of by hand:
+
+```sh
+omosense thread register <thread-id> [--session <id>] [--pane <pane-id>] [--machine <name>] [--cwd <dir>] [--name <text>] [--platform <name>]
+omosense thread close <thread-id>
+```
+
+`register` upserts the entry. It sets only the fields you pass, sets `status` to `active`, removes `closed`, and sets `started` only when it's missing. Every other key, and the key order of the file and the entry, stays as it was. It needs `--session` or `--pane`. Flags take `--flag value` or `--flag=value`.
+
+| Flag | Field |
+|---|---|
+| `--session` | `session_id` |
+| `--pane` | `pane` |
+| `--machine` | `machine` |
+| `--cwd` | `cwd` |
+| `--name` | `name` |
+| `--platform` | `platform` |
+
+`close` sets `status` to `done` and `closed` to the current time.
+
+Both print one `THREAD {"id":<thread-id>,...}` line and exit 0. Exit codes:
+
+- 0: written.
+- 1: `close` on an unknown id (`omosense: thread close: unknown thread "<id>"`), or a `threads.json` that doesn't parse or is an array (`omosense: thread <verb>: threads.json is an array; thread <verb> needs the object form`). The file is left byte-identical.
+- 2: usage error (no `--session`/`--pane`, a missing value, an unknown or repeated flag). The help goes to stderr and nothing is written.
+
+Writes hold `threads.lock` and replace the file atomically, so concurrent registers don't lose entries.
+
+A thread whose `status` is `done` or `closed`, or that has a non-empty `closed`, isn't watched. It stays unwatched until `thread register` makes it active again. Closing a thread in the middle of a turn drops that turn's completion.
+
+When an active entry has both a session and a pane, and rpc is enabled and its socket lists a matching session, rpc owns it and herdr stays quiet for that pane (no job lines, no `silent-session`, no `dead-pane`). If the socket is down or doesn't list the session, herdr reports the pane. With `rpc.enabled` set but the rpc source not running in this host (`ALREADY_RUNNING`, or stopped after crashes), herdr still defers to the socket's session list.
 
 ## Sending messages
 
@@ -149,9 +219,35 @@ How batching works:
 - Subscriber not alive in `omo thread list`: the batch is dropped and the subscription is removed (`LOG rpc batch dropped: subscriber <id> not alive; unsubscribed`).
 - A send that fails while the subscriber is alive is retried after a minute.
 
+Every line in an entry is `<label>: <value>`. `rpc.labels` overrides any label; the defaults reproduce the original output. An unknown key or a non-string value fails config load naming `rpc.labels.<key>`. The ack command itself is never a label and is never cut.
+
+| Key | Default |
+|---|---|
+| `task` | `작업` |
+| `thread` | `thread` |
+| `cwd` | `cwd` |
+| `id` | `완료 id` |
+| `seq` | `seq` |
+| `doneAt` | `done_at` |
+| `count` | `count` |
+| `ack` | `확인 명령` |
+| `unverified` | `미검증` |
+| `verifyPending` | `검증이 끝나지 않음` |
+| `more` | `more` (the word in the `+N more:` line) |
+
 A session that comes back after being off should run `omosense rpc pending` to catch up, then `omosense rpc subscribe <its-id>` again if it was unsubscribed.
 
 `ack <id> <seq>` leaves the entry pending and prints `newer` when a newer completion of that session has arrived since.
+
+## Done verification
+
+Idle means the turn ended, not that the work is done. Set `verify.command` to check it. The hook runs once per done, with one retry. Exit 0 means verified. Anything else (a non-zero exit, a timeout after `verify.timeoutSec`, a start error) means unverified, with a detail like `exit 1: <stderr, 200 runes>`. The done is never dropped.
+
+The hook gets `OMOSENSE_DONE_SOURCE` (`rpc` or `herdr`), `OMOSENSE_DONE_THREAD` and `OMOSENSE_DONE_CWD`. rpc also sets `OMOSENSE_DONE_ID` and `OMOSENSE_DONE_SESSION`; herdr sets `OMOSENSE_DONE_PANE` and `OMOSENSE_DONE_MACHINE`. It runs in the done's cwd when that directory exists.
+
+rpc (on by default once `verify.command` is set): the entry in `rpc-pending.json` gets `verify` (`pending`, `verified`, `unverified`) and `verify_detail`. The hook never delays the batch. An unverified entry gets one `<unverified>: <detail>` line in the batch; one still running gets `<unverified>: <verifyPending>`. A result that lands after its batch shows in `omosense rpc pending` but isn't re-sent. On shutdown a running hook is killed and the entry stays `pending`, and hooks don't re-run after a restart. Without a hook, entries and batches look exactly as before.
+
+herdr (only with `herdr.verify: true`): a pane's working to idle/done `HERDR` line is held until the hook finishes, then printed with `"verify"` and, when unverified, `"verify_detail"`. The hold can reorder that pane's lines: a later `blocked` may print before the held idle line. On shutdown the held line prints at once with `"verify":"unverified","verify_detail":"cancelled"`.
 
 ## Subcommands
 
@@ -165,6 +261,7 @@ omosense herdr [--once]
 omosense rpc [--once] [--all]
 omosense tidy [--once|--now] [flags]
 omosense say <platform> <action> <json>
+omosense thread register|close <thread-id> [flags]
 ```
 
 `--once`, `--now` and `--dry-run` are read-only: they take no lock and don't create the state dir. Run `omosense <subcommand> --help` for details.
