@@ -18,6 +18,7 @@ import (
 	"github.com/DevNewbie1826/omosense/internal/remind"
 	"github.com/DevNewbie1826/omosense/internal/rpc"
 	"github.com/DevNewbie1826/omosense/internal/say"
+	"github.com/DevNewbie1826/omosense/internal/thread"
 	"github.com/DevNewbie1826/omosense/internal/tidy"
 )
 
@@ -47,7 +48,7 @@ func run(args []string) int {
 	}
 
 	switch sub {
-	case "listen", "google", "remind", "herdr", "rpc", "tidy", "say":
+	case "listen", "google", "remind", "herdr", "rpc", "tidy", "say", "thread":
 		if hasHelp(rest) {
 			fmt.Print(subHelp(sub))
 			return 0
@@ -74,6 +75,8 @@ func run(args []string) int {
 			return rpc.Run(ctx, rest)
 		case "tidy":
 			return tidy.Run(ctx, rest)
+		case "thread":
+			return thread.Run(ctx, rest)
 		default:
 			return say.Run(ctx, rest)
 		}
@@ -84,10 +87,16 @@ func run(args []string) int {
 }
 
 // runHost is bare `omosense`: one foreground process hosting every source
-// the folder's flat config enables.
+// the folder's flat config enables. The memory-repo check (IS-14) runs
+// after Load and before any lock or source: a configured memory id whose
+// repo is missing refuses the start.
 func runHost() int {
 	ctx, err := core.Load(core.ParseArgs(nil), true)
 	if err != nil {
+		fmt.Fprintln(os.Stderr, "omosense:", err)
+		return 1
+	}
+	if err := core.CheckMemory(ctx); err != nil {
 		fmt.Fprintln(os.Stderr, "omosense:", err)
 		return 1
 	}
@@ -117,6 +126,8 @@ func subHelp(sub string) string {
 		return rpc.Help
 	case "tidy":
 		return tidy.Help
+	case "thread":
+		return thread.Help
 	default:
 		return say.Help
 	}
@@ -137,6 +148,7 @@ Subcommands:
   rpc       webchat rpc.sock session watcher (RPC)
   tidy      memory tidy watcher (TIDY)
   say       outbound message sender
+  thread    register or close a job thread in threads.json
 
 Run omosense <subcommand> --help for per-subcommand help.
 `)

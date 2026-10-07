@@ -585,6 +585,13 @@ if [ "$1" = "machine" ]; then
   mode=machines
 elif [ "$1" = "--machine" ]; then
   mode=$2
+  shift 2
+fi
+if [ "$1" = "pane" ] && [ "$2" = "list" ]; then
+  mode="$mode.pane"
+fi
+if [ "$1" = "pane" ] && [ "$2" = "process-info" ]; then
+  mode="$mode.pinfo.$4"
 fi
 if [ -f "$dir/$mode.err" ]; then
   cat "$dir/$mode.err" >&2

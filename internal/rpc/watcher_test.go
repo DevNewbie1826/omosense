@@ -528,7 +528,7 @@ func TestRegisteredJobSource(t *testing.T) {
 		{"durable array", `[{"durable_session_id":"durable"}]`, nil, "0"},
 		{"handle array", `[{"session_id":"rpc-1","cwd":"/work/job"}]`, "/work/job", "0"},
 		{"later valid handle", `{"stale":{"session":"rpc-1","cwd":"/work/other"},"job":{"session":"rpc-1","cwd":"/work/job"}}`, "/work/job", "job"},
-		{"status ignored", `{"job":{"session_id":"durable","status":"done"}}`, nil, "job"},
+		{"status done skipped", `{"job":{"session_id":"durable","status":"done"}}`, nil, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			// Given a newly opened session with a registered or reused handle.
@@ -631,7 +631,7 @@ func TestErrorsAndRecovery(t *testing.T) {
 	store := newPendingStore(c.State)
 	w := newWatcher(c, c.Out)
 	w.record = func(id string, ev rpcEvent) {
-		if _, err := store.Record(id, ev); err != nil {
+		if _, err := store.Record(id, ev, false); err != nil {
 			t.Error(err)
 		}
 	}

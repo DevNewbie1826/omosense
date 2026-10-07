@@ -1,8 +1,10 @@
 package host
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -65,13 +67,28 @@ func (s *chanSink) snapshot() []string {
 // announcement instead of racing the worker's next statement.
 type fakeClock struct {
 	mu      sync.Mutex
+	now     time.Time
 	pending []chan time.Time
 	after   chan time.Duration
 }
 
-func newFakeClock() *fakeClock { return &fakeClock{after: make(chan time.Duration, 64)} }
+func newFakeClock() *fakeClock {
+	return &fakeClock{now: time.Unix(0, 0), after: make(chan time.Duration, 64)}
+}
 
-func (c *fakeClock) Now() time.Time { return time.Unix(0, 0) }
+func (c *fakeClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+// advanceTime moves the clock forward by d without firing any timer, so a
+// job that spans it measures a real runtime (IS-9's five-minute reset).
+func (c *fakeClock) advanceTime(d time.Duration) {
+	c.mu.Lock()
+	c.now = c.now.Add(d)
+	c.mu.Unlock()
+}
 
 func (c *fakeClock) After(d time.Duration) <-chan time.Time {
 	c.mu.Lock()
@@ -100,6 +117,25 @@ func (c *fakeClock) awaitAfter(t *testing.T) time.Duration {
 	case <-time.After(10 * time.Second):
 		t.Fatal("no timer was armed")
 		return 0
+	}
+}
+
+// awaitAfterNot drains timer announcements until one differs from skip: the
+// state-file watcher arms a steady 10m drum that breaker tests must filter
+// out to observe the worker's own backoff.
+func (c *fakeClock) awaitAfterNot(t *testing.T, skip time.Duration) time.Duration {
+	t.Helper()
+	deadline := time.After(10 * time.Second)
+	for {
+		select {
+		case d := <-c.after:
+			if d != skip {
+				return d
+			}
+		case <-deadline:
+			t.Fatal("no timer other than the state-file drum was armed")
+			return 0
+		}
 	}
 }
 
@@ -244,7 +280,7 @@ func TestCrashRestartsWithBackoff(t *testing.T) {
 			t.Fatalf("start #%d never happened", i+1)
 		}
 		sink.await(t, "LOG omosense source boom crashed: boom")
-		if got := clock.awaitAfter(t); got != want {
+		if got := clock.awaitAfterNot(t, 10*time.Minute); got != want {
 			t.Fatalf("backoff wait #%d = %v, want %v", i+1, got, want)
 		}
 		clock.advance()
@@ -287,7 +323,7 @@ func TestLockHeldByLiveProcessRetries(t *testing.T) {
 	if !strings.Contains(line, `"pid":`+strconv.Itoa(sleeper.Process.Pid)) {
 		t.Fatalf("ALREADY_RUNNING line = %q, want the holder's lock JSON", line)
 	}
-	if got := clock.awaitAfter(t); got != 30*time.Second {
+	if got := clock.awaitAfterNot(t, 10*time.Minute); got != 30*time.Second {
 		t.Fatalf("retry wait = %v, want 30s", got)
 	}
 	// A second blocked attempt reports the same holder without logging again.
@@ -367,6 +403,302 @@ func TestPanicRecoveredAndRestarted(t *testing.T) {
 	case <-src.started:
 	case <-time.After(10 * time.Second):
 		t.Fatal("source was not restarted after a panic")
+	}
+}
+
+// TestBreakerIgnoresBlockedRetries pins IS-9's exclusion: a source that
+// only ever hit ALREADY_RUNNING (or a lock error) is never counted by the
+// breaker, however many 30s retries pass.
+func TestBreakerIgnoresBlockedRetries(t *testing.T) {
+	ctx, sink := hostCtx(t)
+	clock := newFakeClock()
+	if err := os.MkdirAll(ctx.State, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sleeper := exec.Command("sleep", "300")
+	if err := sleeper.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = sleeper.Process.Kill()
+		_, _ = sleeper.Process.Wait()
+	})
+	held := `{"pid":` + strconv.Itoa(sleeper.Process.Pid) + `,"session":null,"pane":null,"cwd":"/tmp","started":"2026-10-03T00:00:00.000Z"}`
+	if err := os.WriteFile(filepath.Join(ctx.State, "boom.lock.json"), []byte(held), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	src := &fakeSource{name: "boom", lock: "boom", started: make(chan struct{}, 8),
+		body: func(ctx context.Context) error { <-ctx.Done(); return nil }}
+	cancel, done := startHost(t, ctx, Options{
+		Registry: func(*core.Ctx) []core.Source { return []core.Source{src} },
+		Clock:    clock,
+	})
+	defer waitHost(t, cancel, done)
+
+	sink.await(t, "LOG ALREADY_RUNNING boom ")
+	// Far more blocked retries than the six the breaker needs. The wait
+	// fails the moment a stop or crash line appears, and each 30s arm
+	// drives the next blocked attempt.
+	for i := 0; i < 10; i++ {
+	wait:
+		for {
+			select {
+			case line := <-sink.ch:
+				if strings.Contains(line, "source-stopped") || strings.Contains(line, "crashed") {
+					t.Fatalf("blocked retries tripped the breaker: %q", line)
+				}
+			case d := <-clock.after:
+				if d == 10*time.Minute {
+					continue // the state-file watcher's drum
+				}
+				if d != 30*time.Second {
+					t.Fatalf("retry wait #%d = %v, want 30s", i+1, d)
+				}
+				break wait
+			case <-time.After(10 * time.Second):
+				t.Fatal("no 30s retry timer was armed within 10s")
+			}
+		}
+		clock.advance()
+	}
+	t.Logf("REACHED: eleven blocked 30s retries, more than the breaker's six")
+	for _, line := range sink.snapshot() {
+		if strings.Contains(line, "source-stopped") {
+			t.Fatalf("blocked retries tripped the breaker: %q", line)
+		}
+	}
+	// The holder goes away: the retry loop is still alive and starts the job.
+	// Each announcement proves the worker re-armed (or the state drum
+	// re-armed); firing everything pending drives the next acquire.
+	if err := os.Remove(filepath.Join(ctx.State, "boom.lock.json")); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.After(10 * time.Second)
+	for {
+		select {
+		case <-src.started:
+			return
+		case <-clock.after:
+			clock.advance()
+		case <-deadline:
+			t.Fatal("source never started after the holder went away")
+		}
+	}
+}
+
+// TestBreakerStopsCrashLoopingSource pins IS-9: the sixth consecutive crash
+// stops only that source — one exact source-stopped line, its lock released,
+// no seventh start — while a healthy second source keeps running and the
+// host still joins everything and returns nil on shutdown.
+func TestBreakerStopsCrashLoopingSource(t *testing.T) {
+	ctx, sink := hostCtx(t)
+	clock := newFakeClock()
+	boom := &fakeSource{name: "boom", lock: "boom", started: make(chan struct{}, 16)}
+	calm := &fakeSource{name: "calm", lock: "calm", started: make(chan struct{}, 4),
+		body: func(ctx context.Context) error { <-ctx.Done(); return nil }}
+	cancel, done := startHost(t, ctx, Options{
+		Registry: func(*core.Ctx) []core.Source { return []core.Source{boom, calm} },
+		Clock:    clock,
+	})
+
+	select {
+	case <-calm.started:
+	case <-time.After(10 * time.Second):
+		cancel()
+		t.Fatal("healthy source never started")
+	}
+	for i := 1; i <= 6; i++ {
+		select {
+		case <-boom.started:
+		case <-time.After(10 * time.Second):
+			cancel()
+			t.Fatalf("start #%d never happened", i)
+		}
+		sink.await(t, "LOG omosense source boom crashed: boom")
+		if i < 6 {
+			clock.awaitAfterNot(t, 10*time.Minute)
+			clock.advance()
+		}
+	}
+	t.Logf("REACHED: six consecutive crashes of source boom")
+	want := `LOG source-stopped {"source":"boom","crashes":6,"last_error":"boom"}`
+	if line := sink.await(t, "LOG source-stopped "); line != want {
+		t.Fatalf("source-stopped line = %q, want %q", line, want)
+	}
+	if _, err := os.Stat(filepath.Join(ctx.State, "boom.lock.json")); !os.IsNotExist(err) {
+		t.Fatalf("stopped worker left its lock behind: %v", err)
+	}
+	// No seventh start and no further lines from the stopped worker.
+	deadline := time.After(2 * time.Second)
+	for {
+		var stop bool
+		select {
+		case line := <-sink.ch:
+			if strings.Contains(line, "source-stopped") || strings.Contains(line, "boom crashed") {
+				t.Fatalf("stopped worker kept logging: %q", line)
+			}
+		case <-boom.started:
+			t.Fatal("stopped worker started a seventh job")
+		case <-deadline:
+			stop = true
+		}
+		if stop {
+			break
+		}
+	}
+	if _, err := os.Stat(filepath.Join(ctx.State, "calm.lock.json")); err != nil {
+		t.Fatalf("healthy source's lock missing: %v", err)
+	}
+	waitHost(t, cancel, done)
+	for _, lock := range []string{"boom.lock.json", "calm.lock.json"} {
+		if _, err := os.Stat(filepath.Join(ctx.State, lock)); !os.IsNotExist(err) {
+			t.Fatalf("%s left behind after shutdown: %v", lock, err)
+		}
+	}
+}
+
+// TestBreakerResetsAfterLongRun pins IS-9's reset: a job that ran five
+// minutes or more before crashing is crash #1 again, so five quick crashes
+// plus one long crash do not stop the source.
+func TestBreakerResetsAfterLongRun(t *testing.T) {
+	ctx, sink := hostCtx(t)
+	clock := newFakeClock()
+	endRun := make(chan struct{})
+	runs := 0
+	src := &fakeSource{name: "slow", lock: "slow", started: make(chan struct{}, 16),
+		body: func(context.Context) error {
+			runs++
+			if runs == 6 {
+				<-endRun // the long-running job
+				return errors.New("late crash")
+			}
+			return errors.New("quick crash")
+		}}
+	cancel, done := startHost(t, ctx, Options{
+		Registry: func(*core.Ctx) []core.Source { return []core.Source{src} },
+		Clock:    clock,
+	})
+	defer waitHost(t, cancel, done)
+
+	for i := 1; i <= 5; i++ {
+		select {
+		case <-src.started:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("start #%d never happened", i)
+		}
+		sink.await(t, "LOG omosense source slow crashed: quick crash")
+		clock.awaitAfterNot(t, 10*time.Minute)
+		clock.advance()
+	}
+	// Job #6 starts, then the clock moves past the five-minute reset mark
+	// while it runs.
+	select {
+	case <-src.started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("start #6 never happened")
+	}
+	clock.advanceTime(5 * time.Minute)
+	close(endRun)
+	sink.await(t, "LOG omosense source slow crashed: late crash")
+	t.Logf("REACHED: five quick crashes, then a crash after a five-minute run")
+	// The worker must arm a backoff (still alive) rather than print a stop.
+	deadline := time.After(10 * time.Second)
+armWait:
+	for {
+		select {
+		case line := <-sink.ch:
+			if strings.Contains(line, "source-stopped") {
+				t.Fatalf("long run did not reset the breaker: %q", line)
+			}
+		case d := <-clock.after:
+			if d == 10*time.Minute {
+				continue // the state-file watcher's drum
+			}
+			break armWait // the worker's own backoff: it did not stop
+		case <-deadline:
+			t.Fatal("worker neither armed a backoff nor stopped")
+		}
+	}
+	clock.advance()
+	select {
+	case <-src.started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("worker stopped although the long run reset the crash count")
+	}
+	for _, line := range sink.snapshot() {
+		if strings.Contains(line, "source-stopped") {
+			t.Fatalf("long run did not reset the breaker: %q", line)
+		}
+	}
+}
+
+// TestStateFileLargeWarning pins IS-10: a state file over guard.stateFileBytes
+// logs one exact state-file-large line at start, does not repeat while it
+// stays over, re-arms once it is back at or under the limit, and a file
+// exactly at the limit never warns.
+func TestStateFileLargeWarning(t *testing.T) {
+	ctx, sink := hostCtx(t)
+	if err := os.MkdirAll(filepath.Join(ctx.State, "inbox"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const limit = 1024
+	ctx.Profile.Guard.StateFileBytes = limit
+	big := filepath.Join(ctx.State, "inbox", "big.json")
+	if err := os.WriteFile(big, bytes.Repeat([]byte("x"), limit+1), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ctx.State, "exact.bin"), bytes.Repeat([]byte("x"), limit), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	clock := newFakeClock()
+	cancel, done := startHost(t, ctx, Options{
+		Registry: func(*core.Ctx) []core.Source { return nil },
+		Clock:    clock,
+	})
+	defer waitHost(t, cancel, done)
+
+	count := func() int {
+		n := 0
+		for _, line := range sink.snapshot() {
+			if strings.Contains(line, "LOG state-file-large ") {
+				n++
+			}
+		}
+		return n
+	}
+	want := fmt.Sprintf(`LOG state-file-large {"path":%q,"bytes":%d,"limit":%d}`, big, limit+1, limit)
+	if line := sink.await(t, "LOG state-file-large "); line != want {
+		t.Fatalf("state-file-large line = %q, want %q", line, want)
+	}
+	t.Logf("REACHED: over-limit file warned once at start")
+	// Still over the limit: the next check must not repeat the line.
+	if got := clock.awaitAfter(t); got != 10*time.Minute {
+		t.Fatalf("check interval = %v, want 10m", got)
+	}
+	clock.advance()
+	clock.awaitAfter(t) // the next timer armed: the second check has run
+	if n := count(); n != 1 {
+		t.Fatalf("state-file-large repeated while still over the limit: %d lines", n)
+	}
+	// Back under the limit: re-armed silently.
+	if err := os.WriteFile(big, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	clock.advance()
+	clock.awaitAfter(t)
+	// Over the limit again: exactly one more line.
+	if err := os.WriteFile(big, bytes.Repeat([]byte("x"), limit+5), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	clock.advance()
+	want = fmt.Sprintf(`LOG state-file-large {"path":%q,"bytes":%d,"limit":%d}`, big, limit+5, limit)
+	if line := sink.await(t, "LOG state-file-large "); line != want {
+		t.Fatalf("re-armed state-file-large line = %q, want %q", line, want)
+	}
+	for _, line := range sink.snapshot() {
+		if strings.Contains(line, "exact.bin") {
+			t.Fatalf("file exactly at the limit warned: %q", line)
+		}
 	}
 }
 

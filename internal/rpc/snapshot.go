@@ -72,6 +72,65 @@ func watchAll(c *core.Ctx) bool {
 	return c.Flags["--all"] || c.Profile.RPC.All
 }
 
+// threadSessionMatch reports whether a threads.json entry names session s by
+// the rule the rpc source has always used: an equal durable id, or an equal
+// session handle with an equal cleaned, non-empty cwd on both sides.
+func threadSessionMatch(m *core.OMap, s sessionInfo) bool {
+	if m == nil {
+		return false
+	}
+	cwd, _ := m.Get("cwd")
+	threadCwd, _ := cwd.(string)
+	for _, field := range []string{"session_id", "session", "durable_session_id"} {
+		v, _ := m.Get(field)
+		id, ok := v.(string)
+		if !ok || id == "" {
+			continue
+		}
+		if id == s.Durable ||
+			(id == s.Session && threadCwd != "" && s.Cwd != nil && *s.Cwd != "" && filepath.Clean(threadCwd) == filepath.Clean(*s.Cwd)) {
+			return true
+		}
+	}
+	return false
+}
+
+// OwnedThreads returns the thread keys the rpc source owns: the entries whose
+// session field matches a session currently listed on the rpc socket, by the
+// rule threads() applies. The herdr source uses it to fall back to a pane only
+// when no live rpc session matches (IS-12). It dials socketPath() and calls
+// list_sessions once, and reads no watcher state.
+func OwnedThreads(ctx context.Context, entries map[string]*core.OMap) (map[string]bool, error) {
+	out := map[string]bool{}
+	if len(entries) == 0 {
+		return out, nil
+	}
+	c, err := dial(ctx, socketPath())
+	if err != nil {
+		return nil, err
+	}
+	defer c.close()
+	data, err := c.call(ctx, "list_sessions", "")
+	if err != nil {
+		return nil, err
+	}
+	var list struct {
+		Sessions []sessionInfo `json:"sessions"`
+	}
+	if err := json.Unmarshal(data, &list); err != nil {
+		return nil, err
+	}
+	for key, m := range entries {
+		for _, s := range list.Sessions {
+			if threadSessionMatch(m, s) {
+				out[key] = true
+				break
+			}
+		}
+	}
+	return out, nil
+}
+
 // threads preserves object order and uses array indices as thread keys.
 func (w *watcher) threads(sessions []sessionInfo) map[string]string {
 	out := map[string]string{}
@@ -84,20 +143,14 @@ func (w *watcher) threads(sessions []sessionInfo) map[string]string {
 		return out
 	}
 	add := func(key string, v any) {
-		if m, ok := v.(*core.OMap); ok {
-			cwd, _ := m.Get("cwd")
-			threadCwd, _ := cwd.(string)
-			for _, field := range []string{"session_id", "session", "durable_session_id"} {
-				v, _ := m.Get(field)
-				if id, ok := v.(string); ok && id != "" {
-					for _, s := range sessions {
-						matches := id == s.Durable || (id == s.Session && threadCwd != "" && s.Cwd != nil && *s.Cwd != "" && filepath.Clean(threadCwd) == filepath.Clean(*s.Cwd))
-						if matches {
-							if _, exists := out[s.id()]; !exists {
-								out[s.id()] = key
-							}
-						}
-					}
+		m, ok := v.(*core.OMap)
+		if !ok || !core.ThreadActive(m) {
+			return
+		}
+		for _, s := range sessions {
+			if threadSessionMatch(m, s) {
+				if _, exists := out[s.id()]; !exists {
+					out[s.id()] = key
 				}
 			}
 		}

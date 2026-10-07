@@ -92,6 +92,7 @@ func TestTelegramVoiceTranscriptionAndCleanup(t *testing.T) {
 				t.Fatal(err)
 			}
 			ev := await(t, sink.signal).value.(map[string]any)
+			t.Logf("default pipeline event %#v fileRequests %d", ev, fileRequests)
 			if fail == "" && mode != "getFile" {
 				if ev["text"] != "transcribed words" || ev["transcribed"] != true || fileRequests != 1 {
 					t.Fatal(ev, fileRequests)

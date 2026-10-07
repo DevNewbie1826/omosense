@@ -25,6 +25,11 @@ type pendingEntry struct {
 	Count   uint64  `json:"count"`
 	FirstAt string  `json:"first_at"`
 	DoneAt  string  `json:"done_at"`
+	// Verify is the done-verification state: "pending" while the hook runs,
+	// then "verified" or "unverified". Both fields are omitted when empty, so
+	// a folder without a hook keeps the 0.1.0 pending JSON byte-for-byte.
+	Verify       string `json:"verify,omitempty"`
+	VerifyDetail string `json:"verify_detail,omitempty"`
 }
 
 // pendingFile is the on-disk rpc-pending.json. Seq is the last sequence
@@ -99,7 +104,11 @@ func (s *pendingStore) transact(fn func(*pendingFile) bool) error {
 	return os.Rename(tmp.Name(), s.path)
 }
 
-func (s *pendingStore) Record(id string, ev rpcEvent) (pendingEntry, error) {
+// Record upserts the completion of id. verifying marks the entry pending for
+// the done-verification hook; a record made without a hook clears any earlier
+// verification state, so a newer done of the same id never inherits the
+// verdict of the one it replaced (IS-7).
+func (s *pendingStore) Record(id string, ev rpcEvent, verifying bool) (pendingEntry, error) {
 	if id == "" {
 		return pendingEntry{}, errors.New("pending: empty durable id")
 	}
@@ -114,11 +123,40 @@ func (s *pendingStore) Record(id string, ev rpcEvent) (pendingEntry, error) {
 			e.FirstAt = now
 		}
 		e.DoneAt = now
+		if verifying {
+			e.Verify, e.VerifyDetail = "pending", ""
+		} else {
+			e.Verify, e.VerifyDetail = "", ""
+		}
 		f.Entries[id] = e
 		out = e
 		return true
 	})
 	return out, err
+}
+
+// SetVerify writes a hook result onto the entry carrying seq. The sequence
+// names the very done the hook was started for: a result that arrives after
+// the id was recorded again, or acked, is discarded instead of overwriting a
+// newer done. The write never touches notified_seq, so a result landing after
+// its batch stays readable through `omosense rpc pending` without arming
+// another send (IS-7).
+func (s *pendingStore) SetVerify(id string, seq uint64, status, detail string) (bool, error) {
+	written := false
+	err := s.transact(func(f *pendingFile) bool {
+		e, ok := f.Entries[id]
+		if !ok || e.Seq != seq {
+			return false
+		}
+		if e.Verify == status && e.VerifyDetail == detail {
+			return false
+		}
+		e.Verify, e.VerifyDetail = status, detail
+		f.Entries[id] = e
+		written = true
+		return true
+	})
+	return written, err
 }
 
 func (s *pendingStore) Ack(id string, seq uint64, haveSeq bool) (string, error) {

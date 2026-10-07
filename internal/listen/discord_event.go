@@ -68,7 +68,7 @@ func (s src) dcHandle(ctx context.Context, sink core.Sink, bot string, raw json.
 	}
 	ev["attachments"] = attachments
 	if d.Flags&8192 != 0 && len(d.Attachments) != 0 {
-		text, err := transcribe(ctx, d.Attachments[0].URL)
+		text, err := transcribe(ctx, d.Attachments[0].URL, s.cfg.Profile.Transcriber)
 		if err != nil {
 			ev["transcribe_error"] = err.Error()
 		} else {

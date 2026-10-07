@@ -80,14 +80,14 @@ type tidyer struct {
 	sleep       func(context.Context, time.Duration) error
 }
 
-// newTidyer resolves AGENTS ($OMO_MEMORY_AGENTS or ~/.omo/memory/agents)
-// and BACKUPS (~/.omo/memory-backups) once, with the TS thresholds.
+// newTidyer resolves AGENTS via the shared core rule ($OMO_MEMORY_AGENTS
+// or ~/.omo/memory/agents, IS-14) and BACKUPS (~/.omo/memory-backups)
+// once, with the TS thresholds.
 func newTidyer(c *core.Ctx, sink core.Sink) *tidyer {
 	home, _ := os.UserHomeDir()
-	agents := os.Getenv("OMO_MEMORY_AGENTS")
-	if agents == "" {
-		agents = filepath.Join(home, ".omo", "memory", "agents")
-	}
+	// Without a home the agents path degrades exactly as before; tests
+	// and live folders always have one (or OMO_MEMORY_AGENTS set).
+	agents, _ := core.MemoryAgentsDir()
 	exclude := make(map[string]bool, len(c.Profile.Tidy.Exclude))
 	for _, name := range c.Profile.Tidy.Exclude {
 		exclude[name] = true

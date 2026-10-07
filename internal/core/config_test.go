@@ -32,8 +32,10 @@ func writeConfig(t *testing.T, dir, cfg string) {
 
 const mainCfg = `{"telegram":{"bot":"mb","roles":{}},"discord":{"bot":"db"}}`
 
-// flatCfg is the whole flat document: every key of the single-session shape
-// with a value, so one load pins the entire Profile.
+// flatCfg is the whole 0.1.0 flat document: every key of the
+// single-session shape with a value, so one load pins the entire Profile
+// (the improve-8 keys stay absent here; TestLoadNewKeyDefaults pins them
+// at their defaults).
 const flatCfg = `{
   "telegram": {"bot": "mb", "roles": {"12": "owner", "13": "wife"}},
   "discord": {"bot": "db", "roles": {"44": "owner"}},
@@ -56,17 +58,29 @@ func TestLoadFlatConfig(t *testing.T) {
 		t.Fatalf("load: %v", err)
 	}
 	want := Profile{
-		Telegram:  PlatformCfg{Bot: "mb", Roles: map[string]string{"12": "owner", "13": "wife"}},
-		Discord:   PlatformCfg{Bot: "db", Roles: map[string]string{"44": "owner"}},
-		RPC:       RPCCfg{Enabled: true},
-		Tidy:      TidyCfg{Enabled: true, LearnOthers: true, Exclude: []string{"repo1"}},
-		Herdr:     HerdrCfg{Enabled: boolPtr(true)},
-		Memory:    "mem-main",
-		Calendars: &[]string{"cal1", "cal2"},
-		Mail:      true,
+		Telegram:      PlatformCfg{Bot: "mb", Roles: map[string]string{"12": "owner", "13": "wife"}},
+		Discord:       PlatformCfg{Bot: "db", Roles: map[string]string{"44": "owner"}},
+		RPC:           RPCCfg{Enabled: true},
+		Tidy:          TidyCfg{Enabled: true, LearnOthers: true, Exclude: []string{"repo1"}},
+		Herdr:         HerdrCfg{Enabled: boolPtr(true), AgentPattern: "senpi|omo|claude|codex|opencode|(^|/)pi( |$)"},
+		Memory:        "mem-main",
+		Calendars:     &[]string{"cal1", "cal2"},
+		Mail:          true,
+		Verify:        VerifyCfg{TimeoutSec: 60},
+		SilentMinutes: 30,
+		Transcriber:   nil,
+		Guard:         GuardCfg{StateFileBytes: 16 << 20},
 	}
-	if !reflect.DeepEqual(ctx.Profile, want) {
-		t.Errorf("profile = %+v, want %+v", ctx.Profile, want)
+	// The compiled pattern is not comparable as a value; it is pinned
+	// separately right after the DeepEqual pass.
+	got := ctx.Profile
+	re := got.Herdr.AgentRe
+	got.Herdr.AgentRe = nil
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("profile = %+v, want %+v", got, want)
+	}
+	if re == nil || !re.MatchString("/Users/m/.bun/install/global/node_modules/@code-yeongyu/senpi/dist/bundle/cli.js") || re.MatchString("/bin/zsh -l") {
+		t.Errorf("default agent pattern not compiled from the default source: %v", re)
 	}
 }
 
@@ -169,6 +183,37 @@ func TestResolveProfileShapeErrors(t *testing.T) {
 		{`{"memory":5}`, "config.json: memory must be a string"},
 		{`{"mail":"yes"}`, "config.json: mail must be a boolean"},
 		{`{"calendars":{"a":"b"}}`, "config.json: calendars must be an array of strings"},
+		// improve-8 keys: a wrong type must never load silently (IS-15).
+		{`{"verify":[]}`, "config.json: verify must be an object"},
+		{`{"verify":{"command":"x"}}`, "config.json: verify.command must be a non-empty array of strings"},
+		{`{"verify":{"command":[]}}`, "config.json: verify.command must be a non-empty array of strings"},
+		{`{"verify":{"command":[""]}}`, "config.json: verify.command must be a non-empty array of strings"},
+		{`{"verify":{"command":[1]}}`, "config.json: verify.command must be a non-empty array of strings"},
+		{`{"verify":{"command":["sh"],"timeoutSec":0}}`, "config.json: verify.timeoutSec must be a positive integer"},
+		{`{"verify":{"timeoutSec":-1}}`, "config.json: verify.timeoutSec must be a positive integer"},
+		{`{"verify":{"timeoutSec":1.5}}`, "config.json: verify.timeoutSec must be a positive integer"},
+		{`{"verify":{"timeoutSec":"60"}}`, "config.json: verify.timeoutSec must be a positive integer"},
+		{`{"verify":{"timeoutSec":true}}`, "config.json: verify.timeoutSec must be a positive integer"},
+		{`{"rpc":{"verify":"yes"}}`, "config.json: rpc.verify must be a boolean"},
+		{`{"rpc":{"labels":[]}}`, "config.json: rpc.labels must be an object"},
+		{`{"rpc":{"labels":{"bogus":"x"}}}`, "config.json: rpc.labels.bogus is not a known label (task, thread, cwd, id, seq, doneAt, count, ack, unverified, verifyPending, more)"},
+		{`{"rpc":{"labels":{"task":2}}}`, "config.json: rpc.labels.task must be a string"},
+		{`{"herdr":{"verify":"yes"}}`, "config.json: herdr.verify must be a boolean"},
+		{`{"herdr":{"agentPattern":5}}`, "config.json: herdr.agentPattern must be a string"},
+		{`{"herdr":{"agentPattern":"["}}`, "config.json: herdr.agentPattern is not a valid regular expression:"},
+		{`{"silentMinutes":0}`, "config.json: silentMinutes must be a positive integer"},
+		{`{"silentMinutes":-5}`, "config.json: silentMinutes must be a positive integer"},
+		{`{"silentMinutes":1.5}`, "config.json: silentMinutes must be a positive integer"},
+		{`{"silentMinutes":"30"}`, "config.json: silentMinutes must be a positive integer"},
+		{`{"transcriber":"x"}`, "config.json: transcriber must be a non-empty array of strings"},
+		{`{"transcriber":[]}`, "config.json: transcriber must be a non-empty array of strings"},
+		{`{"transcriber":[""]}`, "config.json: transcriber must be a non-empty array of strings"},
+		{`{"transcriber":[1]}`, "config.json: transcriber must be a non-empty array of strings"},
+		{`{"guard":[]}`, "config.json: guard must be an object"},
+		{`{"guard":{"stateFileBytes":0}}`, "config.json: guard.stateFileBytes must be a positive integer"},
+		{`{"guard":{"stateFileBytes":-1}}`, "config.json: guard.stateFileBytes must be a positive integer"},
+		{`{"guard":{"stateFileBytes":2.5}}`, "config.json: guard.stateFileBytes must be a positive integer"},
+		{`{"guard":{"stateFileBytes":"16"}}`, "config.json: guard.stateFileBytes must be a positive integer"},
 	}
 	for _, tc := range cases {
 		_, dir, _ := testEnv(t)
@@ -177,6 +222,127 @@ func TestResolveProfileShapeErrors(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), tc.want) {
 			t.Errorf("cfg %s: err = %v, want %q", tc.cfg, err, tc.want)
 		}
+	}
+}
+
+// TestLoadNewKeyDefaults pins IS-15: a 0.1.0 config (no improve-8 key)
+// loads with every new key at its plan default and the default agent
+// pattern compiled.
+func TestLoadNewKeyDefaults(t *testing.T) {
+	_, dir, _ := testEnv(t)
+	writeConfig(t, dir, mainCfg)
+	ctx, err := Load(ParseArgs(nil), false)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	p := ctx.Profile
+	if p.Verify.Command != nil || p.Verify.TimeoutSec != 60 {
+		t.Errorf("verify defaults = %+v, want no command and 60s", p.Verify)
+	}
+	if !p.RPC.VerifyOn() || p.RPC.Verify != nil {
+		t.Errorf("rpc.verify default = %+v, want absent (on)", p.RPC.Verify)
+	}
+	if p.RPC.Labels != nil {
+		t.Errorf("rpc.labels default = %v, want none", p.RPC.Labels)
+	}
+	for key, want := range map[string]string{
+		"task": "작업", "thread": "thread", "cwd": "cwd", "id": "완료 id", "seq": "seq",
+		"doneAt": "done_at", "count": "count", "ack": "확인 명령", "unverified": "미검증",
+		"verifyPending": "검증이 끝나지 않음", "more": "more",
+	} {
+		if got := p.RPC.Label(key); got != want {
+			t.Errorf("Label(%q) = %q, want %q", key, got, want)
+		}
+	}
+	if p.Herdr.Verify {
+		t.Errorf("herdr.verify default = true, want false")
+	}
+	const defPat = "senpi|omo|claude|codex|opencode|(^|/)pi( |$)"
+	if p.Herdr.AgentPattern != defPat || p.Herdr.AgentRe == nil {
+		t.Errorf("herdr pattern = %q %v, want the default compiled", p.Herdr.AgentPattern, p.Herdr.AgentRe)
+	}
+	if p.SilentMinutes != 30 {
+		t.Errorf("silentMinutes default = %d, want 30", p.SilentMinutes)
+	}
+	if p.Transcriber != nil {
+		t.Errorf("transcriber default = %v, want none", p.Transcriber)
+	}
+	if p.Guard.StateFileBytes != 16777216 {
+		t.Errorf("guard.stateFileBytes default = %d, want 16777216", p.Guard.StateFileBytes)
+	}
+}
+
+// TestLoadNewKeysSet pins the new keys' happy path: every configured
+// value resolves into the Profile and Label mixes overrides with
+// defaults.
+func TestLoadNewKeysSet(t *testing.T) {
+	_, dir, _ := testEnv(t)
+	writeConfig(t, dir, `{
+	  "verify": {"command": ["/bin/sh", "-c", "exit 0"], "timeoutSec": 5},
+	  "rpc": {"verify": false, "labels": {"task": "T", "ack": "A", "more": "M"}},
+	  "herdr": {"verify": true, "agentPattern": "^agent-"},
+	  "silentMinutes": 7,
+	  "transcriber": ["/opt/tr.sh", "{audio}"],
+	  "guard": {"stateFileBytes": 1048576}
+	}`)
+	ctx, err := Load(ParseArgs(nil), false)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	p := ctx.Profile
+	if !reflect.DeepEqual(p.Verify.Command, []string{"/bin/sh", "-c", "exit 0"}) || p.Verify.TimeoutSec != 5 {
+		t.Errorf("verify = %+v, want the configured command and 5s", p.Verify)
+	}
+	if p.RPC.VerifyOn() {
+		t.Errorf("rpc.verify = %+v, want off", p.RPC.Verify)
+	}
+	for key, want := range map[string]string{"task": "T", "ack": "A", "more": "M", "thread": "thread", "id": "완료 id", "nope": ""} {
+		if got := p.RPC.Label(key); got != want {
+			t.Errorf("Label(%q) = %q, want %q", key, got, want)
+		}
+	}
+	if !p.Herdr.Verify || p.Herdr.AgentPattern != "^agent-" || p.Herdr.AgentRe == nil ||
+		!p.Herdr.AgentRe.MatchString("agent-x") || p.Herdr.AgentRe.MatchString("senpi bundle") {
+		t.Errorf("herdr verify/pattern = %v %q %v, want true and the configured pattern compiled", p.Herdr.Verify, p.Herdr.AgentPattern, p.Herdr.AgentRe)
+	}
+	if p.SilentMinutes != 7 {
+		t.Errorf("silentMinutes = %d, want 7", p.SilentMinutes)
+	}
+	if !reflect.DeepEqual(p.Transcriber, []string{"/opt/tr.sh", "{audio}"}) {
+		t.Errorf("transcriber = %v, want the configured argv", p.Transcriber)
+	}
+	if p.Guard.StateFileBytes != 1048576 {
+		t.Errorf("guard.stateFileBytes = %d, want 1048576", p.Guard.StateFileBytes)
+	}
+}
+
+// TestLoadLiveMainShapeConfig pins IS-15: the live MAIN 0.1.0 key set
+// loads unchanged with every new field at its default.
+func TestLoadLiveMainShapeConfig(t *testing.T) {
+	_, dir, _ := testEnv(t)
+	writeConfig(t, dir, `{
+	  "telegram": {"bot": "mb", "roles": {}},
+	  "discord": {"bot": "db", "roles": {}},
+	  "rpc": {"enabled": true, "all": true},
+	  "tidy": {"enabled": true, "learnOthers": true, "exclude": []},
+	  "herdr": {"enabled": true},
+	  "memory": "main-id",
+	  "calendars": [],
+	  "mail": true
+	}`)
+	ctx, err := Load(ParseArgs(nil), false)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	p := ctx.Profile
+	if !p.RPC.Enabled || !p.RPC.All || !p.Tidy.Enabled || !p.Tidy.LearnOthers ||
+		p.Herdr.Enabled == nil || !*p.Herdr.Enabled || p.Memory != "main-id" ||
+		p.Calendars == nil || len(*p.Calendars) != 0 || !p.Mail {
+		t.Fatalf("old keys resolved wrong: %+v", p)
+	}
+	if p.Verify.Command != nil || p.Verify.TimeoutSec != 60 || p.RPC.Labels != nil || p.RPC.Verify != nil ||
+		p.Herdr.Verify || p.Herdr.AgentRe == nil || p.SilentMinutes != 30 || p.Transcriber != nil || p.Guard.StateFileBytes != 16777216 {
+		t.Errorf("new keys not at their defaults: %+v", p)
 	}
 }
 
@@ -294,6 +460,22 @@ func TestLoadCfgRawKeepsOrder(t *testing.T) {
 	want := []string{"mail", "zz", "aa"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("raw keys = %v, want %v", got, want)
+	}
+}
+
+// TestLoadNullNewKeysKeepDefaults pins that an explicit null behaves as
+// absent for every new key (the tri-state convention of the flat shape).
+func TestLoadNullNewKeysKeepDefaults(t *testing.T) {
+	_, dir, _ := testEnv(t)
+	writeConfig(t, dir, `{"verify":null,"rpc":{"verify":null,"labels":null},"herdr":{"verify":null,"agentPattern":null},"silentMinutes":null,"transcriber":null,"guard":null}`)
+	ctx, err := Load(ParseArgs(nil), false)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	p := ctx.Profile
+	if p.Verify.Command != nil || p.Verify.TimeoutSec != 60 || p.RPC.Verify != nil || p.RPC.Labels != nil ||
+		p.Herdr.Verify || p.Herdr.AgentRe == nil || p.SilentMinutes != 30 || p.Transcriber != nil || p.Guard.StateFileBytes != 16<<20 {
+		t.Errorf("null new keys changed the defaults: %+v", p)
 	}
 }
 

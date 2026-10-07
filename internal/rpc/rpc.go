@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"sync"
+	"time"
 
 	"github.com/DevNewbie1826/omosense/internal/core"
 )
@@ -188,14 +190,36 @@ func (s src) Run(ctx context.Context, sink core.Sink) error {
 func run(ctx context.Context, c *core.Ctx, sink core.Sink, w *watcher) error {
 	store := newPendingStore(c.State)
 	b := newBatcher(c, store, sink)
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	verifying := len(c.Profile.Verify.Command) > 0 && c.Profile.RPC.VerifyOn()
+	var hooks sync.WaitGroup
 	w.record = func(id string, ev rpcEvent) {
-		if _, err := store.Record(id, ev); err != nil {
+		e, err := store.Record(id, ev, verifying)
+		if err != nil {
 			sink.Log("rpc pending " + err.Error())
 			return
 		}
 		b.Notify()
+		if !verifying {
+			return
+		}
+		// The hook runs off the watcher and the batcher: a slow or failing
+		// command never blocks a transition nor the batch it belongs to
+		// (IS-7). run joins these before returning.
+		hooks.Add(1)
+		go func() {
+			defer hooks.Done()
+			res := core.RunVerify(ctx, c.Profile.Verify.Command, verifyTimeout(c), verifyEnv(e), deref(e.Cwd))
+			if res.Status == "cancelled" {
+				return
+			}
+			if _, err := store.SetVerify(e.ID, e.Seq, res.Status, res.Detail); err != nil {
+				sink.Log("rpc pending " + err.Error())
+			}
+			hookDoneFn()
+		}()
 	}
-	ctx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -204,5 +228,34 @@ func run(ctx context.Context, c *core.Ctx, sink core.Sink, w *watcher) error {
 	err := w.run(ctx)
 	cancel()
 	<-done
+	hooks.Wait()
 	return err
+}
+
+// verifyEnv is the IS-7 hook environment: the done's identity, with the
+// thread and cwd empty when the done carries none.
+func verifyEnv(e pendingEntry) []string {
+	return []string{
+		"OMOSENSE_DONE_SOURCE=rpc",
+		"OMOSENSE_DONE_ID=" + e.ID,
+		"OMOSENSE_DONE_SESSION=" + e.Session,
+		"OMOSENSE_DONE_THREAD=" + deref(e.Thread),
+		"OMOSENSE_DONE_CWD=" + deref(e.Cwd),
+	}
+}
+
+func deref(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
+}
+
+// verifyTimeout is the configured per-attempt hook timeout, falling back to
+// the config default for a profile built without one.
+func verifyTimeout(c *core.Ctx) time.Duration {
+	if sec := c.Profile.Verify.TimeoutSec; sec > 0 {
+		return time.Duration(sec) * time.Second
+	}
+	return 60 * time.Second
 }

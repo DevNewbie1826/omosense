@@ -2,16 +2,20 @@
 // source the folder's flat config.json enables. It carries the supervisor
 // semantics of the retired daemon (5s doubling to 5m backoff, ALREADY_RUNNING
 // retry every 30s, panic recovery, join-before-release, a refcounted shared
-// listen lock) without pause, grace, halt, attach or journal: every
-// registered source is always wanted.
+// listen lock) without pause, grace, halt, attach or journal: sources restart
+// until they crash-loop, and a breaker stops a worker after six consecutive
+// crashes while the other workers keep running.
 package host
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -125,6 +129,8 @@ func (h *Host) Run(ctx context.Context) error {
 		wg.Add(1)
 		go func(w *worker) { defer wg.Done(); w.run(jobCtx) }(w)
 	}
+	wg.Add(1)
+	go func() { defer wg.Done(); h.watchStateFiles(jobCtx) }()
 	if h.options.Ready != nil {
 		close(h.options.Ready)
 	}
@@ -134,10 +140,12 @@ func (h *Host) Run(ctx context.Context) error {
 	return nil
 }
 
-// worker owns one source's job, its lock and its retry timer. A source is
-// always wanted; a crash logs one line and re-arms the backoff timer, and a
-// lock held by another live process logs ALREADY_RUNNING once per holder and
-// retries every 30s.
+// worker owns one source's job, its lock and its retry timer. A crash logs
+// one line and re-arms the backoff timer; a lock held by another live
+// process logs ALREADY_RUNNING once per holder and retries every 30s
+// without counting toward the breaker. Six consecutive crashes (a job that
+// ran five minutes or more resets the count to one) stop the worker with one
+// source-stopped line, releasing its lock; the other workers keep running.
 type worker struct {
 	ctx    *core.Ctx
 	source core.Source
@@ -145,11 +153,21 @@ type worker struct {
 	clock  Clock
 }
 
+// maxConsecutiveCrashes is the breaker threshold: the sixth consecutive
+// crash stops the worker.
+const maxConsecutiveCrashes = 6
+
+// crashResetAfter is how long a job must run before its ending counts as a
+// fresh crash instead of another consecutive one.
+const crashResetAfter = 5 * time.Minute
+
 func (w *worker) run(ctx context.Context) {
 	var done <-chan error
 	var cancel context.CancelFunc
 	var release func()
 	var retry <-chan time.Time
+	var startedAt time.Time
+	crashes := 0
 	lastBlock := ""
 	backoff := 5 * time.Second
 	stopJob := func() {
@@ -182,6 +200,7 @@ func (w *worker) run(ctx context.Context) {
 			default:
 				lastBlock = ""
 				release = rel
+				startedAt = w.clock.Now()
 				job, jobCancel := context.WithCancel(ctx)
 				cancel = jobCancel
 				ch := make(chan error, 1)
@@ -198,6 +217,7 @@ func (w *worker) run(ctx context.Context) {
 		case <-retry:
 			retry = nil
 		case err := <-done:
+			ran := w.clock.Now().Sub(startedAt)
 			cancel()
 			release()
 			done, cancel, release = nil, nil, nil
@@ -208,6 +228,15 @@ func (w *worker) run(ctx context.Context) {
 				err = errors.New("source returned unexpectedly")
 			}
 			w.crashed(err)
+			if ran >= crashResetAfter {
+				crashes = 1
+			} else {
+				crashes++
+			}
+			if crashes >= maxConsecutiveCrashes {
+				w.stopped(crashes, err)
+				return
+			}
 			retry = w.clock.After(backoff)
 			backoff = min(backoff*2, 5*time.Minute)
 		}
@@ -216,6 +245,106 @@ func (w *worker) run(ctx context.Context) {
 
 func (w *worker) crashed(err error) {
 	w.ctx.Out.Log("omosense source " + w.source.Name() + " crashed: " + err.Error())
+}
+
+// sourceStoppedJSON is the breaker's stop payload: which source stopped,
+// after how many consecutive crashes, with which last error.
+type sourceStoppedJSON struct {
+	Source    string `json:"source"`
+	Crashes   int    `json:"crashes"`
+	LastError string `json:"last_error"`
+}
+
+// stopped reports the breaker decision and ends the worker's loop; the lock
+// is already released, and the host keeps its other workers.
+func (w *worker) stopped(crashes int, err error) {
+	w.ctx.Out.Log("source-stopped " + mustJSON(sourceStoppedJSON{
+		Source:    w.source.Name(),
+		Crashes:   crashes,
+		LastError: err.Error(),
+	}))
+}
+
+// stateCheckInterval is how often the host re-walks the state dir for
+// oversized files.
+const stateCheckInterval = 10 * time.Minute
+
+// stateFileLargeJSON is the oversized-file payload.
+type stateFileLargeJSON struct {
+	Path  string `json:"path"`
+	Bytes int64  `json:"bytes"`
+	Limit int64  `json:"limit"`
+}
+
+// watchStateFiles warns once per state file that grew past the configured
+// guard.stateFileBytes, re-arming when the file is back at or under the
+// limit or gone. It checks once at start and then every interval, and stops
+// with the host.
+func (h *Host) watchStateFiles(ctx context.Context) {
+	limit := h.ctx.Profile.Guard.StateFileBytes
+	if limit <= 0 {
+		limit = 16 << 20
+	}
+	warned := make(map[string]bool)
+	for {
+		h.checkStateFiles(limit, warned)
+		select {
+		case <-ctx.Done():
+			return
+		case <-h.clock.After(stateCheckInterval):
+		}
+	}
+}
+
+// checkStateFiles walks the state dir (regular files only; symlinks are
+// neither followed nor reported) and logs one state-file-large line per
+// file that is over the limit and not already warned.
+func (h *Host) checkStateFiles(limit int64, warned map[string]bool) {
+	root, err := filepath.Abs(h.ctx.State)
+	if err != nil {
+		root = h.ctx.State
+	}
+	over := make(map[string]bool)
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || !d.Type().IsRegular() {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		if info.Size() > limit {
+			over[path] = true
+			if !warned[path] {
+				warned[path] = true
+				h.ctx.Out.Log("state-file-large " + mustJSON(stateFileLargeJSON{
+					Path:  path,
+					Bytes: info.Size(),
+					Limit: limit,
+				}))
+			}
+		} else {
+			delete(warned, path)
+		}
+		return nil
+	})
+	for path := range warned {
+		if !over[path] {
+			delete(warned, path)
+		}
+	}
+}
+
+// mustJSON renders v as compact JSON with no HTML escaping; struct field
+// order is the field order of the line.
+func mustJSON(v any) string {
+	var b strings.Builder
+	enc := json.NewEncoder(&b)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return "{}"
+	}
+	return strings.TrimSuffix(b.String(), "\n")
 }
 
 // runSource runs one source and turns a panic into an error, so a crashing
