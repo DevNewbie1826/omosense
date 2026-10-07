@@ -347,8 +347,8 @@ func foregroundProcesses(v any) ([]foregroundProcess, error) {
 }
 
 // silentState tracks one job pane's silence window (IS-6): the last activity
-// (a status change or a revision change), the status and revision that defined
-// it, and whether the current window was already reported.
+// (a status change or revision growth), the last sampled status and revision,
+// and whether the current window was already reported.
 type silentState struct {
 	last     time.Time
 	status   string
@@ -375,9 +375,8 @@ func (w *watcher) trackSilent(e snapEntry, jp jobPane) silentState {
 		now.Sub(s.last) >= time.Duration(w.silentMinutes)*time.Minute:
 		s.reported = true
 		w.sink.Log(silentLine(e, jp, s.last, now))
-	default:
-		s.revision = rev
 	}
+	s.revision = rev
 	return s
 }
 
