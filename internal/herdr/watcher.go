@@ -9,7 +9,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/DevNewbie1826/omosense/internal/core"
@@ -89,6 +92,7 @@ type agent struct {
 	status  *string
 	cwd     *string
 	title   *string
+	rev     json.Number // IS-6: the row's revision (terminal content_seq)
 }
 
 type seenRec struct {
@@ -107,6 +111,10 @@ type herdrEvent struct {
 	Cwd     *string `json:"cwd"`
 	From    *string `json:"from"`
 	To      string  `json:"to"`
+	// IS-8: the opt-in done-verification verdict. Both are omitempty, so a
+	// hook-less HERDR line is byte-identical to 0.1.0.
+	Verify       string `json:"verify,omitempty"`
+	VerifyDetail string `json:"verify_detail,omitempty"`
 }
 
 type snapEntry struct {
@@ -130,17 +138,57 @@ type watcher struct {
 	seen  map[string]seenRec
 	errs  map[string]string
 	sleep func(context.Context, time.Duration) error
+
+	// IS-5: the 60-second dead-pane check, its pattern, and the panes already
+	// reported dead.
+	pattern  string
+	agentRe  *regexp.Regexp
+	deadAt   time.Time
+	deadSeen map[string]bool
+
+	// IS-6: the per-job-pane silence window.
+	silent        map[string]silentState
+	silentMinutes int
+
+	// IS-12: whether the rpc source may own a job pane's session.
+	rpcEnabled bool
+
+	// IS-8: the opt-in done-verification hook.
+	verify        bool
+	verifyCmd     []string
+	verifyTimeout time.Duration
+	hooks         sync.WaitGroup
 }
 
 func newWatcher(c *core.Ctx, sink core.Sink) *watcher {
-	return &watcher{
+	w := &watcher{
 		state: c.State,
 		sink:  sink,
 		own:   ownPane(),
 		seen:  map[string]seenRec{},
 		errs:  map[string]string{},
 		sleep: sleepFn,
+
+		pattern:  c.Profile.Herdr.AgentPattern,
+		agentRe:  c.Profile.Herdr.AgentRe,
+		deadAt:   nowFn(),
+		deadSeen: map[string]bool{},
+
+		silent:        map[string]silentState{},
+		silentMinutes: c.Profile.SilentMinutes,
+
+		rpcEnabled: c.Profile.RPC.Enabled,
+
+		verify:        len(c.Profile.Verify.Command) > 0 && c.Profile.Herdr.Verify,
+		verifyCmd:     c.Profile.Verify.Command,
+		verifyTimeout: verifyTimeout(c),
 	}
+	if w.agentRe == nil && w.pattern != "" {
+		// core.Load always resolves a compiled pattern; a hand-built Ctx
+		// (tests) may carry only the string.
+		w.agentRe = regexp.MustCompile(w.pattern)
+	}
+	return w
 }
 
 // ownPane reads HERDR_PANE_ID the way the TS module does: an unset variable
@@ -157,6 +205,9 @@ func ownPane() paneID {
 // error is logged and the loop continues, matching the TS try/catch; the
 // per-machine herdr failures are logged inside the snapshot instead.
 func (w *watcher) run(ctx context.Context) error {
+	// IS-8: a held HERDR line is printed by its hook goroutine, so the source
+	// never returns before every hook has finished.
+	defer w.hooks.Wait()
 	skip := "none"
 	if w.own.kind == kindValue {
 		skip = w.own.s
@@ -196,12 +247,14 @@ func (w *watcher) once(ctx context.Context) {
 // when the title did. Panes that disappear are forgotten.
 func (w *watcher) tick(ctx context.Context, first bool) error {
 	fam := w.familyPane()
-	jobs := w.jobPanes()
+	jobs := w.unowned(ctx, w.jobPanes())
+	w.checkDeadPanes(ctx, jobs)
 	snap := w.snapshot(ctx)
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	inSnap := make(map[string]bool, len(snap))
+	silent := make(map[string]silentState, len(snap))
 	for _, e := range snap {
 		inSnap[e.key] = true
 		if e.machine == "local" && e.agent.pane.equal(w.own) {
@@ -210,6 +263,12 @@ func (w *watcher) tick(ctx context.Context, first bool) error {
 		status := statusOf(e.agent)
 		prev, had := w.seen[e.key]
 		w.seen[e.key] = seenRec{status: status, title: snapTitle(e.agent)}
+		jp, isJob := jobs[e.key]
+		if isJob {
+			// IS-6: a registered pane that stays working with no status
+			// change and no revision growth is reported once per window.
+			silent[e.key] = w.trackSilent(e, jp)
+		}
 		if had && prev.status == status {
 			continue
 		}
@@ -221,8 +280,8 @@ func (w *watcher) tick(ctx context.Context, first bool) error {
 				from = strPtr(prev.status)
 			}
 			w.emit(e.machine, e.agent, from, status)
-		case !first && !isFamily && jobs[e.key] && had && prev.status == "working" && (status == "idle" || status == "done"):
-			w.emit(e.machine, e.agent, strPtr(prev.status), status)
+		case !first && !isFamily && isJob && had && prev.status == "working" && (status == "idle" || status == "done"):
+			w.emitJob(ctx, e, jp, strPtr(prev.status), status)
 		}
 	}
 	for key := range w.seen {
@@ -230,11 +289,16 @@ func (w *watcher) tick(ctx context.Context, first bool) error {
 			delete(w.seen, key)
 		}
 	}
+	w.silent = silent
 	return nil
 }
 
 func (w *watcher) emit(machine string, a agent, from *string, to string) {
-	w.sink.Emit("HERDR", herdrEvent{
+	w.sink.Emit("HERDR", w.event(machine, a, from, to))
+}
+
+func (w *watcher) event(machine string, a agent, from *string, to string) herdrEvent {
+	return herdrEvent{
 		Machine: machine,
 		Pane:    a.pane.ptr(),
 		Tab:     a.tab,
@@ -243,7 +307,7 @@ func (w *watcher) emit(machine string, a agent, from *string, to string) {
 		Cwd:     a.cwd,
 		From:    from,
 		To:      to,
-	})
+	}
 }
 
 func (w *watcher) snapshot(ctx context.Context) []snapEntry {
@@ -407,11 +471,11 @@ func (w *watcher) familyPane() paneID {
 	return nullishPane(fm, "pane")
 }
 
-// jobPanes reads <State>/threads.json. A falsy pane is skipped. A null or
-// missing machine becomes "local"; an empty string does not, because `??`
-// only replaces null and undefined.
-func (w *watcher) jobPanes() map[string]bool {
-	out := map[string]bool{}
+// jobPanes reads <State>/threads.json. A closed entry (IS-4) and a falsy pane
+// are skipped. A null or missing machine becomes "local"; an empty string does
+// not, because `??` only replaces null and undefined.
+func (w *watcher) jobPanes() map[string]jobPane {
+	out := map[string]jobPane{}
 	b, err := os.ReadFile(filepath.Join(w.state, "threads.json"))
 	if err != nil {
 		return out
@@ -420,28 +484,31 @@ func (w *watcher) jobPanes() map[string]bool {
 	if err != nil {
 		return out
 	}
-	var vals []any
+	add := func(key string, val any) {
+		m, ok := val.(*core.OMap)
+		if !ok || !core.ThreadActive(m) {
+			return
+		}
+		pane, ok := truthyField(m, "pane")
+		if !ok {
+			return
+		}
+		machine := jobMachine(m)
+		out[machine+"/"+pane] = jobPane{
+			thread: key, machine: machine, pane: pane,
+			session: sessionField(m), entry: m,
+		}
+	}
 	switch x := v.(type) {
 	case *core.OMap:
 		for _, k := range x.Keys() {
 			val, _ := x.Get(k)
-			vals = append(vals, val)
+			add(k, val)
 		}
 	case []any:
-		vals = x
-	default:
-		return out
-	}
-	for _, val := range vals {
-		m, ok := val.(*core.OMap)
-		if !ok {
-			continue
+		for i, val := range x {
+			add(strconv.Itoa(i), val)
 		}
-		pane, ok := truthyField(m, "pane")
-		if !ok {
-			continue
-		}
-		out[jobMachine(m)+"/"+pane] = true
 	}
 	return out
 }
@@ -608,7 +675,23 @@ func parseAgent(m *core.OMap) agent {
 		status:  fieldPtr(m, "agent_status"),
 		cwd:     fieldPtr(m, "cwd"),
 		title:   fieldPtr(m, "terminal_title_stripped"),
+		rev:     fieldNumber(m, "revision"),
 	}
+}
+
+// fieldNumber reads a JSON number field verbatim, so a revision survives the
+// round trip without a float conversion. A missing, null or non-number value
+// is the empty number.
+func fieldNumber(m *core.OMap, key string) json.Number {
+	raw, ok := m.Get(key)
+	if !ok || raw == nil {
+		return ""
+	}
+	n, isNum := raw.(json.Number)
+	if !isNum {
+		return ""
+	}
+	return n
 }
 
 func fieldPane(m *core.OMap, key string) paneID {
