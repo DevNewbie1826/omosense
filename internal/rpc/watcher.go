@@ -256,7 +256,15 @@ func (w *watcher) poll(ctx context.Context, reconcile bool) {
 			case !tracked:
 				s = silentState{last: now, status: status, count: e.state.Count}
 			case status != s.status || e.state.Count > s.count:
+				// A status change or output growth re-arms the window. Growth is
+				// measured against the immediately preceding sample, so a session
+				// that drops and then grows again is seen to be growing (IS-6).
 				s.last, s.status, s.count, s.reported = now, status, e.state.Count, false
+			case e.state.Count < s.count:
+				// A decrease is not growth, so it must not re-arm the window; but it
+				// becomes the sample, so the next increase is observed instead of
+				// being hidden behind a retained high-water mark.
+				s.count = e.state.Count
 			case status == "working" && !s.reported && w.silentMinutes > 0 &&
 				now.Sub(s.last) >= time.Duration(w.silentMinutes)*time.Minute:
 				s.reported = true

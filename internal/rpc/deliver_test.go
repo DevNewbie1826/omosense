@@ -812,7 +812,7 @@ func TestBatchTextBound(t *testing.T) {
 			Thread: ptr(strings.Repeat("t", 200)), Cwd: ptr(strings.Repeat("/c", 200)),
 		})
 	}
-	text := batchText(core.RPCCfg{}, entries, "/proj", "/proj/state")
+	text := mustBatchText(t, core.RPCCfg{}, entries, "/proj", "/proj/state")
 	if len(text) > 32768 {
 		t.Fatalf("batch = %d bytes", len(text))
 	}
@@ -841,7 +841,7 @@ func TestBatchTextBound(t *testing.T) {
 		t.Fatalf("ack labels = %d, listed = %d", labels, listed)
 	}
 	big := []pendingEntry{{ID: "BIG", Seq: 7, Count: 1, DoneAt: "2026-10-05T00:00:00.000Z", Name: ptr(strings.Repeat("가", 32768))}}
-	one := batchText(core.RPCCfg{}, big, "/proj", "/proj/state")
+	one := mustBatchText(t, core.RPCCfg{}, big, "/proj", "/proj/state")
 	if len(one) > 32768 || !utf8.ValidString(one) || !strings.Contains(one, "omosense rpc ack BIG 7") {
 		t.Fatalf("single-entry batch = %d bytes, valid=%v", len(one), utf8.ValidString(one))
 	}

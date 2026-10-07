@@ -213,7 +213,15 @@ func (b *batcher) pass(ctx context.Context) {
 		return
 	}
 	key := fmt.Sprintf("omosense-rpc-batch-%d", maxSeq)
-	if _, err := omoExecFn(ctx, "thread", "send", sub.Session, batchText(b.c.Profile.RPC, send, b.c.Dir, b.c.State), "--all-scope", "--idempotency-key", key, "--json"); err != nil {
+	text, err := batchText(b.c.Profile.RPC, send, b.c.Dir, b.c.State)
+	if err != nil {
+		// The batch cannot be rendered inside its budget: nothing is sent and
+		// nothing is marked notified, exactly like a failed send.
+		b.note("rpc batch too large: " + err.Error())
+		b.retryAt = now.Add(deliverRetry)
+		return
+	}
+	if _, err := omoExecFn(ctx, "thread", "send", sub.Session, text, "--all-scope", "--idempotency-key", key, "--json"); err != nil {
 		b.note("rpc batch send: " + err.Error())
 		b.retryAt = now.Add(deliverRetry)
 		return
@@ -465,12 +473,20 @@ func takeSubscription(stateDir string) (*subscription, error) {
 // batchText renders the IS-9 batch: one block per entry, bounded to batchLimit
 // with a single overflow line naming `omosense rpc pending`. A listed entry's
 // ACK command is never truncated. Every label comes from the configured
-// rpc.labels (IS-13), and the budget counts their real lengths.
-func batchText(r core.RPCCfg, entries []pendingEntry, dir, state string) string {
+// rpc.labels (IS-13), and the budget counts their real lengths - including the
+// overflow line's own label, which is cut to the bytes left (IS-13).
+func batchText(r core.RPCCfg, entries []pendingEntry, dir, state string) (string, error) {
 	absDir, absState := absPath(dir), absPath(state)
 	blocks := make([]string, len(entries))
 	for i, e := range entries {
 		blocks[i] = entryBlock(r, e, absDir, absState, len(entries))
+	}
+	// A batch whose blocks all fit needs no overflow line, so it must not
+	// depend on the overflow label at all.
+	if len(blocks) > 0 {
+		if all := strings.Join(blocks, "\n"); len(all) <= batchLimit {
+			return all, nil
+		}
 	}
 	total, kept := 0, 0
 	for i := range blocks {
@@ -480,7 +496,11 @@ func batchText(r core.RPCCfg, entries []pendingEntry, dir, state string) string 
 		}
 		extra := 0
 		if rest := len(blocks) - kept - 1; rest > 0 {
-			extra = 1 + len(overflowLine(r, rest, absDir, absState))
+			line, err := overflowLineWithin(r, rest, absDir, absState, batchLimit)
+			if err != nil {
+				return "", err
+			}
+			extra = 1 + len(line)
 		}
 		if total+add+extra > batchLimit {
 			break
@@ -489,17 +509,44 @@ func batchText(r core.RPCCfg, entries []pendingEntry, dir, state string) string 
 		kept++
 	}
 	if kept == 0 {
-		return overflowLine(r, len(blocks), absDir, absState)
+		return overflowLineWithin(r, len(blocks), absDir, absState, batchLimit)
 	}
 	out := strings.Join(blocks[:kept], "\n")
 	if kept < len(blocks) {
-		out += "\n" + overflowLine(r, len(blocks)-kept, absDir, absState)
+		line, err := overflowLineWithin(r, len(blocks)-kept, absDir, absState, batchLimit)
+		if err != nil {
+			return "", err
+		}
+		out += "\n" + line
 	}
-	return out
+	return out, nil
 }
 
+// overflowLine is the overflow line with the label taken verbatim: the
+// default-label shape the byte-compat goldens record. batchText renders the
+// bounded form.
 func overflowLine(r core.RPCCfg, n int, dir, state string) string {
-	return fmt.Sprintf("+%d %s: OMOSENSE_DIR=%s OMOSENSE_STATE=%s omosense rpc pending", n, r.Label("more"), shellQuote(dir), shellQuote(state))
+	return fmt.Sprintf("+%d %s: %s", n, r.Label("more"), pendingCmd(dir, state))
+}
+
+// pendingCmd is the mandatory tail of the overflow line: the absolute
+// env-pinned `rpc pending` command. It is machine-consumed and never
+// truncated.
+func pendingCmd(dir, state string) string {
+	return fmt.Sprintf("OMOSENSE_DIR=%s OMOSENSE_STATE=%s omosense rpc pending", shellQuote(dir), shellQuote(state))
+}
+
+// overflowLineWithin renders the overflow line inside limit bytes (IS-13): the
+// display-only `more` label is UTF-8-truncated to the room the mandatory
+// pending command leaves. A suffix that cannot fit at all is an error, so the
+// batcher sends nothing and leaves its entries un-notified.
+func overflowLineWithin(r core.RPCCfg, n int, dir, state string, limit int) (string, error) {
+	head, tail := fmt.Sprintf("+%d ", n), ": "+pendingCmd(dir, state)
+	room := limit - len(head) - len(tail)
+	if room < 0 {
+		return "", fmt.Errorf("the overflow line needs %d bytes, limit %d", len(head)+len(tail), limit)
+	}
+	return head + truncField(r.Label("more"), room) + tail, nil
 }
 
 // ackCommand is the machine-consumed command the batch carries: absolute

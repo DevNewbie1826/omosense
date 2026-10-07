@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/DevNewbie1826/omosense/internal/core"
 )
@@ -37,6 +38,17 @@ func logLines(b *bytes.Buffer, token string) []string {
 		}
 	}
 	return out
+}
+
+// mustBatchText renders a batch, failing the test when its mandatory content
+// cannot fit the budget.
+func mustBatchText(t *testing.T, r core.RPCCfg, entries []pendingEntry, dir, state string) string {
+	t.Helper()
+	text, err := batchText(r, entries, dir, state)
+	if err != nil {
+		t.Fatalf("batchText: %v", err)
+	}
+	return text
 }
 
 // TestClosedThreadSkipped guards Risk row "a closed thread's pane/session still
@@ -176,7 +188,7 @@ func TestNoHookGolden(t *testing.T) {
 		{ID: "D2", Session: "rpc-2", Name: ptr("job two"), Cwd: ptr("/jobs/two"), Thread: ptr("8"), Seq: 2, Count: 3, DoneAt: "2026-10-05T00:01:00.000Z"},
 	}
 	r := core.RPCCfg{}
-	if got := batchText(r, entries, "/proj", "/proj/state"); got != goldenBatch {
+	if got := mustBatchText(t, r, entries, "/proj", "/proj/state"); got != goldenBatch {
 		t.Fatalf("batch text changed from 0.1.0:\n--- got ---\n%s\n--- want ---\n%s", got, goldenBatch)
 	}
 	if got := entryBlock(r, entries[0], "/proj", "/proj/state", 2); got != goldenEntryBlock {
@@ -221,7 +233,7 @@ func TestBatchLabelsCustom(t *testing.T) {
 	}
 	r := core.RPCCfg{Labels: labels}
 	e := pendingEntry{ID: "D1", Session: "rpc-1", Name: ptr("n"), Cwd: ptr("/c"), Thread: ptr("7"), Seq: 1, Count: 1, DoneAt: "2026-10-05T00:00:00.000Z", Verify: "unverified", VerifyDetail: "exit 1: boom"}
-	text := batchText(r, []pendingEntry{e}, "/proj", "/proj/state")
+	text := mustBatchText(t, r, []pendingEntry{e}, "/proj", "/proj/state")
 	for _, want := range []string{
 		"TASK: n", "THREAD: 7", "CWD: /c", "ID: D1", "SEQ: 1",
 		"DONE: 2026-10-05T00:00:00.000Z", "N: 1", "UNV: exit 1: boom",
@@ -248,7 +260,7 @@ func TestBatchLabelsCustom(t *testing.T) {
 		{ID: "D1", Session: "rpc-1", Name: ptr("n"), Cwd: ptr("/c"), Thread: ptr("7"), Seq: 1, Count: 1, DoneAt: "2026-10-05T00:00:00.000Z"},
 		{ID: "D2", Session: "rpc-2", Name: ptr("n"), Cwd: ptr("/c"), Thread: ptr("8"), Seq: 2, Count: 2, DoneAt: "2026-10-05T00:01:00.000Z"},
 	}
-	text = batchText(long, two, "/proj", "/proj/state")
+	text = mustBatchText(t, long, two, "/proj", "/proj/state")
 	if len(text) > batchLimit {
 		t.Fatalf("batch over the 32 KiB budget with long labels: %d bytes", len(text))
 	}
@@ -257,6 +269,91 @@ func TestBatchLabelsCustom(t *testing.T) {
 			t.Fatalf("ACK command for %s was truncated:\n%s", e.ID, text)
 		}
 	}
+}
+
+// TestBatchOverflowLabelBounded guards IS-13's budget for the overflow line: a
+// long configured `more` label is truncated to the bytes the mandatory
+// `omosense rpc pending` command leaves, so the argument the batcher actually
+// sends stays inside 32 KiB, is valid UTF-8, and still carries the whole
+// pending command.
+func TestBatchOverflowLabelBounded(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		more string
+	}{
+		{"ascii", strings.Repeat("M", batchLimit)},
+		{"multi-byte", strings.Repeat("가", batchLimit)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			x := newBatchFixture(t)
+			// A `task` label longer than the whole budget forces the overflow
+			// path: no entry block fits, so the batch is the overflow line.
+			x.b.c.Profile.RPC.Labels = map[string]string{"task": strings.Repeat("T", batchLimit), "more": tc.more}
+			x.subscribe(t, "MAINQA")
+			pendingRecord(t, x.b.store, "D1", "rpc-1")
+			pendingRecord(t, x.b.store, "D2", "rpc-2")
+			x.advance(batchQuiet)
+			x.pass(t)
+			sends := x.f.sub(t, "send")
+			if len(sends) != 1 {
+				t.Fatalf("sends = %q", sends)
+			}
+			text := sends[0][3]
+			if len(text) > batchLimit {
+				t.Fatalf("sent argument = %d bytes, over the %d budget", len(text), batchLimit)
+			}
+			if !utf8.ValidString(text) {
+				t.Fatalf("sent argument split a rune: %q", text)
+			}
+			want := fmt.Sprintf("OMOSENSE_DIR='%s' OMOSENSE_STATE='%s' omosense rpc pending", x.b.c.Dir, x.b.c.State)
+			if !strings.Contains(text, want) {
+				t.Fatalf("the pending command is missing or truncated:\n%s", text)
+			}
+			if !strings.HasPrefix(text, "+2 ") {
+				t.Fatalf("the batch is not the overflow line:\n%s", text)
+			}
+			if strings.Contains(text, tc.more) {
+				t.Fatalf("the whole %d-byte more label was kept", len(tc.more))
+			}
+			if len(text) < batchLimit-2 {
+				t.Fatalf("the label was not filled to the budget: %d bytes", len(text))
+			}
+			if un, err := x.b.store.Unnotified(); err != nil || len(un) != 0 {
+				t.Fatalf("un-notified after the batch: %+v %v", un, err)
+			}
+			t.Logf("sent argument: %d bytes, prefix %q", len(text), text[:24])
+		})
+	}
+}
+
+// TestBatchOverflowMandatoryTooLarge guards IS-13's failure rule: when the
+// mandatory pending command cannot fit the budget, no batch is sent, the
+// entries stay un-notified, and one LOG line names the reason.
+func TestBatchOverflowMandatoryTooLarge(t *testing.T) {
+	x := newBatchFixture(t)
+	x.subscribe(t, "MAINQA")
+	pendingRecord(t, x.b.store, "D1", "rpc-1")
+	pendingRecord(t, x.b.store, "D2", "rpc-2")
+	// A folder path long enough that the overflow line's mandatory suffix alone
+	// exceeds the budget.
+	x.b.c.Dir = "/" + strings.Repeat("d", batchLimit)
+	x.advance(batchQuiet)
+	x.pass(t)
+	if sends := x.f.sub(t, "send"); len(sends) != 0 {
+		t.Fatalf("a batch whose mandatory suffix cannot fit was sent: %q", sends)
+	}
+	un, err := x.b.store.Unnotified()
+	if err != nil || len(un) != 2 {
+		t.Fatalf("entries after a refused batch: %+v %v", un, err)
+	}
+	lines := logLines(x.logs, "rpc batch too large:")
+	if len(lines) != 1 {
+		t.Fatalf("LOG lines = %v", logLines(x.logs, "rpc"))
+	}
+	if !strings.Contains(lines[0], fmt.Sprintf("limit %d", batchLimit)) {
+		t.Fatalf("reason = %q", lines[0])
+	}
+	t.Logf("refused batch: %s", lines[0])
 }
 
 // TestBatchUnverifiedLine guards Risk row "batch omits the unverified line or
@@ -836,4 +933,64 @@ func TestSilentSessionReportedOnce(t *testing.T) {
 	}
 	t.Logf("silent-session lines: %v", lines)
 	t.Log("cleanup: test Cleanup closes and joins fake RPC, removes temporary socket/state, restores environment, sleepFn and nowFn")
+}
+
+// countLines counts the rendered lines that carry substr.
+func countLines(lines []string, substr string) int {
+	n := 0
+	for _, l := range lines {
+		if strings.Contains(l, substr) {
+			n++
+		}
+	}
+	return n
+}
+
+// TestSilentSessionCountDecreaseDoesNotRearm guards IS-6's growth rule: a
+// messageCount is compared with the immediately preceding sample, so a session
+// whose count drops and then grows on every poll is never silent, while a
+// frozen session is still reported once. The reviewed defect kept the pre-drop
+// high-water mark, so real growth below it was read as silence.
+func TestSilentSessionCountDecreaseDoesNotRearm(t *testing.T) {
+	var b bytes.Buffer
+	c := rpcCtx(t, &b, `{"grow":{"session_id":"g"},"frozen":{"session_id":"c"}}`)
+	c.Profile.SilentMinutes = 30
+	clock := time.Date(2026, 10, 5, 0, 0, 0, 0, time.UTC)
+	old := nowFn
+	nowFn = func() time.Time { return clock }
+	t.Cleanup(func() { nowFn = old })
+
+	counts := []int{100, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17}
+	var ticks []scriptTick
+	for _, n := range counts {
+		ticks = append(ticks, scriptTick{
+			sessions: []map[string]any{session("rpc-g", "g"), session("rpc-c", "c")},
+			states: map[string]any{
+				"rpc-g": state("working", n),
+				"rpc-c": state("working", 3),
+			},
+		})
+	}
+	path := shortSocket(t)
+	serveRPC(t, path, ticks)
+	t.Setenv("OMOSENSE_RPC_SOCK", path)
+	w := newWatcher(c, c.Out)
+
+	for i, n := range counts {
+		clock = clock.Add(5 * time.Minute)
+		w.tick(context.Background())
+		lines := logLines(&b, "silent-session")
+		if got := countLines(lines, `"id":"g"`); got != 0 {
+			t.Fatalf("tick %d (count %d): the growing session was reported silent %d time(s): %v", i, n, got, lines)
+		}
+		want := 0
+		if i >= 6 {
+			want = 1
+		}
+		if got := countLines(lines, `"id":"c"`); got != want {
+			t.Fatalf("tick %d: frozen control silent lines = %d, want %d: %v", i, got, want, lines)
+		}
+	}
+	t.Logf("silent-session lines: %v", logLines(&b, "silent-session"))
+	t.Log("cleanup: test Cleanup closes and joins fake RPC, removes temporary socket/state, restores environment and nowFn")
 }
