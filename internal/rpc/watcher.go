@@ -2,6 +2,7 @@ package rpc
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -31,6 +32,18 @@ type record struct {
 	streamSeq                          uint64
 }
 
+// silentState tracks one registered session's silence window (IS-6): the last
+// activity (a status change or a messageCount increase), the status and count
+// that defined it, and whether the current window was already reported. It is
+// deliberately separate from seen/turns, so the completion ordering rule is
+// untouched.
+type silentState struct {
+	last     time.Time
+	status   string
+	count    int
+	reported bool
+}
+
 type watcher struct {
 	folder, stateDir, socket string
 	all, first, ready        bool
@@ -50,6 +63,8 @@ type watcher struct {
 	streamEpoch              int
 	streamSeq                uint64
 	queue                    *streamFIFO
+	silent                   map[string]silentState
+	silentMinutes            int
 }
 
 func newWatcher(c *core.Ctx, sink core.Sink) *watcher {
@@ -60,6 +75,7 @@ func newWatcher(c *core.Ctx, sink core.Sink) *watcher {
 		handles: map[string]sessionInfo{}, turns: map[string]streamTurn{},
 		closed: map[string]string{}, deferred: map[string][]deferredDone{},
 		streamErrors: map[string]bool{},
+		silent:       map[string]silentState{}, silentMinutes: c.Profile.SilentMinutes,
 	}
 }
 
@@ -110,6 +126,24 @@ loop:
 	<-timerDone
 	<-readerDone
 	return nil
+}
+
+// silentLine is the IS-6 silent-session LOG payload: a registered session
+// stayed working with no status change and no output growth since `since`.
+func silentLine(e entry, since, now time.Time) string {
+	payload, err := json.Marshal(struct {
+		Source       string `json:"source"`
+		Session      string `json:"session"`
+		ID           string `json:"id"`
+		Thread       string `json:"thread"`
+		Since        string `json:"since"`
+		Minutes      int    `json:"minutes"`
+		MessageCount int    `json:"messageCount"`
+	}{"rpc", e.info.Session, e.info.id(), snapText(e.thread), core.ISO(since), int(now.Sub(since).Minutes()), e.state.Count})
+	if err != nil {
+		return "silent-session"
+	}
+	return "silent-session " + string(payload)
 }
 
 func (w *watcher) noteError(key string, err error) {
@@ -194,6 +228,7 @@ func (w *watcher) poll(ctx context.Context, reconcile bool) {
 		}
 	}
 	seen := make(map[string]record, len(entries))
+	silent := make(map[string]silentState, len(w.silent))
 	for _, e := range entries {
 		id := e.info.id()
 		if ended, ok := w.closed[e.info.Session]; ok && ended == id {
@@ -211,6 +246,24 @@ func (w *watcher) poll(ctx context.Context, reconcile bool) {
 		}
 		next := prev
 		status := e.state.status()
+		if e.thread != nil {
+			// A registered session that stays working with no status change
+			// and no output growth is reported once per silence window
+			// (IS-6); a status change or a growth re-arms it.
+			now := nowFn()
+			s, tracked := w.silent[id]
+			switch {
+			case !tracked:
+				s = silentState{last: now, status: status, count: e.state.Count}
+			case status != s.status || e.state.Count > s.count:
+				s.last, s.status, s.count, s.reported = now, status, e.state.Count, false
+			case status == "working" && !s.reported && w.silentMinutes > 0 &&
+				now.Sub(s.last) >= time.Duration(w.silentMinutes)*time.Minute:
+				s.reported = true
+				w.sink.Log(silentLine(e, s.last, now))
+			}
+			silent[id] = s
+		}
 		var from *string
 		if prev.status != "" {
 			from = ptr(prev.status)
@@ -258,7 +311,7 @@ func (w *watcher) poll(ctx context.Context, reconcile bool) {
 			}
 		}
 	}
-	w.seen, w.listed, w.first = seen, listed, false
+	w.seen, w.listed, w.first, w.silent = seen, listed, false, silent
 	if healthy && !w.ready {
 		w.sink.Log(fmt.Sprintf("rpc ready (%d sessions, %d watched)", len(list), len(entries)))
 		w.ready = true

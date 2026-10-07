@@ -452,7 +452,7 @@ func TestStreamNestedReconciliation(t *testing.T) {
 	record := h.w.record
 	h.w.record = func(id string, ev rpcEvent) {
 		record(id, ev)
-		if _, err := store.Record(id, ev); err != nil {
+		if _, err := store.Record(id, ev, false); err != nil {
 			t.Error(err)
 		}
 	}
@@ -509,7 +509,7 @@ func TestStreamFlappingPollFallback(t *testing.T) {
 	record := h.w.record
 	h.w.record = func(id string, ev rpcEvent) {
 		record(id, ev)
-		if _, err := store.Record(id, ev); err != nil {
+		if _, err := store.Record(id, ev, false); err != nil {
 			t.Error(err)
 		}
 	}
@@ -581,7 +581,7 @@ func TestStreamHeldReconciliationRebindsTurn(t *testing.T) {
 	record := h.w.record
 	h.w.record = func(id string, ev rpcEvent) {
 		record(id, ev)
-		if _, err := store.Record(id, ev); err != nil {
+		if _, err := store.Record(id, ev, false); err != nil {
 			t.Error(err)
 		}
 	}
@@ -621,7 +621,7 @@ func TestStreamReconciliationDropsEndedTurn(t *testing.T) {
 	record := h.w.record
 	h.w.record = func(id string, ev rpcEvent) {
 		record(id, ev)
-		if _, err := store.Record(id, ev); err != nil {
+		if _, err := store.Record(id, ev, false); err != nil {
 			t.Error(err)
 		}
 	}
@@ -653,7 +653,7 @@ func TestStreamReconnectRemovedKnownTurn(t *testing.T) {
 	record := h.w.record
 	h.w.record = func(id string, ev rpcEvent) {
 		record(id, ev)
-		if _, err := store.Record(id, ev); err != nil {
+		if _, err := store.Record(id, ev, false); err != nil {
 			t.Error(err)
 		}
 	}
@@ -702,7 +702,7 @@ func TestStreamOutageReplacementRemoved(t *testing.T) {
 			record := h.w.record
 			h.w.record = func(id string, ev rpcEvent) {
 				record(id, ev)
-				if _, err := store.Record(id, ev); err != nil {
+				if _, err := store.Record(id, ev, false); err != nil {
 					t.Error(err)
 				}
 			}
@@ -744,7 +744,7 @@ func TestStreamOutagePollKeepsKnownTurn(t *testing.T) {
 			record := h.w.record
 			h.w.record = func(id string, ev rpcEvent) {
 				record(id, ev)
-				if _, err := store.Record(id, ev); err != nil {
+				if _, err := store.Record(id, ev, false); err != nil {
 					t.Error(err)
 				}
 			}
@@ -788,7 +788,7 @@ func TestStreamReconciliationBindsBeforeLaterSettle(t *testing.T) {
 	record := h.w.record
 	h.w.record = func(id string, ev rpcEvent) {
 		record(id, ev)
-		if _, err := store.Record(id, ev); err != nil {
+		if _, err := store.Record(id, ev, false); err != nil {
 			t.Error(err)
 		}
 	}
@@ -834,7 +834,7 @@ func TestStreamStaleOutagePollKeepsBinding(t *testing.T) {
 	record := h.w.record
 	h.w.record = func(id string, ev rpcEvent) {
 		record(id, ev)
-		if _, err := store.Record(id, ev); err != nil {
+		if _, err := store.Record(id, ev, false); err != nil {
 			t.Error(err)
 		}
 	}
@@ -879,7 +879,7 @@ func TestStreamLookupBindingSurvivesOlderPoll(t *testing.T) {
 	record := h.w.record
 	h.w.record = func(id string, ev rpcEvent) {
 		record(id, ev)
-		if _, err := store.Record(id, ev); err != nil {
+		if _, err := store.Record(id, ev, false); err != nil {
 			t.Error(err)
 		}
 	}

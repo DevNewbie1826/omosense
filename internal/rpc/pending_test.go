@@ -13,7 +13,7 @@ import (
 
 func pendingRecord(t *testing.T, s *pendingStore, id, handle string) pendingEntry {
 	t.Helper()
-	e, err := s.Record(id, rpcEvent{Session: handle, Name: ptr("job"), Cwd: ptr("/jobs"), Thread: ptr("7")})
+	e, err := s.Record(id, rpcEvent{Session: handle, Name: ptr("job"), Cwd: ptr("/jobs"), Thread: ptr("7")}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,7 +102,7 @@ func TestPendingConcurrentRecordAck(t *testing.T) {
 			defer wg.Done()
 			<-start
 			other := newPendingStore(dir)
-			if _, err := other.Record("D7", rpcEvent{Session: "rpc-9"}); err != nil {
+			if _, err := other.Record("D7", rpcEvent{Session: "rpc-9"}, false); err != nil {
 				errs <- err
 			}
 			if result, err := other.Ack("D7", 0, true); err != nil || result != "newer" {
@@ -124,7 +124,7 @@ func TestPendingConcurrentRecordAck(t *testing.T) {
 
 func TestPendingEmptyID(t *testing.T) {
 	s := newPendingStore(t.TempDir())
-	if _, err := s.Record("", rpcEvent{Session: "rpc-7"}); err == nil {
+	if _, err := s.Record("", rpcEvent{Session: "rpc-7"}, false); err == nil {
 		t.Fatal("accepted empty durable id")
 	}
 	if es := pendingList(t, s); len(es) != 0 {
@@ -139,7 +139,7 @@ func TestPendingCorruptFile(t *testing.T) {
 			if err := os.WriteFile(s.path, []byte(data), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := s.Record("D7", rpcEvent{}); err == nil {
+			if _, err := s.Record("D7", rpcEvent{}, false); err == nil {
 				t.Fatal("corrupt file accepted")
 			}
 			if _, err := s.List(); err == nil {

@@ -27,6 +27,10 @@ var (
 	batchQuiet         = 5 * time.Minute
 	batchLimit         = 32 * 1024
 	omoExecFn          = omoExec
+	// hookDoneFn runs after a hook result has been committed to the pending
+	// store, so a test can observe that write instead of racing the source's
+	// shutdown. It is a no-op unless a test replaces it.
+	hookDoneFn = func() {}
 )
 
 func omoBin() string {
@@ -209,7 +213,7 @@ func (b *batcher) pass(ctx context.Context) {
 		return
 	}
 	key := fmt.Sprintf("omosense-rpc-batch-%d", maxSeq)
-	if _, err := omoExecFn(ctx, "thread", "send", sub.Session, batchText(send, b.c.Dir, b.c.State), "--all-scope", "--idempotency-key", key, "--json"); err != nil {
+	if _, err := omoExecFn(ctx, "thread", "send", sub.Session, batchText(b.c.Profile.RPC, send, b.c.Dir, b.c.State), "--all-scope", "--idempotency-key", key, "--json"); err != nil {
 		b.note("rpc batch send: " + err.Error())
 		b.retryAt = now.Add(deliverRetry)
 		return
@@ -460,12 +464,13 @@ func takeSubscription(stateDir string) (*subscription, error) {
 
 // batchText renders the IS-9 batch: one block per entry, bounded to batchLimit
 // with a single overflow line naming `omosense rpc pending`. A listed entry's
-// ACK command is never truncated.
-func batchText(entries []pendingEntry, dir, state string) string {
+// ACK command is never truncated. Every label comes from the configured
+// rpc.labels (IS-13), and the budget counts their real lengths.
+func batchText(r core.RPCCfg, entries []pendingEntry, dir, state string) string {
 	absDir, absState := absPath(dir), absPath(state)
 	blocks := make([]string, len(entries))
 	for i, e := range entries {
-		blocks[i] = entryBlock(e, absDir, absState, len(entries))
+		blocks[i] = entryBlock(r, e, absDir, absState, len(entries))
 	}
 	total, kept := 0, 0
 	for i := range blocks {
@@ -475,7 +480,7 @@ func batchText(entries []pendingEntry, dir, state string) string {
 		}
 		extra := 0
 		if rest := len(blocks) - kept - 1; rest > 0 {
-			extra = 1 + len(overflowLine(rest, absDir, absState))
+			extra = 1 + len(overflowLine(r, rest, absDir, absState))
 		}
 		if total+add+extra > batchLimit {
 			break
@@ -484,17 +489,17 @@ func batchText(entries []pendingEntry, dir, state string) string {
 		kept++
 	}
 	if kept == 0 {
-		return overflowLine(len(blocks), absDir, absState)
+		return overflowLine(r, len(blocks), absDir, absState)
 	}
 	out := strings.Join(blocks[:kept], "\n")
 	if kept < len(blocks) {
-		out += "\n" + overflowLine(len(blocks)-kept, absDir, absState)
+		out += "\n" + overflowLine(r, len(blocks)-kept, absDir, absState)
 	}
 	return out
 }
 
-func overflowLine(n int, dir, state string) string {
-	return fmt.Sprintf("+%d more: OMOSENSE_DIR=%s OMOSENSE_STATE=%s omosense rpc pending", n, shellQuote(dir), shellQuote(state))
+func overflowLine(r core.RPCCfg, n int, dir, state string) string {
+	return fmt.Sprintf("+%d %s: OMOSENSE_DIR=%s OMOSENSE_STATE=%s omosense rpc pending", n, r.Label("more"), shellQuote(dir), shellQuote(state))
 }
 
 // ackCommand is the machine-consumed command the batch carries: absolute
@@ -511,18 +516,37 @@ func shellQuote(s string) string {
 }
 
 // entryBlock renders one entry. The display fields share the entry's slice of
-// the budget; the metadata and the ACK command are mandatory.
-func entryBlock(e pendingEntry, dir, state string, n int) string {
-	labels := "작업: \nthread: \ncwd: "
-	ack := "확인 명령: " + ackCommand(e, dir, state)
-	meta := fmt.Sprintf("완료 id: %s\nseq: %d\ndone_at: %s\ncount: %d", e.ID, e.Seq, e.DoneAt, e.Count)
-	display := (batchLimit/n - len(labels) - len(meta) - len(ack) - 2) / 3
+// the budget; the metadata, the unverified line and the ACK command are
+// mandatory. The unverified line follows the count and precedes the ACK
+// command; an entry without a hook verdict adds no line (IS-13).
+func entryBlock(r core.RPCCfg, e pendingEntry, dir, state string, n int) string {
+	labels := r.Label("task") + ": \n" + r.Label("thread") + ": \n" + r.Label("cwd") + ": "
+	ack := r.Label("ack") + ": " + ackCommand(e, dir, state)
+	meta := fmt.Sprintf("%s: %s\n%s: %d\n%s: %s\n%s: %d",
+		r.Label("id"), e.ID, r.Label("seq"), e.Seq, r.Label("doneAt"), e.DoneAt, r.Label("count"), e.Count)
+	extra := ""
+	switch e.Verify {
+	case "unverified":
+		extra = r.Label("unverified") + ": " + e.VerifyDetail
+	case "pending":
+		extra = r.Label("unverified") + ": " + r.Label("verifyPending")
+	}
+	seps := 2
+	if extra != "" {
+		seps = 3
+	}
+	display := (batchLimit/n - len(labels) - len(meta) - len(ack) - len(extra) - seps) / 3
 	if display < 0 {
 		display = 0
 	}
-	return fmt.Sprintf("작업: %s\nthread: %s\ncwd: %s\n%s\n%s",
-		truncField(snapText(e.Name), display), truncField(snapText(e.Thread), display),
-		truncField(snapText(e.Cwd), display), meta, ack)
+	tail := ""
+	if extra != "" {
+		tail = extra + "\n"
+	}
+	return fmt.Sprintf("%s: %s\n%s: %s\n%s: %s\n%s\n%s%s",
+		r.Label("task"), truncField(snapText(e.Name), display),
+		r.Label("thread"), truncField(snapText(e.Thread), display),
+		r.Label("cwd"), truncField(snapText(e.Cwd), display), meta, tail, ack)
 }
 
 // truncField cuts s to at most budget bytes without splitting a rune.
