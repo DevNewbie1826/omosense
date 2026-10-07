@@ -155,7 +155,7 @@ func (s src) tgHandle(ctx context.Context, sink core.Sink, bot string, api teleg
 		voiceID = m.VideoNote.FileID
 	}
 	if hasVoice {
-		text, err := telegramVoice(ctx, api, voiceID)
+		text, err := telegramVoice(ctx, api, voiceID, s.cfg.Profile.Transcriber)
 		if err != nil {
 			ev["transcribe_error"] = redact(err, api.token)
 		} else {
