@@ -84,10 +84,16 @@ func run(args []string) int {
 }
 
 // runHost is bare `omosense`: one foreground process hosting every source
-// the folder's flat config enables.
+// the folder's flat config enables. The memory-repo check (IS-14) runs
+// after Load and before any lock or source: a configured memory id whose
+// repo is missing refuses the start.
 func runHost() int {
 	ctx, err := core.Load(core.ParseArgs(nil), true)
 	if err != nil {
+		fmt.Fprintln(os.Stderr, "omosense:", err)
+		return 1
+	}
+	if err := core.CheckMemory(ctx); err != nil {
 		fmt.Fprintln(os.Stderr, "omosense:", err)
 		return 1
 	}

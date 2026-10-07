@@ -9,24 +9,30 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
 
 // Profile is the resolved flat config.json of the folder omosense runs in.
 // There is exactly one profile per folder: the profiles object is gone.
 type Profile struct {
-	Telegram  PlatformCfg
-	Discord   PlatformCfg
-	RPC       RPCCfg
-	Tidy      TidyCfg
-	Herdr     HerdrCfg
-	Memory    string
-	Calendars *[]string // nil means all calendars
-	Mail      bool
+	Telegram      PlatformCfg
+	Discord       PlatformCfg
+	RPC           RPCCfg
+	Tidy          TidyCfg
+	Herdr         HerdrCfg
+	Memory        string
+	Calendars     *[]string // nil means all calendars
+	Mail          bool
+	Verify        VerifyCfg
+	SilentMinutes int
+	Transcriber   []string
+	Guard         GuardCfg
 }
 
 // PlatformCfg is a platform section: the single bot this folder listens on
@@ -41,7 +47,49 @@ type PlatformCfg struct {
 type RPCCfg struct {
 	Enabled bool
 	All     bool
+	// Verify is the tri-state rpc.verify: absent (nil) and true are both
+	// on, only an explicit false turns the done-verification hook off.
+	Verify *bool
+	// Labels holds the configured rpc.labels overrides; Label resolves a
+	// key against them and the defaults.
+	Labels map[string]string
 }
+
+// VerifyOn reports whether the rpc done-verification hook runs.
+func (r RPCCfg) VerifyOn() bool { return r.Verify == nil || *r.Verify }
+
+// Label returns the rpc batch label for key: the configured override,
+// else the default. An unknown key has no default and returns "".
+func (r RPCCfg) Label(key string) string {
+	if v, ok := r.Labels[key]; ok {
+		return v
+	}
+	return rpcLabelDefaults[key]
+}
+
+// rpcLabelList is the label table: key order fixes the unknown-key error
+// text, def is the 0.1.0 default each label reproduces byte-for-byte.
+var rpcLabelList = []struct{ key, def string }{
+	{"task", "작업"},
+	{"thread", "thread"},
+	{"cwd", "cwd"},
+	{"id", "완료 id"},
+	{"seq", "seq"},
+	{"doneAt", "done_at"},
+	{"count", "count"},
+	{"ack", "확인 명령"},
+	{"unverified", "미검증"},
+	{"verifyPending", "검증이 끝나지 않음"},
+	{"more", "more"},
+}
+
+var rpcLabelDefaults = func() map[string]string {
+	m := make(map[string]string, len(rpcLabelList))
+	for _, e := range rpcLabelList {
+		m[e.key] = e.def
+	}
+	return m
+}()
 
 // TidyCfg is the tidy section.
 type TidyCfg struct {
@@ -50,10 +98,30 @@ type TidyCfg struct {
 	Exclude     []string
 }
 
+// VerifyCfg is the verify section: the optional done-verification hook
+// command (empty means no hook) and its per-attempt timeout.
+type VerifyCfg struct {
+	Command    []string
+	TimeoutSec int
+}
+
+// GuardCfg is the guard section: host resource-guard thresholds.
+type GuardCfg struct {
+	StateFileBytes int64
+}
+
 // HerdrCfg is the herdr section. herdr is a default source: Enabled absent
 // means on, and only an explicit false turns it off.
 type HerdrCfg struct {
 	Enabled *bool
+	// Verify is the opt-in herdr.done hook: absent (false) keeps HERDR
+	// lines byte-identical to 0.1.0.
+	Verify bool
+	// AgentPattern is the dead-pane foreground match source and AgentRe
+	// its compiled form; after Load both always carry the configured or
+	// default pattern, so AgentRe is never nil.
+	AgentPattern string
+	AgentRe      *regexp.Regexp
 }
 
 // On reports whether the herdr source runs: absent means yes.
@@ -226,6 +294,11 @@ func parseCfg(om *OMap) (*Cfg, error) {
 	return &Cfg{Raw: om}, nil
 }
 
+// defaultAgentPattern is the IS-5 dead-pane foreground default: the
+// measured agent argvs (senpi/omo/claude/codex/opencode bundles, pi)
+// against everything else a pane foreground can be.
+const defaultAgentPattern = `senpi|omo|claude|codex|opencode|(^|/)pi( |$)`
+
 // parseProfile validates the flat document. Every key is optional, but a
 // present key must have the declared shape; violations name the key path
 // (for example "config.json: telegram.bot must be a string") so the
@@ -246,6 +319,12 @@ func parseProfile(om *OMap) (Profile, error) {
 			return out, err
 		}
 		if out.All, err = boolKey(section, "all", "rpc.all"); err != nil {
+			return out, err
+		}
+		if out.Verify, err = boolPtrKey(section, "verify", "rpc.verify"); err != nil {
+			return out, err
+		}
+		if out.Labels, err = labelsKey(section); err != nil {
 			return out, err
 		}
 		return out, nil
@@ -270,14 +349,33 @@ func parseProfile(om *OMap) (Profile, error) {
 	}
 	if p.Herdr, err = sectionCfg(om, "herdr", func(section *OMap) (HerdrCfg, error) {
 		var out HerdrCfg
-		enabled, err := boolPtrKey(section, "enabled", "herdr.enabled")
-		if err != nil {
+		var err error
+		if out.Enabled, err = boolPtrKey(section, "enabled", "herdr.enabled"); err != nil {
 			return out, err
 		}
-		out.Enabled = enabled
+		if out.Verify, err = boolKey(section, "verify", "herdr.verify"); err != nil {
+			return out, err
+		}
+		if out.AgentPattern, err = strKey(section, "agentPattern", "herdr.agentPattern"); err != nil {
+			return out, err
+		}
+		if out.AgentPattern == "" {
+			out.AgentPattern = defaultAgentPattern
+		}
+		re, err := regexp.Compile(out.AgentPattern)
+		if err != nil {
+			return HerdrCfg{}, fmt.Errorf("config.json: herdr.agentPattern is not a valid regular expression: %v", err)
+		}
+		out.AgentRe = re
 		return out, nil
 	}); err != nil {
 		return Profile{}, err
+	}
+	if p.Herdr.AgentRe == nil {
+		// herdr section absent or null: the default pattern still resolves,
+		// so the compiled pattern is never nil after Load.
+		p.Herdr.AgentPattern = defaultAgentPattern
+		p.Herdr.AgentRe = regexp.MustCompile(defaultAgentPattern)
 	}
 	if p.Memory, err = strKey(om, "memory", "memory"); err != nil {
 		return Profile{}, err
@@ -287,6 +385,49 @@ func parseProfile(om *OMap) (Profile, error) {
 	}
 	if p.Mail, err = boolKey(om, "mail", "mail"); err != nil {
 		return Profile{}, err
+	}
+	if p.Verify, err = sectionCfg(om, "verify", func(section *OMap) (VerifyCfg, error) {
+		var out VerifyCfg
+		var err error
+		if out.Command, err = cmdKey(section, "command", "verify.command"); err != nil {
+			return out, err
+		}
+		n, err := posIntKey(section, "timeoutSec", "verify.timeoutSec")
+		if err != nil {
+			return out, err
+		}
+		out.TimeoutSec = int(n)
+		return out, nil
+	}); err != nil {
+		return Profile{}, err
+	}
+	if p.Verify.TimeoutSec == 0 {
+		p.Verify.TimeoutSec = 60
+	}
+	n, err := posIntKey(om, "silentMinutes", "silentMinutes")
+	if err != nil {
+		return Profile{}, err
+	}
+	if n == 0 {
+		n = 30
+	}
+	p.SilentMinutes = int(n)
+	if p.Transcriber, err = cmdKey(om, "transcriber", "transcriber"); err != nil {
+		return Profile{}, err
+	}
+	if p.Guard, err = sectionCfg(om, "guard", func(section *OMap) (GuardCfg, error) {
+		var out GuardCfg
+		n, err := posIntKey(section, "stateFileBytes", "guard.stateFileBytes")
+		if err != nil {
+			return out, err
+		}
+		out.StateFileBytes = n
+		return out, nil
+	}); err != nil {
+		return Profile{}, err
+	}
+	if p.Guard.StateFileBytes == 0 {
+		p.Guard.StateFileBytes = 16 << 20
 	}
 	return p, nil
 }
@@ -409,6 +550,78 @@ func strsKey(m *OMap, key, path string) ([]string, error) {
 			return nil, fmt.Errorf("config.json: %s must be an array of strings", path)
 		}
 		out = append(out, s)
+	}
+	return out, nil
+}
+
+// cmdKey reads a command key: a non-empty array of strings whose first
+// element (the program to run) is non-empty. Later elements may be empty
+// strings: they are arguments the command receives verbatim.
+func cmdKey(m *OMap, key, path string) ([]string, error) {
+	v, ok := m.Get(key)
+	if !ok || v == nil {
+		return nil, nil
+	}
+	arr, isArr := v.([]any)
+	if !isArr || len(arr) == 0 {
+		return nil, fmt.Errorf("config.json: %s must be a non-empty array of strings", path)
+	}
+	out := make([]string, len(arr))
+	for i, e := range arr {
+		s, isStr := e.(string)
+		if !isStr || (i == 0 && s == "") {
+			return nil, fmt.Errorf("config.json: %s must be a non-empty array of strings", path)
+		}
+		out[i] = s
+	}
+	return out, nil
+}
+
+// posIntKey reads a positive integer key: a JSON number that is an
+// integer greater than zero (fractions, zero and negatives are rejected).
+// Absent and null return 0 so the caller applies its default.
+func posIntKey(m *OMap, key, path string) (int64, error) {
+	v, ok := m.Get(key)
+	if !ok || v == nil {
+		return 0, nil
+	}
+	n, isNum := v.(json.Number)
+	if !isNum {
+		return 0, fmt.Errorf("config.json: %s must be a positive integer", path)
+	}
+	i, err := n.Int64()
+	if err != nil || i <= 0 {
+		return 0, fmt.Errorf("config.json: %s must be a positive integer", path)
+	}
+	return i, nil
+}
+
+// labelsKey reads rpc.labels: string values under exactly the known
+// label keys.
+func labelsKey(section *OMap) (map[string]string, error) {
+	v, ok := section.Get("labels")
+	if !ok || v == nil {
+		return nil, nil
+	}
+	lm, isObj := v.(*OMap)
+	if !isObj {
+		return nil, fmt.Errorf("config.json: rpc.labels must be an object")
+	}
+	out := make(map[string]string, lm.Len())
+	for _, k := range lm.Keys() {
+		if _, known := rpcLabelDefaults[k]; !known {
+			keys := make([]string, len(rpcLabelList))
+			for i, e := range rpcLabelList {
+				keys[i] = e.key
+			}
+			return nil, fmt.Errorf("config.json: rpc.labels.%s is not a known label (%s)", k, strings.Join(keys, ", "))
+		}
+		val, _ := lm.Get(k)
+		s, isStr := val.(string)
+		if !isStr {
+			return nil, fmt.Errorf("config.json: rpc.labels.%s must be a string", k)
+		}
+		out[k] = s
 	}
 	return out, nil
 }

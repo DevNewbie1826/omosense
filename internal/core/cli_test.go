@@ -341,3 +341,72 @@ func TestCLIStaleOmomeowEnvFails(t *testing.T) {
 		t.Errorf("exit = %d stderr = %q, want stale OMOMEOW_DIR failure", code, eb.String())
 	}
 }
+
+// TestCLIBareHostMemoryCheck pins IS-14 on the real binary: bare
+// omosense with a configured memory id whose repo is missing exits 1
+// naming the key and the checked path before any lock or source starts;
+// with the repo present the host starts (its startup LOG) and stops
+// cleanly on SIGTERM. herdr is disabled so the test host never touches a
+// real herdr socket.
+func TestCLIBareHostMemoryCheck(t *testing.T) {
+	buildBinaries(t)
+	home, dir, state := cliEnv(t)
+	agents := filepath.Join(home, "agents")
+	t.Setenv("OMO_MEMORY_AGENTS", agents)
+
+	writeCliConfig(t, dir, `{"memory":"nope","herdr":{"enabled":false}}`)
+	stdout, stderr, code := runBin(t)
+	want := "omosense: config.json: memory \"nope\": repo not found at " + filepath.Join(agents, "nope", "repo") + "\n"
+	if code != 1 || stderr != want || stdout != "" {
+		t.Fatalf("exit = %d stderr = %q stdout = %q, want exit 1 with exactly %q", code, stderr, stdout, want)
+	}
+	locks, err := filepath.Glob(filepath.Join(state, "*.lock"))
+	if err != nil || len(locks) != 0 {
+		t.Errorf("a lock was taken before the memory check: %v (err=%v)", locks, err)
+	}
+
+	if err := os.MkdirAll(filepath.Join(agents, "ok", "repo"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeCliConfig(t, dir, `{"memory":"ok","herdr":{"enabled":false}}`)
+	cmd := exec.Command(binPath)
+	out, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	ready := make(chan string, 1)
+	go func() {
+		sc := bufio.NewScanner(out)
+		for sc.Scan() {
+			if strings.HasPrefix(sc.Text(), "LOG omosense host starting") {
+				ready <- sc.Text()
+			}
+		}
+		close(ready)
+	}()
+	select {
+	case line, ok := <-ready:
+		if !ok {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			t.Fatal("the host exited before its startup line")
+		}
+		_ = line
+	case <-time.After(10 * time.Second):
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		t.Fatal("the host did not start within 10s (memory check refused a present repo)")
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	_ = cmd.Process.Signal(syscall.SIGTERM)
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		_ = cmd.Process.Kill()
+		t.Fatal("the host did not exit on SIGTERM")
+	}
+}
