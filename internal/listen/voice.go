@@ -73,14 +73,16 @@ func transcribe(ctx context.Context, url string, argv []string) (text string, er
 // runTranscriber runs argv against the downloaded audio. Stdout trimmed is
 // the transcript. A non-zero exit or a start error is
 // "transcriber: <err>: <stderr trimmed, 200 runes>", without the
-// ": <stderr>" part when stderr is empty.
+// ": <stderr>" part when stderr is empty. The transcriber owns a process
+// group (core.SourceCommand/RunSource), so a cancel kills it and any child
+// it left behind before this returns and the caller can release its lock.
 func runTranscriber(ctx context.Context, argv []string, audio string) (string, error) {
 	args := substituteAudio(argv, audio)
-	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
+	cmd := core.SourceCommand(ctx, args[0], args[1:]...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
+	if err := core.RunSource(cmd); err != nil {
 		return "", transcriberErr(err, stderr.String())
 	}
 	return strings.TrimSpace(stdout.String()), nil

@@ -22,10 +22,13 @@ type VerifyResult struct {
 
 // RunVerify runs command with a per-attempt timeout: exit 0 verifies,
 // anything else gets exactly one retry (two attempts ever). A cancelled
-// ctx returns cancelled with no retry, the running process killed;
-// WaitDelay bounds the return even when an escaped child holds the
-// pipes. env is appended to os.Environ(); dir becomes the working
-// directory when it is an existing directory, else it is inherited.
+// ctx returns cancelled with no retry, the running process killed. Each
+// attempt runs through SourceCommand/RunSource, so the hook owns a
+// process group: cancellation group-kills it and any child it left
+// behind, and the bounded pipe drain still returns even when an escaped
+// descendant holds the pipes. env is appended to os.Environ(); dir
+// becomes the working directory when it is an existing directory, else
+// it is inherited.
 func RunVerify(ctx context.Context, command []string, timeout time.Duration, env []string, dir string) VerifyResult {
 	var res VerifyResult
 	for attempt := 0; attempt < 2; attempt++ {
@@ -43,15 +46,14 @@ func RunVerify(ctx context.Context, command []string, timeout time.Duration, env
 func runVerifyOnce(ctx context.Context, command []string, timeout time.Duration, env []string, dir string) VerifyResult {
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	cmd := exec.CommandContext(cctx, command[0], command[1:]...)
+	cmd := SourceCommand(cctx, command[0], command[1:]...)
 	cmd.Env = append(os.Environ(), env...)
 	if fi, err := os.Stat(dir); err == nil && fi.IsDir() {
 		cmd.Dir = dir
 	}
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
-	cmd.WaitDelay = 2 * time.Second
-	err := cmd.Run()
+	err := RunSource(cmd)
 	if err == nil {
 		return VerifyResult{Status: "verified"}
 	}

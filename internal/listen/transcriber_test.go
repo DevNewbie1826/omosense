@@ -1,12 +1,16 @@
 package listen
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -252,6 +256,161 @@ func TestTranscriberRespectsContext(t *testing.T) {
 	}
 	if processAlive(pid) {
 		t.Fatalf("transcriber pid %d still alive after cancel", pid)
+	}
+}
+
+// subscribeFifo subscribes to a FIFO BEFORE the transcriber starts. The
+// goroutine blocks in open() until the child opens the FIFO for writing,
+// reports the pid line the child writes (readiness), then blocks until the
+// last writer closes and reports that (io.EOF) - which happens exactly when
+// the child dies. Both waits are OS events on the pipe; neither polls.
+func subscribeFifo(t *testing.T, path string) (<-chan string, <-chan error) {
+	t.Helper()
+	pids := make(chan string, 1)
+	gones := make(chan error, 1)
+	go func() {
+		f, err := os.OpenFile(path, os.O_RDONLY, 0)
+		if err != nil {
+			pids <- ""
+			gones <- err
+			return
+		}
+		defer f.Close()
+		br := bufio.NewReader(f)
+		line, err := br.ReadString('\n')
+		if err != nil {
+			pids <- ""
+			gones <- err
+			return
+		}
+		pids <- strings.TrimSpace(line)
+		_, err = br.ReadByte()
+		gones <- err
+	}()
+	return pids, gones
+}
+
+// awaitFifoPid waits (bounded) for the child's readiness line.
+func awaitFifoPid(t *testing.T, pids <-chan string, bound time.Duration) int {
+	t.Helper()
+	select {
+	case line := <-pids:
+		n, err := strconv.Atoi(line)
+		if err != nil || n <= 0 {
+			t.Fatalf("transcriber child pid line %q: %v", line, err)
+		}
+		return n
+	case <-time.After(bound):
+		t.Fatalf("the transcriber child never announced readiness through the FIFO within %s", bound)
+		return 0
+	}
+}
+
+// awaitFifoGone waits (bounded) for the FIFO's last writer to close. The
+// child holds the FIFO open for writing, so a surviving child keeps this
+// read blocked and the bound is what fails.
+func awaitFifoGone(t *testing.T, gones <-chan error, bound time.Duration) {
+	t.Helper()
+	select {
+	case err := <-gones:
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("FIFO read ended with %v, want EOF once the child died", err)
+		}
+	case <-time.After(bound):
+		t.Fatalf("the transcriber child still holds the FIFO %s after the cancel: it survived the kill", bound)
+	}
+}
+
+// childProcessGone confirms FIFO EOF without waiting for an orphan's
+// reaping. A zombie has exited; a running child still fails this check.
+func childProcessGone(pid int) bool {
+	if !processAlive(pid) {
+		return true
+	}
+	state, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "stat=").Output()
+	return (err == nil && strings.HasPrefix(strings.TrimSpace(string(state)), "Z")) ||
+		!processAlive(pid)
+}
+
+// TestTranscriberCancelKillsBackgroundChild pins the transcriber's
+// process-group contract (core.SourceCommand/RunSource): the configured
+// transcriber starts an ordinary child WITHOUT exec, so that child stays in
+// the transcriber's process group and inherits its stdout/stderr pipes. The
+// child opens a FIFO for writing (the test subscribes to it before the
+// source starts), announces its pid, then blocks holding both the FIFO and
+// the inherited pipes. Cancelling the handler context must make the source
+// return - so the host can release listen.lock.json - AND close the FIFO's
+// last writer by killing that child. A bare exec.CommandContext kills only
+// the transcriber and then blocks forever draining pipes the surviving child
+// still holds.
+func TestTranscriberCancelKillsBackgroundChild(t *testing.T) {
+	dir := t.TempDir()
+	fifoPath := filepath.Join(dir, "child.fifo")
+	child := exitTranscriber(t, fmt.Sprintf("exec 9>%s\nprintf '%%s\\n' \"$$\" >&9\nwhile :; do :; done\n", shellQuote(fifoPath)))
+	script := exitTranscriber(t, fmt.Sprintf("%s &\nwait\n", shellQuote(child)))
+	c := testCtx(t)
+	c.Profile.Transcriber = []string{script, "{audio}"}
+	server := audioServer(t)
+	defer server.Close()
+	var u telegramUpdate
+	if err := json.Unmarshal([]byte(`{"message":{"message_id":1,"chat":{"id":2,"type":"private"},"caption":"original","voice":{"file_id":"voice-id"}}}`), &u); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(fifoPath, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pids, gones := subscribeFifo(t, fifoPath)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var pid int
+	t.Cleanup(func() {
+		if pid > 0 && processAlive(pid) {
+			if p, err := os.FindProcess(pid); err == nil {
+				_ = p.Signal(syscall.SIGKILL)
+			}
+		}
+	})
+	type outcome struct {
+		ev  map[string]any
+		err error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		sink := newSink()
+		err := sourceByName(t, c, "telegram").tgHandle(ctx, sink, "test", telegramAPI{server.URL, "fake-test-token", server.Client()}, u)
+		if err != nil {
+			done <- outcome{err: err}
+			return
+		}
+		select {
+		case rec := <-sink.signal:
+			ev, _ := rec.value.(map[string]any)
+			done <- outcome{ev: ev}
+		case <-time.After(5 * time.Second):
+			done <- outcome{err: fmt.Errorf("no event after transcriber start")}
+		}
+	}()
+	pid = awaitFifoPid(t, pids, 5*time.Second)
+	t.Logf("transcriber child pid %d is holding the pipes; cancelling the context", pid)
+	cancel()
+	var ev map[string]any
+	select {
+	case out := <-done:
+		if out.err != nil {
+			t.Fatal(out.err)
+		}
+		ev = out.ev
+	case <-time.After(5 * time.Second):
+		t.Fatal("context cancel did not stop the transcriber while its child held the pipes")
+	}
+	t.Logf("reached cancelled event %#v", ev)
+	errorText, _ := ev["transcribe_error"].(string)
+	if ev["text"] != "original" || !strings.HasPrefix(errorText, "transcriber:") {
+		t.Fatalf("failure not surfaced as transcribe_error: %#v", ev)
+	}
+	awaitFifoGone(t, gones, 3*time.Second)
+	if !childProcessGone(pid) {
+		t.Fatalf("transcriber child pid %d still alive after cancel: the transcriber does not own its process group", pid)
 	}
 }
 
