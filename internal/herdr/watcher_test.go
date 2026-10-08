@@ -58,10 +58,8 @@ func TestJobTransitionRules(t *testing.T) {
 	state := t.TempDir()
 	installFakeHerdr(t, dir)
 	t.Setenv("HERDR_PANE_ID", "own")
-	writeFile(t, filepath.Join(state, "sessions.json"), `{"family":{"pane":"fam"}}`)
 	writeFile(t, filepath.Join(state, "threads.json"), `{
 		"job":{"pane":"job"},
-		"fam":{"pane":"fam"},
 		"own":{"pane":"own"},
 		"remote":{"pane":"rjob","machine":"box"},
 		"blank":{"pane":""},
@@ -500,6 +498,45 @@ func TestSourcesPausable(t *testing.T) {
 	}
 	if got, want := s.Prefixes(), []string{"HERDR"}; len(got) != 1 || got[0] != want[0] {
 		t.Errorf("prefixes = %v, want %v", got, want)
+	}
+}
+
+// TestNullPaneNotFamily pins IS-1: a registered job pane whose pane id is
+// JSON null is reported like any other job pane. The removed family special
+// case read the state's family pane and compared it with every pane, and
+// paneID.equal treats two null-kind ids as equal, so with no family entry a
+// null-id pane was mistaken for the family pane and its working→idle/done
+// line was dropped.
+func TestNullPaneNotFamily(t *testing.T) {
+	for _, status := range []string{"idle", "done"} {
+		t.Run(status, func(t *testing.T) {
+			dir := t.TempDir()
+			state := t.TempDir()
+			installFakeHerdr(t, dir)
+			// A non-empty own pane id keeps the own-pane skip out of the way:
+			// only the family comparison could suppress this line.
+			t.Setenv("HERDR_PANE_ID", "own")
+			writeFile(t, filepath.Join(state, "threads.json"), `{"job":{"pane":"null"}}`)
+			writeFile(t, filepath.Join(dir, "machines.out"), "[]\n")
+			writeFile(t, filepath.Join(dir, "local.out"), `{"result":{"agents":[{"pane_id":null,"agent_status":"working"}]}}`)
+
+			var buf bytes.Buffer
+			w := newWatcher(testCtx(state, "main", &buf), core.NewOut(&buf))
+			if err := w.tick(context.Background(), true); err != nil {
+				t.Fatal(err)
+			}
+			if got := linesOf(&buf); len(got) != 0 {
+				t.Fatalf("first tick emitted %q, want nothing", got)
+			}
+
+			writeFile(t, filepath.Join(dir, "local.out"), fmt.Sprintf(`{"result":{"agents":[{"pane_id":null,"agent_status":%q}]}}`, status))
+			if err := w.tick(context.Background(), false); err != nil {
+				t.Fatal(err)
+			}
+			wantLines(t, linesOf(&buf),
+				fmt.Sprintf(`HERDR {"machine":"local","pane":null,"tab":null,"agent":null,"title":null,"cwd":null,"from":"working","to":%q}`, status),
+			)
+		})
 	}
 }
 

@@ -242,11 +242,10 @@ func (w *watcher) once(ctx context.Context) {
 
 // tick applies watch-herdr.ts's rules. own-pane rows are skipped before
 // seen is updated. blocked emits on the first observation; working→idle
-// and working→done emit only for a job pane that is not the family pane
-// and not on the first tick. Status that did not change is quiet, even
-// when the title did. Panes that disappear are forgotten.
+// and working→done emit only for a job pane and not on the first tick.
+// Status that did not change is quiet, even when the title did. Panes
+// that disappear are forgotten.
 func (w *watcher) tick(ctx context.Context, first bool) error {
-	fam := w.familyPane()
 	jobs := w.unowned(ctx, w.jobPanes())
 	w.checkDeadPanes(ctx, jobs)
 	snap := w.snapshot(ctx)
@@ -272,7 +271,6 @@ func (w *watcher) tick(ctx context.Context, first bool) error {
 		if had && prev.status == status {
 			continue
 		}
-		isFamily := e.machine == "local" && e.agent.pane.equal(fam)
 		switch {
 		case status == "blocked":
 			var from *string
@@ -280,7 +278,7 @@ func (w *watcher) tick(ctx context.Context, first bool) error {
 				from = strPtr(prev.status)
 			}
 			w.emit(e.machine, e.agent, from, status)
-		case !first && !isFamily && isJob && had && prev.status == "working" && (status == "idle" || status == "done"):
+		case !first && isJob && had && prev.status == "working" && (status == "idle" || status == "done"):
 			w.emitJob(ctx, e, jp, strPtr(prev.status), status)
 		}
 	}
@@ -442,33 +440,6 @@ func execHerdr(ctx context.Context, args []string) (stdout, stderr string, code 
 		return out.String(), errb.String(), ee.ExitCode()
 	}
 	return out.String(), errb.String() + err.Error(), 127
-}
-
-// familyPane reads <State>/sessions.json `.family.pane`, or null when the
-// file is missing, unparsable, or the pane is absent. The TS expression
-// ends in `?? null`, so missing and null are the same.
-func (w *watcher) familyPane() paneID {
-	b, err := os.ReadFile(filepath.Join(w.state, "sessions.json"))
-	if err != nil {
-		return paneID{kind: kindNull}
-	}
-	v, err := core.ParseJSON(b)
-	if err != nil {
-		return paneID{kind: kindNull}
-	}
-	m, ok := v.(*core.OMap)
-	if !ok {
-		return paneID{kind: kindNull}
-	}
-	raw, ok := m.Get("family")
-	if !ok || raw == nil {
-		return paneID{kind: kindNull}
-	}
-	fm, ok := raw.(*core.OMap)
-	if !ok {
-		return paneID{kind: kindNull}
-	}
-	return nullishPane(fm, "pane")
 }
 
 // jobPanes reads <State>/threads.json. A closed entry (IS-4) and a falsy pane
@@ -705,18 +676,6 @@ func fieldPane(m *core.OMap, key string) paneID {
 	s, ok := jsPrimitive(raw)
 	if !ok {
 		return paneID{kind: kindMissing}
-	}
-	return paneID{kind: kindValue, s: s}
-}
-
-func nullishPane(m *core.OMap, key string) paneID {
-	raw, ok := m.Get(key)
-	if !ok || raw == nil {
-		return paneID{kind: kindNull}
-	}
-	s, ok := jsPrimitive(raw)
-	if !ok {
-		return paneID{kind: kindNull}
 	}
 	return paneID{kind: kindValue, s: s}
 }
