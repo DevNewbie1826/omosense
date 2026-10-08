@@ -308,7 +308,10 @@ func TestRunAckCommandFromBatch(t *testing.T) {
 // TestRunSubscribeRoundTrip covers the IS-7 CLI: subscribe writes the file and
 // prints it, subscription prints it, unsubscribe removes it.
 func TestRunSubscribeRoundTrip(t *testing.T) {
-	stateDir, _ := integrationFixture(t)
+	stateDir, f := integrationFixture(t)
+	// The subprocess fake omo starts with an empty thread list. Report the
+	// subscriber alive so the liveness check accepts this round trip.
+	deliveryWrite(t, filepath.Join(f.dir, "list"), fmt.Sprintf(`[{"thread_id":"%s","sessionId":"%s","alive":true}]`+"\n", rpcSubscriber, rpcSubscriber))
 	code, out, stderr := runCommand(t, "subscribe", rpcSubscriber)
 	var sub subscription
 	if code != 0 || stderr != "" || !strings.HasPrefix(out, "SUB ") ||
@@ -419,5 +422,178 @@ func TestRunOnceDoesNotDeliver(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(stateDir, "watch-rpc.lock.json")); !os.IsNotExist(err) {
 		t.Fatalf("once took lock: %v", err)
+	}
+}
+
+// subscribeCall runs subscribe and returns its exit code, stdout and stderr.
+func subscribeCall(t *testing.T, state, id string) (int, string, string) {
+	t.Helper()
+	var stdout bytes.Buffer
+	c := &core.Ctx{State: state, Args: []string{"subscribe", id}, Out: core.NewOut(&stdout)}
+	old := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = w
+	defer func() { os.Stderr = old }()
+	code := subscribe(c)
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	if _, err := stderr.ReadFrom(r); err != nil {
+		t.Fatal(err)
+	}
+	return code, stdout.String(), stderr.String()
+}
+
+// installThreadList answers `omo thread list --all-scope --json` with the
+// shape the deliverer parses. execErr, when set, is returned instead.
+func installThreadList(t *testing.T, body []byte, execErr error) {
+	t.Helper()
+	prev := omoExecFn
+	omoExecFn = func(ctx context.Context, args ...string) ([]byte, error) {
+		if len(args) != 4 || args[0] != "thread" || args[1] != "list" || args[2] != "--all-scope" || args[3] != "--json" {
+			return nil, fmt.Errorf("unexpected omo args %q", args)
+		}
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			return nil, fmt.Errorf("liveness check has no deadline")
+		}
+		if remain := time.Until(deadline); remain <= 0 || remain > deliverExecTimeout {
+			return nil, fmt.Errorf("liveness deadline %s outside %s", remain, deliverExecTimeout)
+		}
+		if execErr != nil {
+			return nil, execErr
+		}
+		return append([]byte(nil), body...), nil
+	}
+	t.Cleanup(func() { omoExecFn = prev })
+}
+
+func threadListRow(threadID, sessionID string, alive bool) []byte {
+	flag := "false"
+	if alive {
+		flag = "true"
+	}
+	return []byte(fmt.Sprintf(`[{"thread_id":"%s","sessionId":"%s","alive":%s}]`, threadID, sessionID, flag))
+}
+
+func requireSubscribed(t *testing.T, state, id, stdout string) {
+	t.Helper()
+	var emitted subscription
+	if !strings.HasPrefix(stdout, "SUB ") || json.Unmarshal([]byte(strings.TrimPrefix(stdout, "SUB ")), &emitted) != nil || emitted.Session != id {
+		t.Fatalf("stdout = %q", stdout)
+	}
+	b, err := os.ReadFile(subscriptionPath(state))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stored subscription
+	if json.Unmarshal(b, &stored) != nil || stored.Session != id || stored.SubscribedAt == "" || stored.Instance == "" {
+		t.Fatalf("subscription file = %s", b)
+	}
+}
+
+// TestSubscribeAcceptsThreadID guards a live durable thread_id being refused.
+func TestSubscribeAcceptsThreadID(t *testing.T) {
+	state := t.TempDir()
+	const id = "tid-only"
+	installThreadList(t, threadListRow(id, "sid-other", true), nil)
+	code, stdout, stderr := subscribeCall(t, state, id)
+	if code != 0 || stderr != "" {
+		t.Fatalf("exit=%d stderr=%q stdout=%q", code, stderr, stdout)
+	}
+	requireSubscribed(t, state, id, stdout)
+}
+
+// TestSubscribeAcceptsSessionID guards a live session handle being refused
+// when the check compares only thread_id.
+func TestSubscribeAcceptsSessionID(t *testing.T) {
+	state := t.TempDir()
+	const id = "sid-only"
+	installThreadList(t, threadListRow("tid-other", id, true), nil)
+	code, stdout, stderr := subscribeCall(t, state, id)
+	if code != 0 || stderr != "" {
+		t.Fatalf("exit=%d stderr=%q stdout=%q", code, stderr, stdout)
+	}
+	requireSubscribed(t, state, id, stdout)
+}
+
+// TestSubscribeRejectsUnknownSession guards a wrong id being stored: exit 1,
+// stderr names the id, and nothing is written over a new or existing file.
+func TestSubscribeRejectsUnknownSession(t *testing.T) {
+	const id = "no-such-session"
+	want := "omosense: rpc subscribe: session \"no-such-session\" is not a live omo thread; use the durable thread_id from \"omo thread list\"\n"
+	reject := func(t *testing.T, code int, stdout, stderr string) {
+		t.Helper()
+		if code != 1 || stdout != "" || stderr != want {
+			t.Fatalf("exit=%d stdout=%q stderr=%q", code, stdout, stderr)
+		}
+	}
+	t.Run("absent", func(t *testing.T) {
+		state := t.TempDir()
+		installThreadList(t, threadListRow("tid-live", "sid-live", true), nil)
+		code, stdout, stderr := subscribeCall(t, state, id)
+		reject(t, code, stdout, stderr)
+		if _, err := os.Stat(subscriptionPath(state)); !os.IsNotExist(err) {
+			t.Fatalf("subscription written: %v", err)
+		}
+	})
+	t.Run("notAlive", func(t *testing.T) {
+		state := t.TempDir()
+		installThreadList(t, threadListRow(id, id, false), nil)
+		code, stdout, stderr := subscribeCall(t, state, id)
+		reject(t, code, stdout, stderr)
+		if _, err := os.Stat(subscriptionPath(state)); !os.IsNotExist(err) {
+			t.Fatalf("subscription written: %v", err)
+		}
+	})
+	t.Run("existing", func(t *testing.T) {
+		state := t.TempDir()
+		installThreadList(t, threadListRow("tid-live", "sid-live", true), nil)
+		kept := newSubscription("kept-session", time.Date(2026, 10, 5, 0, 0, 0, 0, time.UTC))
+		if err := writeSubscription(state, kept); err != nil {
+			t.Fatal(err)
+		}
+		before, err := os.ReadFile(subscriptionPath(state))
+		if err != nil {
+			t.Fatal(err)
+		}
+		code, stdout, stderr := subscribeCall(t, state, id)
+		reject(t, code, stdout, stderr)
+		after, err := os.ReadFile(subscriptionPath(state))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(before, after) {
+			t.Fatalf("existing subscription overwritten:\n%s\n%s", before, after)
+		}
+	})
+}
+
+// TestSubscribeWarnsWhenOmoUnavailable guards an omo outage or an unparsable
+// list blocking subscribe: warn, write the subscription, exit 0.
+func TestSubscribeWarnsWhenOmoUnavailable(t *testing.T) {
+	const id = "offline-session"
+	wantPrefix := "omosense: rpc subscribe: warning: session \"offline-session\" could not be checked: "
+	for _, tc := range []struct {
+		name    string
+		body    []byte
+		execErr error
+	}{
+		{name: "missing", execErr: fmt.Errorf("omo: executable file not found")},
+		{name: "unparsable", body: []byte("not-json")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			state := t.TempDir()
+			installThreadList(t, tc.body, tc.execErr)
+			code, stdout, stderr := subscribeCall(t, state, id)
+			if code != 0 || !strings.HasPrefix(stderr, wantPrefix) || !strings.HasSuffix(stderr, "\n") {
+				t.Fatalf("exit=%d stdout=%q stderr=%q", code, stdout, stderr)
+			}
+			requireSubscribed(t, state, id, stdout)
+		})
 	}
 }

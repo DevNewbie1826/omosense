@@ -178,21 +178,23 @@ func (x *batchFixture) alive(t *testing.T, session string, ok bool) {
 	deliveryWrite(t, filepath.Join(x.f.dir, "list"), rows+"\n")
 }
 
-// replaceSubscription models a real `omosense rpc unsubscribe` followed by
-// `omosense rpc subscribe <session>` completing while a liveness check is in
-// flight (IS-7).
+// replaceSubscription models a subscription replaced while a liveness check
+// is in flight (IS-7). It unsubscribes, then writes the same record subscribe
+// publishes after a successful check. It does not call subscribe: that would
+// run a second thread list against the gated shim.
 func (x *batchFixture) replaceSubscription(t *testing.T, session string) {
 	t.Helper()
 	args := x.b.c.Args
+	defer func() { x.b.c.Args = args }()
 	x.b.c.Args = []string{"unsubscribe"}
 	if code := unsubscribe(x.b.c); code != 0 {
 		t.Fatalf("unsubscribe exit %d", code)
 	}
-	x.b.c.Args = []string{"subscribe", session}
-	if code := subscribe(x.b.c); code != 0 {
-		t.Fatalf("subscribe exit %d", code)
+	// Publish the replacement record directly. subscribe would run its own
+	// thread list while the deliverer's list is blocked on the FIFO.
+	if err := writeSubscription(x.b.c.State, newSubscription(session, x.clock())); err != nil {
+		t.Fatal(err)
 	}
-	x.b.c.Args = args
 }
 
 // removeBarrier unlinks gated FIFOs so a later pass does not wait on them.
