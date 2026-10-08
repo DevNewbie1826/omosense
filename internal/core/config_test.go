@@ -40,14 +40,15 @@ const flatCfg = `{
   "telegram": {"bot": "mb", "roles": {"12": "owner", "13": "wife"}},
   "discord": {"bot": "db", "roles": {"44": "owner"}},
   "rpc": {"enabled": true, "all": false},
-  "tidy": {"enabled": true, "learnOthers": true, "exclude": ["repo1"]},
+  "tidy": {"enabled": true, "learnOthers": true, "exclude": ["repo1"], "checkMin": 12, "quietMin": 240},
   "herdr": {"enabled": true},
   "memory": "mem-main",
   "calendars": ["cal1", "cal2"],
   "mail": true
 }`
 
-func boolPtr(b bool) *bool { return &b }
+func boolPtr(b bool) *bool        { return &b }
+func floatPtr(f float64) *float64 { return &f }
 
 func TestLoadFlatConfig(t *testing.T) {
 	_, dir, _ := testEnv(t)
@@ -61,7 +62,7 @@ func TestLoadFlatConfig(t *testing.T) {
 		Telegram:      PlatformCfg{Bot: "mb", Roles: map[string]string{"12": "owner", "13": "wife"}},
 		Discord:       PlatformCfg{Bot: "db", Roles: map[string]string{"44": "owner"}},
 		RPC:           RPCCfg{Enabled: true},
-		Tidy:          TidyCfg{Enabled: true, LearnOthers: true, Exclude: []string{"repo1"}},
+		Tidy:          TidyCfg{Enabled: true, LearnOthers: true, Exclude: []string{"repo1"}, CheckMin: floatPtr(12), QuietMin: floatPtr(240)},
 		Herdr:         HerdrCfg{Enabled: boolPtr(true), AgentPattern: "senpi|omo|claude|codex|opencode|(^|/)pi( |$)"},
 		Memory:        "mem-main",
 		Calendars:     &[]string{"cal1", "cal2"},
@@ -178,6 +179,14 @@ func TestResolveProfileShapeErrors(t *testing.T) {
 		{`{"tidy":[]}`, "config.json: tidy must be an object"},
 		{`{"tidy":{"exclude":"x"}}`, "config.json: tidy.exclude must be an array of strings"},
 		{`{"tidy":{"learnOthers":1}}`, "config.json: tidy.learnOthers must be a boolean"},
+		{`{"tidy":{"checkMin":"5"}}`, "config.json: tidy.checkMin must be a positive number"},
+		{`{"tidy":{"checkMin":true}}`, "config.json: tidy.checkMin must be a positive number"},
+		{`{"tidy":{"checkMin":0}}`, "config.json: tidy.checkMin must be a positive number"},
+		{`{"tidy":{"checkMin":-1}}`, "config.json: tidy.checkMin must be a positive number"},
+		{`{"tidy":{"quietMin":"60"}}`, "config.json: tidy.quietMin must be a positive number"},
+		{`{"tidy":{"quietMin":false}}`, "config.json: tidy.quietMin must be a positive number"},
+		{`{"tidy":{"quietMin":0}}`, "config.json: tidy.quietMin must be a positive number"},
+		{`{"tidy":{"quietMin":-0.5}}`, "config.json: tidy.quietMin must be a positive number"},
 		{`{"herdr":[]}`, "config.json: herdr must be an object"},
 		{`{"herdr":{"enabled":"yes"}}`, "config.json: herdr.enabled must be a boolean"},
 		{`{"memory":5}`, "config.json: memory must be a string"},
@@ -263,6 +272,9 @@ func TestLoadNewKeyDefaults(t *testing.T) {
 	}
 	if p.SilentMinutes != 30 {
 		t.Errorf("silentMinutes default = %d, want 30", p.SilentMinutes)
+	}
+	if p.Tidy.CheckMin != nil || p.Tidy.QuietMin != nil {
+		t.Errorf("tidy cadence defaults = %v/%v, want unset", p.Tidy.CheckMin, p.Tidy.QuietMin)
 	}
 	if p.Transcriber != nil {
 		t.Errorf("transcriber default = %v, want none", p.Transcriber)
@@ -467,7 +479,7 @@ func TestLoadCfgRawKeepsOrder(t *testing.T) {
 // absent for every new key (the tri-state convention of the flat shape).
 func TestLoadNullNewKeysKeepDefaults(t *testing.T) {
 	_, dir, _ := testEnv(t)
-	writeConfig(t, dir, `{"verify":null,"rpc":{"verify":null,"labels":null},"herdr":{"verify":null,"agentPattern":null},"silentMinutes":null,"transcriber":null,"guard":null}`)
+	writeConfig(t, dir, `{"tidy":{"checkMin":null,"quietMin":null},"verify":null,"rpc":{"verify":null,"labels":null},"herdr":{"verify":null,"agentPattern":null},"silentMinutes":null,"transcriber":null,"guard":null}`)
 	ctx, err := Load(ParseArgs(nil), false)
 	if err != nil {
 		t.Fatalf("load: %v", err)
@@ -476,6 +488,23 @@ func TestLoadNullNewKeysKeepDefaults(t *testing.T) {
 	if p.Verify.Command != nil || p.Verify.TimeoutSec != 60 || p.RPC.Verify != nil || p.RPC.Labels != nil ||
 		p.Herdr.Verify || p.Herdr.AgentRe == nil || p.SilentMinutes != 30 || p.Transcriber != nil || p.Guard.StateFileBytes != 16<<20 {
 		t.Errorf("null new keys changed the defaults: %+v", p)
+	}
+	if p.Tidy.CheckMin != nil || p.Tidy.QuietMin != nil {
+		t.Errorf("null tidy cadence keys changed the defaults: %+v", p.Tidy)
+	}
+}
+
+// TestLoadTidyCadenceKeys pins the tidy cadence keys: configured numbers
+// (fractions included) resolve into the Profile, absent stays unset.
+func TestLoadTidyCadenceKeys(t *testing.T) {
+	_, dir, _ := testEnv(t)
+	writeConfig(t, dir, `{"tidy":{"checkMin":5,"quietMin":0.5}}`)
+	ctx, err := Load(ParseArgs(nil), false)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if p := ctx.Profile.Tidy; p.CheckMin == nil || *p.CheckMin != 5 || p.QuietMin == nil || *p.QuietMin != 0.5 {
+		t.Errorf("tidy cadence = %+v, want checkMin 5 and quietMin 0.5", p)
 	}
 }
 

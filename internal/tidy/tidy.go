@@ -19,7 +19,7 @@ const Help = `Usage: omosense tidy [--once|--now] [flags]
 Runs the memory tidy watcher, printing TIDY and LOG lines to stdout.
 
 Flags:
-  --check-min/--quiet-min/--max-min [m]   thresholds in minutes (JS number)
+  --check-min/--quiet-min [m]          thresholds in minutes (JS number)
   --write-watermark [repo=sha ...]        update the watermark and exit
   --backup-now                            run the daily backup and exit
   --once, --now                           read-only change check
@@ -30,13 +30,20 @@ Flags:
 // disabled profile prints one LOG line and exits 0. Otherwise
 // --write-watermark, --backup-now and the read-only --now/--once run
 // without the lock, and everything else enters the locked watcher loop.
+// newTidyer already resolved the config values over the defaults, so a
+// given flag is simply applied on top (flag > config > default).
 func Run(c *core.Ctx, args []string) int {
 	t := newTidyer(c, c.Out)
-	checkMs, quietMs, maxMs, ok := parseMinutes(c.Out, args)
+	checkMs, quietMs, checkSet, quietSet, ok := parseMinutes(c.Out, args)
 	if !ok {
 		return 2
 	}
-	t.checkMs, t.quietMs, t.maxMs = checkMs, quietMs, maxMs
+	if checkSet {
+		t.checkMs = checkMs
+	}
+	if quietSet {
+		t.quietMs = quietMs
+	}
 	if !c.Profile.Tidy.Enabled {
 		t.sink.Log("tidy disabled")
 		return 0

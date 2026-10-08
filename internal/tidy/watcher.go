@@ -75,14 +75,14 @@ type tidyer struct {
 	sink        core.Sink
 	checkMs     float64
 	quietMs     float64
-	maxMs       float64
 	now         func() time.Time
 	sleep       func(context.Context, time.Duration) error
 }
 
 // newTidyer resolves AGENTS via the shared core rule ($OMO_MEMORY_AGENTS
 // or ~/.omo/memory/agents, IS-14) and BACKUPS (~/.omo/memory-backups)
-// once, with the TS thresholds.
+// once, with the thresholds from the tidy config over the TS defaults
+// (the CLI flags apply on top in Run).
 func newTidyer(c *core.Ctx, sink core.Sink) *tidyer {
 	home, _ := os.UserHomeDir()
 	// Without a home the agents path degrades exactly as before; tests
@@ -92,6 +92,14 @@ func newTidyer(c *core.Ctx, sink core.Sink) *tidyer {
 	for _, name := range c.Profile.Tidy.Exclude {
 		exclude[name] = true
 	}
+	checkMs := defaultCheckMin * 60_000.0
+	if m := c.Profile.Tidy.CheckMin; m != nil {
+		checkMs = *m * 60_000
+	}
+	quietMs := defaultQuietMin * 60_000.0
+	if m := c.Profile.Tidy.QuietMin; m != nil {
+		quietMs = *m * 60_000
+	}
 	return &tidyer{
 		state:       c.State,
 		memory:      c.Profile.Memory,
@@ -100,9 +108,8 @@ func newTidyer(c *core.Ctx, sink core.Sink) *tidyer {
 		agents:      agents,
 		backups:     filepath.Join(home, ".omo", "memory-backups"),
 		sink:        sink,
-		checkMs:     defaultCheckMin * 60_000,
-		quietMs:     defaultQuietMin * 60_000,
-		maxMs:       defaultMaxMin * 60_000,
+		checkMs:     checkMs,
+		quietMs:     quietMs,
 		now:         nowFn,
 		sleep:       sleepFn,
 	}
@@ -112,15 +119,14 @@ func newTidyer(c *core.Ctx, sink core.Sink) *tidyer {
 // check-interval forever. Tick errors are logged and the loop continues,
 // matching the TS try/catch; ctx cancellation (a daemon stop) returns nil.
 func (t *tidyer) runLoop(ctx context.Context) error {
-	t.sink.Log(fmt.Sprintf("memory-tidy watcher starting (check %sm, quiet %sm, max %sm)",
-		minStr(t.checkMs), minStr(t.quietMs), minStr(t.maxMs)))
-	pendingSince := map[string]float64{}
+	t.sink.Log(fmt.Sprintf("memory-tidy watcher starting (check %sm, quiet %sm)",
+		minStr(t.checkMs), minStr(t.quietMs)))
 	emitted := map[string]emitRec{}
 	for {
 		if ctx.Err() != nil {
 			return nil
 		}
-		if err := t.tick(ctx, t.nowMs(), pendingSince, emitted); err != nil && ctx.Err() == nil {
+		if err := t.tick(ctx, t.nowMs(), emitted); err != nil && ctx.Err() == nil {
 			t.sink.Log("memory-tidy " + err.Error())
 		}
 		if err := t.sleep(ctx, time.Duration(t.checkMs)*time.Millisecond); err != nil {
@@ -130,11 +136,10 @@ func (t *tidyer) runLoop(ctx context.Context) error {
 }
 
 // tick is one TS try block: purge repos that left the changed set, mark
-// the ready ones (quiet elapsed since the commit, or max elapsed since the
-// repo was first seen, and not muted by the 6h re-emit guard), emit one
-// TIDY line for all ready repos, then run the daily backup. An error
-// aborts the rest of the pass, like the throw.
-func (t *tidyer) tick(ctx context.Context, now float64, pendingSince map[string]float64, emitted map[string]emitRec) error {
+// the ready ones (quiet elapsed since the HEAD commit, and not muted by
+// the 6h re-emit guard), emit one TIDY line for all ready repos, then run
+// the daily backup. An error aborts the rest of the pass, like the throw.
+func (t *tidyer) tick(ctx context.Context, now float64, emitted map[string]emitRec) error {
 	changes, err := t.changed(ctx)
 	if err != nil {
 		return err
@@ -146,22 +151,17 @@ func (t *tidyer) tick(ctx context.Context, now float64, pendingSince map[string]
 	for _, x := range changes {
 		stillChanged[x.repo] = true
 	}
-	for repo := range pendingSince {
+	for repo := range emitted {
 		if !stillChanged[repo] {
-			delete(pendingSince, repo)
 			delete(emitted, repo)
 		}
 	}
 	var ready []change
 	for _, x := range changes {
-		if _, ok := pendingSince[x.repo]; !ok {
-			pendingSince[x.repo] = now
-		}
-		since := pendingSince[x.repo]
 		if e, ok := emitted[x.repo]; ok && e.to == x.to && now-e.at < reemitMs {
 			continue
 		}
-		if now-x.committedAt >= t.quietMs || now-since >= t.maxMs {
+		if now-x.committedAt >= t.quietMs {
 			ready = append(ready, x)
 		}
 	}
