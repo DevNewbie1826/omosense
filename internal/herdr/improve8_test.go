@@ -579,6 +579,69 @@ func TestHerdrVerifyRunsHook(t *testing.T) {
 	t.Log("cleanup: test Cleanup removes the fake herdr dir, the hook dir and restores the environment")
 }
 
+// TestVerifyTimeout guards S5-2 at the delivery boundary: the timeout a herdr
+// done hook actually runs under is verify.timeoutSec (7 -> 7 s; 0 and -3 fall
+// back to 60 s). A real pane transition drives emitJob and the duration handed
+// to the hook runner is captured, so a call site that hard-codes a timeout - or
+// a changed fallback - fails here, not just the stored field. The profile is
+// built by hand because config load rejects a negative timeoutSec and rewrites
+// 0 to the 60 s default (core.go posIntKey/416), so the fallback branch is only
+// reachable from a hand-built profile; TestHerdrVerifyRunsHook covers the
+// config.json -> hook path.
+func TestVerifyTimeout(t *testing.T) {
+	unsetEnv(t, "HERDR_PANE_ID")
+	cases := []struct {
+		sec  int
+		want time.Duration
+	}{
+		{sec: 7, want: 7 * time.Second},
+		{sec: 0, want: 60 * time.Second},
+		{sec: -3, want: 60 * time.Second},
+	}
+	for _, tc := range cases {
+		t.Run(fmt.Sprintf("timeoutSec=%d", tc.sec), func(t *testing.T) {
+			dir := t.TempDir()
+			state := t.TempDir()
+			installFakeHerdr(t, dir)
+			h := newVerifyHook(t, "0")
+			var buf bytes.Buffer
+			c := &core.Ctx{
+				State: state,
+				Out:   core.NewOut(&buf),
+				Profile: core.Profile{
+					Verify: core.VerifyCfg{Command: []string{h.path()}, TimeoutSec: tc.sec},
+					Herdr:  core.HerdrCfg{Verify: true},
+				},
+			}
+			w := newWatcher(c, core.NewOut(&buf))
+			if !w.verify {
+				t.Fatal("herdr verify hook is off")
+			}
+			handed := make(chan time.Duration, 4)
+			old := runVerifyFn
+			runVerifyFn = func(ctx context.Context, command []string, timeout time.Duration, env []string, dir string) core.VerifyResult {
+				select {
+				case handed <- timeout:
+				default:
+				}
+				return core.RunVerify(ctx, command, timeout, env, dir)
+			}
+			t.Cleanup(func() { runVerifyFn = old })
+
+			verifyPane(t, dir, state, w)
+			w.hooks.Wait()
+			select {
+			case got := <-handed:
+				if got != tc.want {
+					t.Fatalf("hook timeout for timeoutSec=%d = %s, want %s", tc.sec, got, tc.want)
+				}
+			default:
+				t.Fatal("the transition never reached the hook runner")
+			}
+		})
+	}
+}
+
 // TestCancelledHoldPrintsUnverified guards the Risk row "shutdown during a
 // running hook writes a verify result or delays the source's return; a
 // cancelled herdr hold loses the transition" (IS-8): the held line is not
