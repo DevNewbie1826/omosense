@@ -1,6 +1,6 @@
 {
   "name": "omosense",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "omosense - one foreground messenger/agent monitor per project folder, plus CLI (prebuilt Go binaries for macOS and Linux)",
   "license": "MIT",
   "repository": {
