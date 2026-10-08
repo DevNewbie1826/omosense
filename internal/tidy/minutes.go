@@ -12,39 +12,37 @@ import (
 const (
 	defaultCheckMin = 10
 	defaultQuietMin = 60
-	defaultMaxMin   = 240
 )
 
-type minutesFlag struct {
-	flag     string
-	fallback float64
+// minutesFlags order fixes the parse order: check, quiet, so the first
+// bad flag is the one the TS would exit on.
+var minutesFlags = []string{
+	"--check-min",
+	"--quiet-min",
 }
 
-// minutesFlags order fixes the parse order: check, quiet, max, so the
-// first bad flag is the one the TS would exit on.
-var minutesFlags = []minutesFlag{
-	{"--check-min", defaultCheckMin},
-	{"--quiet-min", defaultQuietMin},
-	{"--max-min", defaultMaxMin},
-}
-
-// parseMinutes reads the three threshold flags from raw argv (both --x=v
-// and "--x v") and returns them as milliseconds. A bad value logs
+// parseMinutes reads the two threshold flags from raw argv (both --x=v
+// and "--x v") and returns them as milliseconds plus which were given:
+// the caller applies a set flag over the config value, and leaves an
+// unset one alone (config over the default). A bad value logs
 // "memory-tidy bad <flag>" and reports ok=false (the caller exits 2).
-func parseMinutes(sink core.Sink, args []string) (checkMs, quietMs, maxMs float64, ok bool) {
-	vals := make([]float64, len(minutesFlags))
-	for i, mf := range minutesFlags {
-		v, found, bad := minutesValue(args, mf.flag)
+func parseMinutes(sink core.Sink, args []string) (checkMs, quietMs float64, checkSet, quietSet, ok bool) {
+	out := [2]struct {
+		set bool
+		ms  float64
+	}{}
+	for i, flag := range minutesFlags {
+		v, found, bad := minutesValue(args, flag)
 		if bad {
-			sink.Log("memory-tidy bad " + mf.flag)
-			return 0, 0, 0, false
+			sink.Log("memory-tidy bad " + flag)
+			return 0, 0, false, false, false
 		}
-		if !found {
-			v = mf.fallback
+		if found {
+			out[i].set = true
+			out[i].ms = v * 60_000
 		}
-		vals[i] = v * 60_000
 	}
-	return vals[0], vals[1], vals[2], true
+	return out[0].ms, out[1].ms, out[0].set, out[1].set, true
 }
 
 // minutesValue finds the first "--x" or "--x=v" occurrence and applies JS

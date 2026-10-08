@@ -18,6 +18,7 @@ import (
 	"github.com/DevNewbie1826/omosense/internal/remind"
 	"github.com/DevNewbie1826/omosense/internal/rpc"
 	"github.com/DevNewbie1826/omosense/internal/say"
+	"github.com/DevNewbie1826/omosense/internal/stop"
 	"github.com/DevNewbie1826/omosense/internal/thread"
 	"github.com/DevNewbie1826/omosense/internal/tidy"
 )
@@ -48,6 +49,18 @@ func run(args []string) int {
 	}
 
 	switch sub {
+	case "stop":
+		// stop reads only this folder's lock files, so it is dispatched
+		// before core.Load and needs no config.json.
+		if hasHelp(rest) {
+			fmt.Print(subHelp("stop"))
+			return 0
+		}
+		if len(rest) > 0 {
+			fmt.Fprintln(os.Stderr, "omosense: stop takes no arguments")
+			return 2
+		}
+		return stop.Run(os.Stdout, os.Stderr)
 	case "listen", "google", "remind", "herdr", "rpc", "tidy", "say", "thread":
 		if hasHelp(rest) {
 			fmt.Print(subHelp(sub))
@@ -128,6 +141,8 @@ func subHelp(sub string) string {
 		return tidy.Help
 	case "thread":
 		return thread.Help
+	case "stop":
+		return stop.Help
 	default:
 		return say.Help
 	}
@@ -149,6 +164,7 @@ Subcommands:
   tidy      memory tidy watcher (TIDY)
   say       outbound message sender
   thread    register or close a job thread in threads.json
+  stop      stop this folder's running host
 
 Run omosense <subcommand> --help for per-subcommand help.
 `)

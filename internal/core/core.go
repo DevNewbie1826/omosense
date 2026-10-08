@@ -96,6 +96,12 @@ type TidyCfg struct {
 	Enabled     bool
 	LearnOthers bool
 	Exclude     []string
+	// CheckMin and QuietMin are the watcher cadence overrides in minutes
+	// (tidy.checkMin/tidy.quietMin): nil means the key is unset, so the
+	// CLI flag or the default applies. Fractions are allowed, like the
+	// flags.
+	CheckMin *float64
+	QuietMin *float64
 }
 
 // VerifyCfg is the verify section: the optional done-verification hook
@@ -341,6 +347,12 @@ func parseProfile(om *OMap) (Profile, error) {
 			return out, err
 		}
 		if out.Exclude, err = strsKey(section, "exclude", "tidy.exclude"); err != nil {
+			return out, err
+		}
+		if out.CheckMin, err = posNumberKey(section, "checkMin", "tidy.checkMin"); err != nil {
+			return out, err
+		}
+		if out.QuietMin, err = posNumberKey(section, "quietMin", "tidy.quietMin"); err != nil {
 			return out, err
 		}
 		return out, nil
@@ -594,6 +606,25 @@ func posIntKey(m *OMap, key, path string) (int64, error) {
 		return 0, fmt.Errorf("config.json: %s must be a positive integer", path)
 	}
 	return i, nil
+}
+
+// posNumberKey reads a positive number key: a JSON number greater than
+// zero, fractions included (unlike posIntKey). Absent and null return nil
+// so the caller can tell "not set" from an invalid zero.
+func posNumberKey(m *OMap, key, path string) (*float64, error) {
+	v, ok := m.Get(key)
+	if !ok || v == nil {
+		return nil, nil
+	}
+	n, isNum := v.(json.Number)
+	if !isNum {
+		return nil, fmt.Errorf("config.json: %s must be a positive number", path)
+	}
+	f, err := n.Float64()
+	if err != nil || f <= 0 {
+		return nil, fmt.Errorf("config.json: %s must be a positive number", path)
+	}
+	return &f, nil
 }
 
 // labelsKey reads rpc.labels: string values under exactly the known

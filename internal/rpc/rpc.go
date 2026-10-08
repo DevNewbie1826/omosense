@@ -122,12 +122,24 @@ func pending(c *core.Ctx) int {
 }
 
 // subscribe writes the folder's single rpc delivery target (IS-7).
+// A live thread list that lacks the id is refused. When the list cannot be
+// read, the id is still stored so an offline omo does not block subscribe.
 func subscribe(c *core.Ctx) int {
 	if len(c.Args) != 2 || c.Args[1] == "" {
 		fmt.Fprint(os.Stderr, Help)
 		return 2
 	}
-	sub := newSubscription(c.Args[1], nowFn())
+	id := c.Args[1]
+	ctx, cancel := context.WithTimeout(context.Background(), deliverExecTimeout)
+	defer cancel()
+	alive, err := subscriberAlive(ctx, id)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "omosense: rpc subscribe: warning: session %q could not be checked: %v\n", id, err)
+	} else if !alive {
+		fmt.Fprintf(os.Stderr, "omosense: rpc subscribe: session %q is not a live omo thread; use the durable thread_id from \"omo thread list\"\n", id)
+		return 1
+	}
+	sub := newSubscription(id, nowFn())
 	if err := writeSubscription(c.State, sub); err != nil {
 		fmt.Fprintln(os.Stderr, "omosense: rpc subscribe:", err)
 		return 1

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -167,7 +168,6 @@ func TestBadMinutesFlagExitsTwo(t *testing.T) {
 	}{
 		{"value form", []string{"--check-min=abc"}, "--check-min"},
 		{"space form negative", []string{"--quiet-min", "-5"}, "--quiet-min"},
-		{"max garbage", []string{"--max-min=5x"}, "--max-min"},
 		{"trailing flag has no value", []string{"--check-min"}, "--check-min"},
 		{"first bad flag wins", []string{"--check-min=x", "--quiet-min=y"}, "--check-min"},
 	} {
@@ -185,42 +185,85 @@ func TestBadMinutesFlagExitsTwo(t *testing.T) {
 
 func TestParseMinutesForms(t *testing.T) {
 	for _, tc := range []struct {
-		name  string
-		args  []string
-		check float64
-		quiet float64
-		max   float64
-		ok    bool
+		name     string
+		args     []string
+		check    float64
+		quiet    float64
+		checkSet bool
+		quietSet bool
+		ok       bool
 	}{
-		{"defaults", nil, 600000, 3600000, 14400000, true},
-		{"space form", []string{"--check-min", "5"}, 300000, 3600000, 14400000, true},
-		{"equals form", []string{"--check-min=5"}, 300000, 3600000, 14400000, true},
-		{"empty means zero", []string{"--check-min="}, 0, 3600000, 14400000, true},
-		{"js trims whitespace", []string{"--check-min", " 7 "}, 420000, 3600000, 14400000, true},
-		{"js hex literal", []string{"--check-min", "0x10"}, 960000, 3600000, 14400000, true},
-		{"js exponent", []string{"--check-min", "1e2"}, 6000000, 3600000, 14400000, true},
-		{"negative zero is finite", []string{"--check-min", "-0"}, 0, 3600000, 14400000, true},
-		{"infinity rejected", []string{"--check-min", "Infinity"}, 0, 0, 0, false},
-		{"nan rejected", []string{"--check-min", "NaN"}, 0, 0, 0, false},
-		{"underscore rejected", []string{"--check-min", "1_000"}, 0, 0, 0, false},
-		{"negative rejected", []string{"--quiet-min", "-1"}, 0, 0, 0, false},
+		{"none given", nil, 0, 0, false, false, true},
+		{"space form", []string{"--check-min", "5"}, 300000, 0, true, false, true},
+		{"equals form", []string{"--check-min=5"}, 300000, 0, true, false, true},
+		{"empty means zero", []string{"--check-min="}, 0, 0, true, false, true},
+		{"js trims whitespace", []string{"--check-min", " 7 "}, 420000, 0, true, false, true},
+		{"js hex literal", []string{"--check-min", "0x10"}, 960000, 0, true, false, true},
+		{"js exponent", []string{"--check-min", "1e2"}, 6000000, 0, true, false, true},
+		{"negative zero is finite", []string{"--check-min", "-0"}, 0, 0, true, false, true},
+		{"quiet only", []string{"--quiet-min", "90"}, 0, 5400000, false, true, true},
+		{"both flags", []string{"--check-min", "5", "--quiet-min=90"}, 300000, 5400000, true, true, true},
+		{"infinity rejected", []string{"--check-min", "Infinity"}, 0, 0, false, false, false},
+		{"nan rejected", []string{"--check-min", "NaN"}, 0, 0, false, false, false},
+		{"underscore rejected", []string{"--check-min", "1_000"}, 0, 0, false, false, false},
+		{"negative rejected", []string{"--quiet-min", "-1"}, 0, 0, false, false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			check, quiet, max, ok := parseMinutes(core.NewOut(&bytes.Buffer{}), tc.args)
+			check, quiet, checkSet, quietSet, ok := parseMinutes(core.NewOut(&bytes.Buffer{}), tc.args)
 			if ok != tc.ok {
 				t.Fatalf("ok = %v, want %v", ok, tc.ok)
 			}
 			if !ok {
 				return
 			}
-			if check != tc.check || quiet != tc.quiet || max != tc.max {
-				t.Fatalf("minutes = %v/%v/%v, want %v/%v/%v", check, quiet, max, tc.check, tc.quiet, tc.max)
+			if check != tc.check || quiet != tc.quiet || checkSet != tc.checkSet || quietSet != tc.quietSet {
+				t.Fatalf("minutes = %v/%v (set %v/%v), want %v/%v (set %v/%v)",
+					check, quiet, checkSet, quietSet, tc.check, tc.quiet, tc.checkSet, tc.quietSet)
 			}
 		})
 	}
 }
 
-func TestLoopQuietThenReemit(t *testing.T) {
+func TestMovingHeadNoAlert(t *testing.T) {
+	_, agents, state := sandbox(t)
+	epoch := int64(1750000000)
+	repo := makeRepo(t, agents, "alpha")
+	start := time.UnixMilli(epoch * 1000)
+	advance := fakeClock(t, start)
+	// Pre-seed today's lastBackupDate so the loop's backup pass stays
+	// silent and any TIDY line would stand out.
+	seed := fmt.Sprintf(`{"repos":{},"lastRun":null,"lastBackupDate":%q}`, seoulDateOf(t, start))
+	writeFile(t, filepath.Join(state, "memory-tidy.json"), seed)
+
+	var buf bytes.Buffer
+	c := testCtx(state, "main", &buf)
+	prev := sleepFn
+	passes := 0
+	sleepFn = func(ctx context.Context, d time.Duration) error {
+		if d != 5*time.Minute {
+			t.Errorf("interval = %v, want 5m", d)
+		}
+		advance(d)
+		// HEAD moves every check: a fresh empty commit pinned to the new
+		// fake now, so the HEAD commit is never quiet.
+		commitAt(t, repo, nowFn().Unix(), "m")
+		passes++
+		if passes >= 130 { // 130 checks x 5m = 650 minutes of moving HEAD
+			return context.Canceled
+		}
+		return nil
+	}
+	t.Cleanup(func() { sleepFn = prev })
+
+	if code := Run(c, []string{"--check-min", "5", "--quiet-min", "60"}); code != 0 {
+		t.Fatalf("Run = %d, want 0", code)
+	}
+	if n := strings.Count(buf.String(), "TIDY "); n != 0 {
+		t.Fatalf("moving HEAD emitted %d TIDY lines, want 0:\n%s", n, buf.String())
+	}
+}
+
+func TestQuietRepoAlertsOnceNotWithin6h(t *testing.T) {
 	_, agents, state := sandbox(t)
 	epoch := int64(1750000000)
 	repo := makeRepo(t, agents, "alpha")
@@ -236,6 +279,7 @@ func TestLoopQuietThenReemit(t *testing.T) {
 	c := testCtx(state, "main", &buf)
 	lockHeld := false
 	prev := sleepFn
+	passes := 0
 	sleepFn = func(ctx context.Context, d time.Duration) error {
 		if d != 5*time.Minute {
 			t.Errorf("interval = %v, want 5m", d)
@@ -246,7 +290,11 @@ func TestLoopQuietThenReemit(t *testing.T) {
 			t.Errorf("lock missing during loop: %v", err)
 		}
 		advance(d)
-		if strings.Count(buf.String(), "TIDY ") >= 2 {
+		passes++
+		// 100 passes = 500m: the first TIDY lands at commit+90m (pass 13)
+		// and the 6h re-emit at pass 85, so a rule that never emits cannot
+		// hang the loop waiting for a second line that never comes.
+		if passes >= 100 {
 			return context.Canceled
 		}
 		return nil
@@ -265,60 +313,199 @@ func TestLoopQuietThenReemit(t *testing.T) {
 	if got := readFile(t, filepath.Join(state, "memory-tidy.json")); got != seed {
 		t.Fatalf("loop rewrote the watermark:\ngot:\n%s\nwant:\n%s", got, seed)
 	}
-	// The commit is 30m old; quiet is 90m, so the first TIDY comes at
-	// commit+90m (pass 13 of 5m), and the re-emit fires 6h after that —
-	// the max rule (240m since first seen) must NOT fire earlier, because
-	// the re-emit guard short-circuits first.
+	// Exactly one TIDY once the commit is 90m quiet (pass 13), no re-emit
+	// for the same `to` within 6h, and exactly one more after 6h (pass 85).
 	line := fmt.Sprintf(`TIDY {"changed":[{"repo":"alpha","from":null,"to":%q}]}`, sha)
 	wantLines(t, linesOf(&buf),
-		"LOG memory-tidy watcher starting (check 5m, quiet 90m, max 240m)",
+		"LOG memory-tidy watcher starting (check 5m, quiet 90m)",
 		line,
 		line,
 	)
 }
 
-func TestLoopMaxEmitsAndBackups(t *testing.T) {
-	home, agents, state := sandbox(t)
+// emitClock wraps the loop's stdout buffer and stamps the fake-clock time
+// (ms since epoch) of every line Out writes, so a test can assert WHEN the
+// watcher emitted, not just how often: Out serializes each Emit/Log into
+// exactly one Write, and the clock only moves in the injected sleep between
+// ticks, so each stamp is the emitting tick's own now.
+type emitClock struct {
+	buf   *bytes.Buffer
+	lines []string
+	at    []float64
+}
+
+func (e *emitClock) Write(p []byte) (int, error) {
+	e.lines = append(e.lines, strings.TrimSuffix(string(p), "\n"))
+	e.at = append(e.at, float64(nowFn().UnixMilli()))
+	return e.buf.Write(p)
+}
+
+// tidyTimes returns the stamped times of the TIDY lines, in order.
+func (e *emitClock) tidyTimes() []float64 {
+	var out []float64
+	for i, line := range e.lines {
+		if strings.HasPrefix(line, "TIDY ") {
+			out = append(out, e.at[i])
+		}
+	}
+	return out
+}
+
+func TestQuietThresholdEmitTimes(t *testing.T) {
+	// Guard (v1 B3): the quiet threshold gates the FIRST TIDY at the
+	// first check at or after commit+quietMin (the boundary is
+	// inclusive: IS-4's "quiet >= quietMin"), and the re-emit lands at
+	// exactly first emit + 6h — asserted on the stamped emission times,
+	// so a threshold swapped for another configured value (checkMin, any
+	// shorter span) or a halved re-emit window fails here even when the
+	// final line counts happen to match.
+	_, agents, state := sandbox(t)
 	epoch := int64(1750000000)
 	repo := makeRepo(t, agents, "alpha")
-	sha := commitAt(t, repo, epoch, "a1")
-	start := time.UnixMilli((epoch + 60) * 1000) // 1m after the commit
+	commitAt(t, repo, epoch, "a1")
+	start := time.UnixMilli((epoch + 30*60) * 1000) // 30m after the commit
 	advance := fakeClock(t, start)
-	date := seoulDateOf(t, start)
+	// Pre-seed today's lastBackupDate so the loop's backup pass stays
+	// silent and only the watcher's own lines are stamped.
+	seed := fmt.Sprintf(`{"repos":{},"lastRun":null,"lastBackupDate":%q}`, seoulDateOf(t, start))
+	writeFile(t, filepath.Join(state, "memory-tidy.json"), seed)
 
 	var buf bytes.Buffer
-	c := testCtx(state, "main", &buf)
+	rec := &emitClock{buf: &buf}
+	c := testCtx(state, "main", rec)
 	prev := sleepFn
+	passes := 0
 	sleepFn = func(ctx context.Context, d time.Duration) error {
-		if d != 240*time.Minute {
-			t.Errorf("interval = %v, want 240m", d)
+		if d != 5*time.Minute {
+			t.Errorf("interval = %v, want 5m", d)
 		}
 		advance(d)
-		if strings.Count(buf.String(), "TIDY ") >= 1 {
+		passes++
+		// 100 passes = 500m: tick 13 runs at commit+90m (the first
+		// ready check) and tick 85 at commit+450m (the 6h re-emit), so
+		// both emissions are observed whatever their timing.
+		if passes >= 100 {
 			return context.Canceled
 		}
 		return nil
 	}
 	t.Cleanup(func() { sleepFn = prev })
 
-	if code := Run(c, []string{"--check-min=240", "--quiet-min=600"}); code != 0 {
+	if code := Run(c, []string{"--check-min", "5", "--quiet-min", "90"}); code != 0 {
 		t.Fatalf("Run = %d, want 0", code)
 	}
-	// Pass 1: not quiet (1m old) and now-since = 0, so no TIDY, but the
-	// daily backup runs and writes the watermark. Pass 2 (+240m): the max
-	// rule (now-since >= 240m) emits even though the commit is 241m old
-	// and quiet is 600m.
-	bundle := filepath.Join(home, ".omo", "memory-backups", date, "alpha.bundle")
-	size := statOf(t, bundle).Size()
-	wantLines(t, linesOf(&buf),
-		"LOG memory-tidy watcher starting (check 240m, quiet 600m, max 240m)",
-		fmt.Sprintf("LOG memory-tidy backup %s repos=1 bytes=%d failed=none", date, size),
-		fmt.Sprintf(`TIDY {"changed":[{"repo":"alpha","from":null,"to":%q}]}`, sha),
-	)
-	want := fmt.Sprintf("{\n  \"repos\": {},\n  \"lastRun\": null,\n  \"lastBackupDate\": %q\n}\n", date)
-	if got := readFile(t, filepath.Join(state, "memory-tidy.json")); got != want {
-		t.Fatalf("watermark bytes:\ngot:\n%s\nwant:\n%s", got, want)
+	got := rec.tidyTimes()
+	wantFirst := float64((epoch + 90*60) * 1000) // commit + quietMin, tick 13
+	wantReemit := wantFirst + reemitMs           // first emit + 6h, tick 85
+	if len(got) != 2 {
+		t.Fatalf("TIDY emission times = %v, want exactly [commit+90m, commit+90m+6h] (quiet 90m, re-emit 6h)", got)
 	}
+	if got[0] != wantFirst {
+		t.Errorf("first TIDY at %v ms, want %v (first check at or after commit+quietMin; a shorter threshold emits earlier)", got[0], wantFirst)
+	}
+	if got[1] != wantReemit {
+		t.Errorf("re-emit TIDY at %v ms, want %v (exactly 6h after the first emit)", got[1], wantReemit)
+	}
+}
+
+func TestNoTidyBeforeQuietThreshold(t *testing.T) {
+	// Guard (v1 B3): zero TIDY before commit+quietMin: the loop stops
+	// with its last check at commit+85m (5m short of the 90m boundary),
+	// with checkMin 5 so a threshold swapped for checkMin (5m) or any
+	// value <= 85m (e.g. a 30m stand-in) emits inside the window.
+	_, agents, state := sandbox(t)
+	epoch := int64(1750000000)
+	repo := makeRepo(t, agents, "alpha")
+	commitAt(t, repo, epoch, "a1")
+	start := time.UnixMilli(epoch * 1000) // at the commit itself
+	advance := fakeClock(t, start)
+	seed := fmt.Sprintf(`{"repos":{},"lastRun":null,"lastBackupDate":%q}`, seoulDateOf(t, start))
+	writeFile(t, filepath.Join(state, "memory-tidy.json"), seed)
+
+	var buf bytes.Buffer
+	rec := &emitClock{buf: &buf}
+	c := testCtx(state, "main", rec)
+	prev := sleepFn
+	passes := 0
+	sleepFn = func(ctx context.Context, d time.Duration) error {
+		if d != 5*time.Minute {
+			t.Errorf("interval = %v, want 5m", d)
+		}
+		advance(d)
+		passes++
+		// 18 passes: ticks run at commit+0..85m and the loop exits
+		// before any tick at commit+90m.
+		if passes >= 18 {
+			return context.Canceled
+		}
+		return nil
+	}
+	t.Cleanup(func() { sleepFn = prev })
+
+	if code := Run(c, []string{"--check-min", "5", "--quiet-min", "90"}); code != 0 {
+		t.Fatalf("Run = %d, want 0", code)
+	}
+	if got := rec.tidyTimes(); len(got) != 0 {
+		t.Fatalf("TIDY emitted at %v ms after the commit, want none before commit+90m (last check at +85m)", got)
+	}
+	if n := strings.Count(buf.String(), "TIDY "); n != 0 {
+		t.Fatalf("emitted %d TIDY lines before the quiet threshold, want 0:\n%s", n, buf.String())
+	}
+}
+
+// cadenceRun runs the locked watcher loop for one tick over a repo whose
+// HEAD is fresh, under a fake clock: it returns the loop's stdout lines
+// and asserts the interval the loop sleeps between ticks (the effective
+// check cadence).
+func cadenceRun(t *testing.T, tidyCfg core.TidyCfg, args []string, wantInterval time.Duration) []string {
+	t.Helper()
+	_, agents, state := sandbox(t)
+	start := time.UnixMilli(1750000000 * 1000)
+	commitAt(t, makeRepo(t, agents, "alpha"), 1750000000, "a1")
+	seed := fmt.Sprintf(`{"repos":{},"lastRun":null,"lastBackupDate":%q}`, seoulDateOf(t, start))
+	writeFile(t, filepath.Join(state, "memory-tidy.json"), seed)
+
+	var buf bytes.Buffer
+	c := testCtx(state, "main", &buf)
+	c.Profile.Tidy.CheckMin = tidyCfg.CheckMin
+	c.Profile.Tidy.QuietMin = tidyCfg.QuietMin
+	advance := fakeClock(t, start)
+	prev := sleepFn
+	sleepFn = func(ctx context.Context, d time.Duration) error {
+		if d != wantInterval {
+			t.Errorf("interval = %v, want %v", d, wantInterval)
+		}
+		advance(d)
+		return context.Canceled
+	}
+	t.Cleanup(func() { sleepFn = prev })
+	if code := Run(c, args); code != 0 {
+		t.Fatalf("Run = %d, want 0", code)
+	}
+	return linesOf(&buf)
+}
+
+func TestConfigCadenceReachesWatcher(t *testing.T) {
+	// Guard: tidy.checkMin/tidy.quietMin set both the check interval the
+	// loop sleeps and the start LOG's effective thresholds.
+	got := cadenceRun(t, core.TidyCfg{CheckMin: floatPtr(7), QuietMin: floatPtr(93)}, nil, 7*time.Minute)
+	wantLines(t, got, "LOG memory-tidy watcher starting (check 7m, quiet 93m)")
+}
+
+func TestFlagBeatsConfigCadence(t *testing.T) {
+	// Guard: --check-min/--quiet-min override the config values.
+	got := cadenceRun(t, core.TidyCfg{CheckMin: floatPtr(7), QuietMin: floatPtr(93)},
+		[]string{"--check-min", "3", "--quiet-min", "11"}, 3*time.Minute)
+	wantLines(t, got, "LOG memory-tidy watcher starting (check 3m, quiet 11m)")
+}
+
+func TestUnknownFlagIgnored(t *testing.T) {
+	// A removed threshold flag is now just an unknown flag: like every
+	// unknown flag it neither errors nor changes the thresholds, so the
+	// loop runs on the 10/60 defaults (the report names the removed
+	// flag).
+	got := cadenceRun(t, core.TidyCfg{}, []string{"--gone-flag=240"}, 10*time.Minute)
+	wantLines(t, got, "LOG memory-tidy watcher starting (check 10m, quiet 60m)")
 }
 
 func TestSourceRunStopsOnCancel(t *testing.T) {
@@ -353,7 +540,7 @@ func TestSourceRunStopsOnCancel(t *testing.T) {
 	}
 	date := seoulDateOf(t, time.UnixMilli(epoch*1000))
 	wantLines(t, linesOf(&buf),
-		"LOG memory-tidy watcher starting (check 10m, quiet 60m, max 240m)",
+		"LOG memory-tidy watcher starting (check 10m, quiet 60m)",
 		fmt.Sprintf("LOG memory-tidy backup %s repos=1 bytes=%d failed=none", date, statOf(t, filepath.Join(backupsOf(t), date, "alpha.bundle")).Size()),
 	)
 }
@@ -463,14 +650,16 @@ func TestSourcesDisabled(t *testing.T) {
 	}
 }
 
-func testCtx(state, _ string, buf *bytes.Buffer) *core.Ctx {
+func floatPtr(f float64) *float64 { return &f }
+
+func testCtx(state, _ string, w io.Writer) *core.Ctx {
 	return &core.Ctx{
 		State: state,
 		Profile: core.Profile{
 			Tidy: core.TidyCfg{Enabled: true, LearnOthers: true},
 		},
 		Flags: map[string]bool{},
-		Out:   core.NewOut(buf),
+		Out:   core.NewOut(w),
 	}
 }
 

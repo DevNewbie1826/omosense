@@ -27,6 +27,8 @@ omosense
 
 Bare `omosense` (no subcommand) is the session host. It runs until it gets SIGINT, SIGTERM or SIGHUP, then stops every source, releases its locks and exits 0. Without `.omosense/config.json` it exits 1 with `omosense: read config: ...` naming the path it tried.
 
+To stop it from another shell, run `omosense stop` (or `npx omosense stop`, `bunx omosense stop`) in the same folder. See [Stopping the host](#stopping-the-host).
+
 ## Which sources run
 
 | Source | Starts when | Prints |
@@ -83,6 +85,8 @@ Newer optional keys, shown with example values:
 | `telegram.roles`, `discord.roles` | User id to role (`owner`, `wife`, `trusted`, ...), attached to each `EVENT`. |
 | `rpc.enabled`, `rpc.all` | Watch webchat sessions; `all` watches every session, not only those registered in `threads.json`. |
 | `tidy.enabled`, `tidy.learnOthers`, `tidy.exclude` | Memory tidy watcher and which agents' memory repos it skips. |
+| `tidy.checkMin` | How often tidy checks the memory repos, in minutes. Default `10`. |
+| `tidy.quietMin` | How long a changed repo's HEAD commit must be quiet before it's reported, in minutes. Default `60`. See [Memory tidy](#memory-tidy). |
 | `herdr.enabled` | Absent means on. Only an explicit `false` turns herdr off. |
 | `memory` | This agent's memory id. |
 | `calendars` | Calendars google watches. Absent means all of them. |
@@ -120,7 +124,7 @@ The state dir holds:
 | `rpc-subscription.json` | The session that receives rpc done batches. |
 | `threads.json` | Job thread registry read by herdr and rpc. Written by `omosense thread`. |
 | `threads.lock` | Lock guarding `threads.json` writes. |
-| `sessions.json` | Response session registration. |
+| `sessions.json` | Left over from older versions. omosense no longer reads it. |
 | `memory-tidy.json` | Tidy watermark. |
 | `tg-offset-<bot>` | Telegram fetch offset for that bot. |
 | `inbox/` | Downloaded Telegram attachments. |
@@ -210,6 +214,8 @@ omosense rpc pending                  # list un-acked completions, oldest seq fi
 omosense rpc ack <id> [<seq>]         # clear one
 ```
 
+`subscribe` checks the id against `omo thread list` before it saves anything. An id that isn't listed is rejected: it exits 1, writes nothing, and the error hints that you should pass the durable `thread_id`. If `omo` can't be queried at all, subscribe prints a warning and keeps the subscription.
+
 How batching works:
 
 - Each done restarts a 5-minute quiet timer. When 5 minutes pass with no new done, exactly one message goes out (`omo thread send`) listing every completion since the last batch. If a session finishes twice inside the window, only its newest seq is listed, with a count.
@@ -259,12 +265,39 @@ omosense google [--once]
 omosense remind
 omosense herdr [--once]
 omosense rpc [--once] [--all]
-omosense tidy [--once|--now] [flags]
+omosense tidy [--once|--now] [--check-min m] [--quiet-min m] [flags]
+omosense stop
 omosense say <platform> <action> <json>
 omosense thread register|close <thread-id> [flags]
 ```
 
 `--once`, `--now` and `--dry-run` are read-only: they take no lock and don't create the state dir. Run `omosense <subcommand> --help` for details.
+
+## Memory tidy
+
+With `tidy.enabled`, the tidy source checks the memory repos every `checkMin` minutes (default 10). A repo that changed since its last tidy is reported with one `TIDY` line once its HEAD commit has been quiet for `quietMin` minutes (default 60). A repo that keeps getting commits isn't reported until it settles. The same HEAD isn't reported again within 6 hours.
+
+`tidy.checkMin` and `tidy.quietMin` take any number greater than 0, fractions included. A wrong type, `0` or a negative value exits 1 naming the key, for example `config.json: tidy.quietMin ...`. The `--check-min` and `--quiet-min` flags override the config, and the config overrides the defaults. The start line shows the values in effect:
+
+```
+LOG memory-tidy watcher starting (check 10m, quiet 60m)
+```
+
+## Stopping the host
+
+```sh
+omosense stop
+```
+
+`stop` reads this folder's `.omosense/state/*.lock.json` (or `$OMOSENSE_STATE`). It only signals a pid whose command name (the basename of argv[0]) starts with `omosense`. It sends SIGTERM, waits up to 10 seconds for the process to exit and its locks to go away, and prints one line. It doesn't need `config.json` and doesn't create the state dir.
+
+Exit codes:
+
+- 0: not running, stopped, or the lock is stale or held by a pid that isn't omosense. A stale or foreign lock is reported; nothing is signaled or deleted.
+- 1: a verified omosense pid, or its lock file, still persists after the 10 s wait (the message names the pid and the remaining lock), or a lock file is unreadable or malformed, or argv could not be read.
+- 2: usage error.
+
+If a lock names a live pid that belongs to another program (a reused pid), omosense can't take that lock back on its own. Remove the lock file by hand, then start again.
 
 ## Supported platforms
 
