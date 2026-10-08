@@ -60,7 +60,7 @@ measure() {
   ls "$state" >/dev/null 2>&1 || { printf 'state dir unreadable: %s\n' "$state" >&2; return 1; }
   for lock in "$state"/*.lock.json; do
     if [ ! -f "$lock" ]; then
-      [ -e "$lock" ] && { printf 'unparsable lock: %s\n' "${lock##*/}" >&2; return 1; }
+      { [ -e "$lock" ] || [ -L "$lock" ]; } && { printf 'unparsable lock: %s\n' "${lock##*/}" >&2; return 1; }
       continue # glob matched nothing
     fi
     name=${lock##*/}
@@ -99,10 +99,19 @@ under_tmp() {
 }
 
 # Refuse (exit 2, nothing written) unless the receipt dir resolves under
-# /tmp and is either absent or an empty real directory.
+# /tmp, does not overlap the resolved live folder, .omosense or state dir,
+# and is either absent or an empty real directory.
 check_receipt_dir() {
-  local rdir=$1 entries
+  local live=$1 rdir=$2 entries r t tr
   under_tmp "$rdir" || refuse "receipt dir must resolve under /tmp: $rdir"
+  r=$(resolve_dir_path "$rdir") || refuse "receipt dir unresolvable: $rdir"
+  for t in "$live" "$live/.omosense" "$live/.omosense/state"; do
+    [ -d "$t" ] || continue
+    # unenterable: measure fails on the state dir before anything is written
+    tr=$(cd "$t" 2>/dev/null && pwd -P) || continue
+    case "$r/" in "$tr/"*) refuse "receipt dir is inside the live folder: $rdir" ;; esac
+    case "$tr/" in "$r/"*) refuse "receipt dir contains the live folder: $rdir" ;; esac
+  done
   if [ -e "$rdir" ]; then
     { [ ! -L "$rdir" ] && [ -d "$rdir" ]; } || refuse "receipt dir is not a real directory: $rdir"
     entries=$(ls -A "$rdir" 2>/dev/null) || refuse "receipt dir unreadable: $rdir"
@@ -113,7 +122,7 @@ check_receipt_dir() {
 cmd_before() {
   local live=$1 rdir=$2 receipt measurement
   [ -d "$live" ] || fail "live folder missing: $live"
-  check_receipt_dir "$rdir"
+  check_receipt_dir "$live" "$rdir"
   receipt=$rdir/$RECEIPT_NAME
   measurement=$(measure "$live" 2>&1) || fail "$measurement"
   mkdir -p "$rdir" || fail "cannot create receipt dir: $rdir"
@@ -221,6 +230,24 @@ cmd_selftest() {
     ok "unparsable lock: before fails closed, nothing written"
   else
     bad "unparsable lock (rc=$rc: $out)"
+  fi
+
+  out=$("$0" before "$live1" "$live1/.omosense/state/receipt" 2>&1)
+  rc=$?
+  if [ "$rc" -eq 2 ] && [ ! -e "$live1/.omosense/state/receipt" ]; then
+    ok "receipt dir inside the live folder refused, nothing created"
+  else
+    bad "receipt dir inside the live folder (rc=$rc: $out)"
+  fi
+
+  cp -R "$live1" "$root/live4" # dangling lock beside a measurable one
+  ln -s "$root/nowhere" "$root/live4/.omosense/state/broken.lock.json"
+  out=$("$0" before "$root/live4" "$root/r10" 2>&1)
+  rc=$?
+  if [ "$rc" -eq 1 ] && [ ! -e "$root/r10" ]; then
+    ok "dangling lock: before fails closed, nothing written"
+  else
+    bad "dangling lock (rc=$rc: $out)"
   fi
 
   rc_is "before for the dead-pid lane" 0 "$0" before "$live1" "$root/r9"
