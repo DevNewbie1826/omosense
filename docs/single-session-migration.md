@@ -88,7 +88,7 @@ Copy, don't move, so the old layout stays intact until the new one works. The na
 | `tg-offset-<bot>` | `tg-offset-<bot>` (same name; only this profile's bot) |
 | `memory-tidy.json` | `memory-tidy.json` |
 | `threads.json` | `threads.json` |
-| `sessions.json` | `sessions.json` |
+| `sessions.json` | not copied (omosense no longer reads it) |
 | `inbox/` | `inbox/` |
 
 Don't copy lock files (`*.lock.json`, `rpc-pending-*.lock`, and in the new state dir `rpc-pending.lock`, `rpc-subscription.lock`) or daemon leftovers (journals, pid, socket, `omosense-profile-*.stopped`). Locks belong to running processes, and the daemon files have no reader now.
@@ -100,14 +100,14 @@ cp -p "$OLDSTATE/reminders-$P.json"    "$S/reminders.json"   2>/dev/null
 cp -p "$OLDSTATE/google-seen-$P.json"  "$S/google-seen.json" 2>/dev/null
 cp -p "$OLDSTATE/rpc-pending-$P.json"  "$S/rpc-pending.json" 2>/dev/null
 [ -n "$BOT" ] && cp -p "$OLDSTATE/tg-offset-$BOT" "$S/" 2>/dev/null
-for f in memory-tidy.json threads.json sessions.json; do cp -p "$OLDSTATE/$f" "$S/" 2>/dev/null; done
+for f in memory-tidy.json threads.json; do cp -p "$OLDSTATE/$f" "$S/" 2>/dev/null; done
 [ -d "$OLDSTATE/inbox" ] && cp -Rp "$OLDSTATE/inbox" "$S/"
 ls -la "$S"
 ```
 
 A file missing in the old dir just means that profile never wrote it. Then confirm each copy is byte-identical, for example `cmp "$OLDSTATE/reminders-$P.json" "$S/reminders.json"`.
 
-`memory-tidy.json` only matters for the profile with `tidy.enabled`. `threads.json` and `sessions.json` were shared by all profiles, so each folder gets a full copy.
+`memory-tidy.json` only matters for the profile with `tidy.enabled`. `threads.json` was shared by all profiles, so each folder gets a full copy. `sessions.json` was shared too, but omosense no longer reads it, so there's nothing to copy. Copying it anyway does no harm.
 
 ## 4. Start it and subscribe
 
