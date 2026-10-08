@@ -17,8 +17,10 @@
 #         pids.txt        sorted "<lock> <pid> <ps lstart>" for every
 #                         <live-folder>/.omosense/state/*.lock.json
 #                         ("-" when the pid is not alive)
-#         binary.sha256   sorted unique "sha256  <argv0>" where argv0 comes
-#                         from `ps -o comm= -p <pid>` of every live lock pid
+#         binary.sha256   sorted unique "sha256  <exe>" where <exe> is the
+#                         cwd-independent absolute executable path of every
+#                         live lock pid (lsof text entry, then Linux
+#                         /proc/<pid>/exe, then an absolute `ps -o comm=`)
 #         meta.txt        live folder, UTC timestamp, hostname (never compared)
 #   scripts/qa11-live-audit.sh after <live-folder> <receipt-dir>
 #       Recompute pids + start times + binary hash and compare them with the
@@ -27,11 +29,52 @@
 #   scripts/qa11-live-audit.sh selftest
 #       Run the built-in control: a fake live folder under /tmp with a real
 #       helper process, PASS while untouched, FAIL on a tampered start time,
-#       a tampered binary hash and a missing receipt.
+#       a tampered binary hash and a missing receipt, plus the fail-closed
+#       lanes (unparsable lock, unreadable state dir, a relative-argv0 helper
+#       whose on-disk binary is replaced, an unhashable executable).
 #   scripts/qa11-live-audit.sh --help
 #       This help.
 #
-# Exit codes: 0 ok / 1 audit FAIL or unreadable input / 2 usage or refusal.
+# Measurement is fail-closed: every value that is compared (the lock pid
+# list, the ps start times, the executable hash) must be really measured. A
+# lock file that exists but carries no parsable pid, a live pid whose start
+# time cannot be read, a live pid whose executable cannot be resolved to an
+# absolute path or cannot be hashed, and a state dir that cannot be enumerated
+# are all ERRORS: `before` exits 1 and writes no receipt at all (measurement
+# runs before the receipt dir is created), and `after` exits 1 with a FAIL
+# line. Two equal error markers are never compared as a PASS, and an empty
+# measurement is accepted as "no live hosts" only when the enumeration itself
+# succeeded - a pid that is simply not alive is a legitimate value, recorded
+# as "-".
+#
+# Liveness never goes through an external tool: it comes from the shell's own
+# `kill -0`, so no missing, broken or empty-output program can make a LIVE pid
+# look dead. That shape - a `ps` that could not be executed reading as "no
+# such process", the pid recorded as "-", its executable never hashed, and
+# `after` comparing empty against empty for a PASS - is exactly the false PASS
+# this file must not be able to produce. `kill -0` reports EPERM for a live
+# pid that is not ours, which still counts as alive; only a clear "no such
+# process" is "not alive", and any other outcome is an error. Every external
+# tool whose output is compared (ps for the start time, the executable
+# resolver, the hasher) has its exit status checked, and a tool that is
+# present but fails is an error rather than a silent fall-through.
+#
+# Required tools are resolved once at startup (`command -v`): ps, a hasher
+# (shasum or sha256sum), and an executable resolver - lsof on macOS, readlink
+# for the Linux /proc/<pid>/exe link. A missing tool is exit 2 naming it,
+# before anything is written. The executable is then resolved without an
+# OS-name branch (lsof's text entry, then Linux /proc/<pid>/exe, then an
+# absolute `ps -o comm=`), so a host launched as ./relative-host is still
+# hashed by its real path.
+#
+# Exit codes: 0 ok / 1 audit FAIL or unreadable input / 2 usage, refusal or a
+# missing required tool.
+#
+# Receipt dir rule: the dir itself may already exist (a fresh dir is the common
+# case), but it must be a real, non-symlink directory under /tmp and every
+# receipt target - state-copy, state.sha256, pids.txt, binary.sha256, meta.txt
+# - must be absent, so an existing or dangling symlink target is refused before
+# any write.
 #
 # Safety: the receipt dir is validated BEFORE anything is created - it must
 # be lexically under /tmp or /private/tmp, contain no `..`, carry no symlink
@@ -47,12 +90,17 @@
 # inside, or containing any of the three) is refused, so a symlinked .omosense
 # or state, or a /tmp vs /private/tmp spelling, cannot redirect a write into
 # the live state. The live folder is only ever read (find, cat, cp-from, ps,
-# shasum) and `after` writes nothing at all. The script never deletes anything
+# the executable resolver, the hasher) and `after` writes nothing at all. The
+# script never deletes anything
 # and never signals any process (the selftest kills only the helper process it
 # started itself).
 
 set -euo pipefail
 export LC_ALL=C
+
+# Resolved once by require_tools(); every hash goes through hash_file() so the
+# receipt and each re-measurement use the same program.
+HASH_CMD=""
 
 usage() {
   cat <<'EOF'
@@ -65,16 +113,39 @@ usage: scripts/qa11-live-audit.sh <command> [args]
 
 Pass criteria are the host pids, their ps start times and the deployed
 binary hash only; the copied state is a snapshot receipt and is never
-compared. The script reads the live folder, writes only inside a receipt dir
-confined to /tmp, never signals any process. Exit codes: 0 ok, 1 audit FAIL,
-2 usage or an unsafe receipt dir. A receipt dir is refused when it is not
-confined to /tmp, contains a symlink component, is itself a symlink or not a
-directory, sits inside the live folder, or contains it, or resolves into or
-contains the live tree at any level - the resolved live folder, its resolved
-.omosense dir, or its resolved state source (symlinks followed, so a
-symlinked .omosense/state and a /tmp vs /private/tmp spelling are both seen);
-a receipt target that already exists or is a symlink (dangling included) is
-refused before any write.
+compared.
+
+Measurement is fail-closed: a lock whose pid cannot be parsed, a live pid
+whose start time cannot be read, a live pid whose executable cannot be
+resolved to an absolute path or cannot be hashed, and a state dir that cannot
+be enumerated each make `before` exit 1 and write no receipt at all, and make
+`after` exit 1 with a FAIL line - an unmeasurable input never passes. An empty
+lock set is a legitimate "no hosts" result only because the enumeration itself
+succeeded; a pid that is not alive is a legitimate value recorded as "-".
+
+Liveness comes from the shell's own `kill -0`, never from an external tool,
+so no missing or broken program can make a live pid look dead (EPERM counts
+as alive; only "no such process" is dead). Required tools are resolved at
+startup - ps, a hasher (shasum or sha256sum), and lsof on macOS / readlink on
+Linux - and a missing one is exit 2 naming it before anything is written.
+Every tool whose output is compared has its exit status checked. The
+executable is resolved without an OS-name branch (lsof text entry, then Linux
+/proc/<pid>/exe, then an absolute `ps -o comm=`), so ./relative-host is hashed
+by its real path.
+
+The script reads the live folder, writes only inside a receipt dir confined
+to /tmp, never signals any process. Exit codes: 0 ok, 1 audit FAIL or
+unreadable input, 2 usage or an unsafe receipt dir. Receipt dir rule: the dir
+itself may already exist (a fresh dir is the common case), but it must be a
+real non-symlink directory under /tmp and every receipt target - state-copy,
+state.sha256, pids.txt, binary.sha256, meta.txt - must be absent, so an
+existing or dangling symlink target is refused before any write. A receipt
+dir is refused when it is not confined to /tmp, contains a symlink component,
+is itself a symlink or not a directory, sits inside the live folder, or
+contains it, or resolves into or contains the live tree at any level - the
+resolved live folder, its resolved .omosense dir, or its resolved state
+source (symlinks followed, so a symlinked .omosense/state and a /tmp vs
+/private/tmp spelling are both seen).
 EOF
 }
 
@@ -233,6 +304,7 @@ resolve_live() {
 
 # extract_pid LOCK -> the pid field of a state lock file, or fail. Locks are
 # {"pid":N,...} (the shape internal/stop reads); only the first match is used.
+# A lock that exists but carries no parsable pid is an ERROR for every caller.
 extract_pid() {
   local p=""
   p="$(sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$1" 2>/dev/null)" || p=""
@@ -241,68 +313,215 @@ extract_pid() {
   printf '%s\n' "$p"
 }
 
+# require_state_dir LIVE -> exit 1 when the state dir is missing or cannot be
+# enumerated. An empty lock list is a legitimate "no hosts" result ONLY after
+# this succeeds: an unreadable dir must never read as "no hosts".
+require_state_dir() {
+  local state="$1/.omosense/state"
+  if [ ! -d "$state" ]; then
+    printf 'FAIL no state dir: %s\n' "$state" >&2
+    exit 1
+  fi
+  if [ ! -r "$state" ] || [ ! -x "$state" ]; then
+    printf 'FAIL state dir is not enumerable: %s\n' "$state" >&2
+    exit 1
+  fi
+}
+
+# require_tools -> resolve the tools the audit needs and exit 2 (before any
+# write) naming every one that is missing. ps supplies the start time, a
+# hasher supplies the executable digest, and an executable resolver is needed
+# per platform: lsof for the text entry on macOS, readlink for the Linux
+# /proc/<pid>/exe link. Resolving here means a missing tool is a clear refusal
+# instead of a mid-audit surprise whose output could be read as a value.
+require_tools() {
+  local miss="" os t
+  if ! command -v ps >/dev/null 2>&1; then
+    miss="$miss ps"
+  fi
+  if command -v shasum >/dev/null 2>&1; then
+    HASH_CMD="shasum"
+  elif command -v sha256sum >/dev/null 2>&1; then
+    HASH_CMD="sha256sum"
+  else
+    miss="$miss shasum"
+  fi
+  os="$(uname -s 2>/dev/null || printf 'unknown')"
+  if [ "$os" = "Linux" ]; then
+    if ! command -v readlink >/dev/null 2>&1; then
+      miss="$miss readlink"
+    fi
+  else
+    if ! command -v lsof >/dev/null 2>&1; then
+      miss="$miss lsof"
+    fi
+  fi
+  if [ -n "$miss" ]; then
+    for t in $miss; do
+      printf 'FAIL missing required tool: %s\n' "$t" >&2
+    done
+    exit 2
+  fi
+}
+
+# hash_file PATH -> stdout "<sha256>  <path>" in the shasum/sha256sum format,
+# non-zero when the hasher fails. The hasher is resolved once at startup.
+hash_file() {
+  if [ "$HASH_CMD" = "shasum" ]; then
+    shasum -a 256 "$1"
+  else
+    sha256sum "$1"
+  fi
+}
+
+# pid_alive PID -> success when the pid exists. Liveness comes from the
+# shell's own `kill -0`, never from an external program, so a missing or
+# failing tool can no longer make a LIVE pid look dead. `kill -0` reports
+# EPERM for a live pid that is not ours - still alive. Only a clear "no such
+# process" is "not alive"; anything else is an ERROR the caller must not read
+# as a value.
+pid_alive() {
+  local err
+  if kill -0 "$1" 2>/dev/null; then
+    return 0
+  fi
+  err="$(kill -0 "$1" 2>&1)" || true
+  case "$err" in
+    *"permitted"* | *"not owner"*) return 0 ;;
+    *"No such process"*) return 1 ;;
+  esac
+  printf 'FAIL cannot determine liveness of pid %s: %s\n' "$1" "$err" >&2
+  exit 1
+}
+
+# exe_path PID -> stdout the absolute, cwd-independent path of the process
+# executable, or fail (non-zero, nothing printed). A resolver that is present
+# is ALWAYS invoked and its exit status is ALWAYS checked: a present-but-failed
+# tool is an error, never a silent fall-through to the next candidate and
+# never a marker two receipts could compare as equal. Only a resolver that is
+# not installed at all is skipped (that is absence, not failure). Candidates:
+# lsof's text entry (macOS and Linux), the Linux /proc/<pid>/exe link, then an
+# absolute `ps -o comm=` value that exists on disk. A RELATIVE `ps` value is
+# never used - that was exactly the case that used to be stored as a marker
+# and compared as equal.
+exe_path() {
+  local pid="$1" p
+  if command -v lsof >/dev/null 2>&1; then
+    if ! p="$(lsof -a -p "$pid" -d txt -Fn 2>/dev/null)"; then
+      return 1
+    fi
+    p="$(printf '%s\n' "$p" | sed -n 's/^n//p')"
+    p="${p%%$'\n'*}"
+    if [ -n "$p" ]; then
+      printf '%s\n' "$p"
+      return 0
+    fi
+    return 1
+  fi
+  if [ -L "/proc/$pid/exe" ]; then
+    if ! p="$(readlink "/proc/$pid/exe" 2>/dev/null)"; then
+      return 1
+    fi
+    if [ -n "$p" ]; then
+      printf '%s\n' "$p"
+      return 0
+    fi
+    return 1
+  fi
+  if ! p="$(ps -o comm= -p "$pid" 2>/dev/null)"; then
+    return 1
+  fi
+  case "$p" in
+    /*)
+      if [ -e "$p" ]; then
+        printf '%s\n' "$p"
+        return 0
+      fi
+      ;;
+  esac
+  return 1
+}
+
 # lock_pids LIVE -> stdout "<lock-basename> <pid> <lstart or ->" sorted.
+# Fails closed: a lock without a parsable pid, and a live pid whose start time
+# cannot be read, are errors. A pid that is not alive is a legitimate "-".
 lock_pids() {
   local state="$1/.omosense/state" f pid lstart
-  [ -d "$state" ] || {
-    printf 'FAIL no state dir: %s\n' "$state"
-    exit 1
-  }
+  require_state_dir "$1"
   for f in "$state"/*.lock.json; do
-    [ -e "$f" ] || continue
-    if pid="$(extract_pid "$f")"; then
-      if lstart="$(ps -o lstart= -p "$pid" 2>/dev/null)"; then
-        :
-      else
-        lstart="-"
+    # The only entry to skip is the unexpanded pattern itself (no lock files).
+    # A dangling symlink DOES match the pattern and is a lock we cannot parse,
+    # so it must reach extract_pid and fail closed rather than be dropped.
+    [ -e "$f" ] || [ -L "$f" ] || continue
+    if ! pid="$(extract_pid "$f")"; then
+      printf 'FAIL cannot parse pid from lock: %s\n' "$f" >&2
+      exit 1
+    fi
+    if pid_alive "$pid"; then
+      if ! lstart="$(ps -o lstart= -p "$pid" 2>/dev/null)" || [ -z "${lstart//[[:space:]]/}" ]; then
+        printf 'FAIL cannot read start time of live pid %s: %s\n' "$pid" "$f" >&2
+        exit 1
       fi
     else
-      pid="-"
       lstart="-"
     fi
     printf '%s %s %s\n' "$(basename "$f")" "$pid" "$lstart"
   done | sort
 }
 
-# binary_hashes LIVE -> stdout "sha256  argv0" per unique live binary, sorted.
+# binary_hashes LIVE -> stdout "sha256  <exe>" per unique live executable,
+# sorted. Fails closed: a live pid whose executable cannot be resolved to an
+# absolute path or cannot be hashed is an error - never an "unreadable <path>"
+# marker that two receipts could compare as equal.
 binary_hashes() {
-  local state="$1/.omosense/state" f pid bin out
-  [ -d "$state" ] || {
-    printf 'FAIL no state dir: %s\n' "$state"
-    exit 1
-  }
+  local state="$1/.omosense/state" f pid exe out
+  require_state_dir "$1"
   for f in "$state"/*.lock.json; do
-    [ -e "$f" ] || continue
-    if pid="$(extract_pid "$f")"; then
-      if bin="$(ps -o comm= -p "$pid" 2>/dev/null)" && [ -n "$bin" ]; then
-        printf '%s\n' "$bin"
-      fi
+    [ -e "$f" ] || [ -L "$f" ] || continue
+    if ! pid="$(extract_pid "$f")"; then
+      printf 'FAIL cannot parse pid from lock: %s\n' "$f" >&2
+      exit 1
     fi
-  done | sort -u | while IFS= read -r bin; do
-    if out="$(shasum -a 256 "$bin" 2>/dev/null)"; then
-      printf '%s\n' "$out"
-    else
-      printf 'unreadable %s\n' "$bin"
+    pid_alive "$pid" || continue
+    if ! exe="$(exe_path "$pid")"; then
+      printf 'FAIL cannot resolve executable of live pid %s: %s\n' "$pid" "$f" >&2
+      exit 1
     fi
-  done | sort
+    if ! out="$(hash_file "$exe" 2>/dev/null)" || [ -z "$out" ]; then
+      printf 'FAIL cannot hash executable %s of live pid %s: %s\n' "$exe" "$pid" "$f" >&2
+      exit 1
+    fi
+    printf '%s\n' "$out"
+  done | sort -u
+}
+
+# write_lines FILE TEXT -> write TEXT plus one trailing newline, or an empty
+# file when TEXT is empty, so an empty measurement stays a 0-byte receipt.
+write_lines() {
+  local file="$1" text="${2-}"
+  if [ -z "$text" ]; then
+    : >"$file"
+  else
+    printf '%s\n' "$text" >"$file"
+  fi
 }
 
 cmd_before() {
-  local live="$1" dir="$2" state="$1/.omosense/state" f live_abs omo_abs state_src resolved
-  [ -d "$state" ] || {
-    printf 'FAIL no state dir: %s\n' "$state" >&2
-    exit 1
-  }
+  local live="$1" dir="$2" f live_abs omo_abs state_src resolved pids_now bins_now
+  require_state_dir "$live"
   # Validate the receipt path (creates nothing) before any write, then resolve
   # the live tree (folder, .omosense dir, state source - symlinks followed) and
-  # refuse any receipt location that aliases it, then create the receipt dir if
-  # it does not exist. The dir may pre-exist, but every receipt target below
-  # must be absent (see the loop).
+  # refuse any receipt location that aliases it, then MEASURE. Measurement runs
+  # before the receipt dir is created, so an input that cannot be measured
+  # leaves no receipt behind at all. The dir may pre-exist, but every receipt
+  # target below must be absent (see the loop).
   resolve_receipt_dir "$dir"
   live_abs="$(resolve_live "$live")"
   omo_abs="$(resolve_omo_dir "$live")"
   state_src="$(resolve_state_src "$live")"
   refuse_alias "$live_abs" "$omo_abs" "$state_src"
+  pids_now="$(lock_pids "$live")"
+  bins_now="$(binary_hashes "$live")"
   if [ -L "$RECV" ]; then
     printf 'FAIL receipt dir is a symlink: %s\n' "$RECV" >&2
     exit 2
@@ -350,11 +569,11 @@ cmd_before() {
   (
     cd "$RECV/state-copy" || exit 1
     find . -type f | sort | while IFS= read -r f; do
-      shasum -a 256 "$f"
+      hash_file "$f" || exit 1
     done
   ) >"$RECV/state.sha256"
-  lock_pids "$live" >"$RECV/pids.txt"
-  binary_hashes "$live" >"$RECV/binary.sha256"
+  write_lines "$RECV/pids.txt" "$pids_now"
+  write_lines "$RECV/binary.sha256" "$bins_now"
   {
     printf 'live_folder: %s\n' "$live"
     printf 'recorded_at: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -370,6 +589,8 @@ cmd_before() {
 
 cmd_after() {
   local live="$1" dir="$2" f live_abs omo_abs state_src rc=0
+  local pids_ref bins_ref pids_now bins_now
+  require_state_dir "$live"
   # Same path validation and alias refusal as `before`, but read-only: this
   # mode writes nothing at all (no scratch dir), so no receipt-relative path
   # can escape.
@@ -392,15 +613,22 @@ cmd_after() {
       exit 1
     fi
   done
-  if ! cmp -s "$RECV/pids.txt" <(lock_pids "$live"); then
+  # Measure first, then compare: a measurement that cannot be taken exits 1
+  # here (via the functions' own fail-closed exits) instead of being compared
+  # as an empty or marker value against the receipt.
+  pids_ref="$(cat "$RECV/pids.txt")"
+  bins_ref="$(cat "$RECV/binary.sha256")"
+  pids_now="$(lock_pids "$live")"
+  bins_now="$(binary_hashes "$live")"
+  if [ "$pids_ref" != "$pids_now" ]; then
     rc=1
     printf 'FAIL pids/start-times changed\n'
-    diff "$RECV/pids.txt" <(lock_pids "$live") | sed 's/^/  /' || true
+    diff <(printf '%s\n' "$pids_ref") <(printf '%s\n' "$pids_now") | sed 's/^/  /' || true
   fi
-  if ! cmp -s "$RECV/binary.sha256" <(binary_hashes "$live"); then
+  if [ "$bins_ref" != "$bins_now" ]; then
     rc=1
     printf 'FAIL deployed binary changed\n'
-    diff "$RECV/binary.sha256" <(binary_hashes "$live") | sed 's/^/  /' || true
+    diff <(printf '%s\n' "$bins_ref") <(printf '%s\n' "$bins_now") | sed 's/^/  /' || true
   fi
   if [ "$rc" -eq 0 ]; then
     printf 'PASS pids+start-times+binary unchanged\n'
@@ -411,7 +639,13 @@ cmd_after() {
 cmd_selftest() {
   local T live SPID UNIQ REFUSE ESCAPE_TARGET DIRECT rc=0 out got
   local alias_live_a alias_target_a alias_live_b alias_ext_b alias_live_c alias_target_c
+  local SCRIPT REL_PID HELPER_DIR CC_BIN rel_ready rel_live rel_receipt want_sha got_line
+  local MINBIN FAKEPS_FAIL FAKEPS_EMPTY deadonly_live t p
+  local empty_live noread_live malformed_live mal2_live gone_live dangling_lock_live c
   T="$(mktemp -d /tmp/qa11-selftest.XXXXXX)"
+  # Absolute script path: the new lanes run the audit from a DIFFERENT cwd, so
+  # a relative "$0" would break.
+  SCRIPT="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
   live="$T/live"
   UNIQ="${T##*/}"
   # Refusal inputs are HOME-independent on purpose: a receipt path built from
@@ -426,23 +660,36 @@ cmd_selftest() {
   sleep 300 &
   SPID=$!
   disown
-  # Kill only the helper this selftest started; nothing else is ever signaled.
+  # Every helper this selftest starts is tracked here - global on purpose, since
+  # the EXIT trap runs after this function has already returned.
+  HELPER_PIDS="$SPID"
+  # Kill only the helpers this selftest started; nothing else is ever signaled.
   # The trap removes only the /tmp sandbox - never a path outside /tmp.
-  trap 'kill "$SPID" 2>/dev/null || true; rm -rf "$T"' EXIT
+  trap 'for p in $HELPER_PIDS; do kill "$p" 2>/dev/null || true; done; rm -rf "$T"' EXIT
   mkdir -p "$live/.omosense/state/inbox"
   printf '{"pid": %d, "session": "qa11-selftest"}\n' "$SPID" >"$live/.omosense/state/listen.lock.json"
   printf '{"pid": 999999999, "session": "dead"}\n' >"$live/.omosense/state/dead.lock.json"
   printf '{"v": 1}\n' >"$live/.omosense/state/reminders.json"
   printf 'msg-1\n' >"$live/.omosense/state/inbox/msg-1"
 
-  # lane NAME WANT_EXIT WANT_SUBSTR -- CMD... : run CMD, expect WANT_EXIT and
-  # (when non-empty) WANT_SUBSTR in the output; anything else fails the lane.
+  # lane NAME WANT_EXIT WANT_SUBSTR [--cwd DIR] -- CMD... : run CMD, expect
+  # WANT_EXIT and (when non-empty) WANT_SUBSTR in the output; anything else
+  # fails the lane. With --cwd the command runs from DIR, which proves the
+  # audit does not depend on the caller's working directory.
   lane() {
-    local name="$1" want="$2" sub="$3"
+    local name="$1" want="$2" sub="$3" cwd=""
     shift 3
+    if [ "${1-}" = "--cwd" ]; then
+      cwd="$2"
+      shift 2
+    fi
     if [ "${1-}" = "--" ]; then shift; fi
     set +e
-    out="$("$@" 2>&1)"
+    if [ -n "$cwd" ]; then
+      out="$( cd "$cwd" && "$@" 2>&1 )"
+    else
+      out="$("$@" 2>&1)"
+    fi
     got=$?
     set -e
     if [ "$got" -ne "$want" ]; then
@@ -645,6 +892,223 @@ cmd_selftest() {
 
   lane "after: PASS again after restore" 0 "PASS" -- "$0" after "$live" "$T/receipt"
 
+  # --- S5-8 R1 class: every compared measurement is fail-closed. ---
+  # A pid that is not alive is a legitimate value ("-"), and an empty lock set
+  # is a legitimate "no hosts" result only because enumeration itself
+  # succeeded - but a lock that cannot be parsed, a live pid whose start time
+  # or executable cannot be read, and a state dir that cannot be enumerated
+  # must fail the audit instead of being compared as an equal error marker.
+  if grep -qF -- "dead.lock.json 999999999 -" "$T/receipt/pids.txt"; then
+    printf 'ok   dead pid recorded as "-" (a legitimate not-alive value)\n'
+  else
+    rc=1
+    printf 'FAIL dead pid is not recorded as a legitimate "-" value\n%s\n' "$(cat "$T/receipt/pids.txt")"
+  fi
+
+  empty_live="$T/empty-live"
+  mkdir -p "$empty_live/.omosense/state"
+  lane "empty state dir: before is a legitimate no-hosts receipt" 0 "RECEIPT" \
+    -- "$SCRIPT" before "$empty_live" "$T/empty-receipt"
+  lane "empty state dir: after PASSes (no hosts)" 0 "PASS" \
+    -- "$SCRIPT" after "$empty_live" "$T/empty-receipt"
+
+  noread_live="$T/noread-live"
+  mkdir -p "$noread_live/.omosense/state"
+  printf '{"pid": %d, "session": "noread"}\n' "$SPID" >"$noread_live/.omosense/state/listen.lock.json"
+  chmod 000 "$noread_live/.omosense/state"
+  lane "unreadable state dir: before fails closed" 1 "FAIL" \
+    -- "$SCRIPT" before "$noread_live" "$T/noread-receipt"
+  absent "unreadable-state-dir refusal" "$T/noread-receipt"
+  chmod 755 "$noread_live/.omosense/state"
+
+  malformed_live="$T/malformed-live"
+  mkdir -p "$malformed_live/.omosense/state"
+  printf 'not-json\n' >"$malformed_live/.omosense/state/listen.lock.json"
+  lane "malformed lock: before fails closed" 1 "FAIL cannot parse pid" \
+    -- "$SCRIPT" before "$malformed_live" "$T/malformed-receipt"
+  absent "malformed-lock refusal" "$T/malformed-receipt"
+
+  mal2_live="$T/mal2-live"
+  mkdir -p "$mal2_live/.omosense/state"
+  printf '{"pid": %d, "session": "mal2"}\n' "$SPID" >"$mal2_live/.omosense/state/listen.lock.json"
+  lane "malformed lock: receipt taken while the lock is valid" 0 "RECEIPT" \
+    -- "$SCRIPT" before "$mal2_live" "$T/mal2-receipt"
+  printf 'not-json\n' >"$mal2_live/.omosense/state/listen.lock.json"
+  lane "malformed lock: after fails closed" 1 "FAIL cannot parse pid" \
+    -- "$SCRIPT" after "$mal2_live" "$T/mal2-receipt"
+
+  # A dangling *.lock.json symlink matches the lock pattern, so it is an entry
+  # the audit cannot parse - not something to drop silently.
+  dangling_lock_live="$T/dangling-lock-live"
+  mkdir -p "$dangling_lock_live/.omosense/state"
+  ln -s "$dangling_lock_live/.omosense/state/missing-target" \
+    "$dangling_lock_live/.omosense/state/listen.lock.json"
+  lane "dangling symlink lock: before fails closed" 1 "FAIL cannot parse pid" \
+    -- "$SCRIPT" before "$dangling_lock_live" "$T/dangling-lock-receipt"
+  absent "dangling-lock refusal" "$T/dangling-lock-receipt"
+
+  # (a) a process launched as ./relative-host from its own dir, audited from
+  # another cwd: the receipt must hold the REAL digest of its resolved path,
+  # and replacing the on-disk binary (pid and start time unchanged) must FAIL.
+  CC_BIN=""
+  for c in cc clang gcc; do
+    if command -v "$c" >/dev/null 2>&1; then
+      CC_BIN="$c"
+      break
+    fi
+  done
+  if [ -z "$CC_BIN" ]; then
+    rc=1
+    printf 'FAIL relative-argv0 lane: no C compiler (cc/clang/gcc) to build the fixture\n'
+  else
+    HELPER_DIR="$T/rel-bin"
+    mkdir -p "$HELPER_DIR"
+    cat >"$HELPER_DIR/helper.c" <<'CEOF'
+#include <stdio.h>
+#include <unistd.h>
+int main(void) {
+  printf("HELPER_READY %s\n", BUILD_LABEL);
+  fflush(stdout);
+  for (;;) pause();
+  return 0;
+}
+CEOF
+    "$CC_BIN" '-DBUILD_LABEL="A"' -o "$HELPER_DIR/relative-host" "$HELPER_DIR/helper.c"
+    "$CC_BIN" '-DBUILD_LABEL="B"' -o "$HELPER_DIR/relative-host.next" "$HELPER_DIR/helper.c"
+    # Subscribe to the helper's own readiness line before triggering the audit:
+    # the FIFO open is the synchronisation and `-t 10` only bounds the wait, so
+    # nothing is paced by a sleep and the exec is known to have happened.
+    mkfifo "$T/rel.ready"
+    exec 9<>"$T/rel.ready"
+    ( cd "$HELPER_DIR" && exec ./relative-host ) >"$T/rel.ready" 2>&1 &
+    REL_PID=$!
+    disown
+    HELPER_PIDS="$HELPER_PIDS $REL_PID"
+    if ! IFS= read -r -t 10 -u 9 rel_ready; then
+      rc=1
+      printf 'FAIL relative-argv0 lane: helper never reported readiness\n'
+    elif [ "${rel_ready#HELPER_READY}" = "$rel_ready" ]; then
+      rc=1
+      printf 'FAIL relative-argv0 lane: unexpected readiness line: %s\n' "$rel_ready"
+    fi
+    exec 9<&-
+    rel_live="$T/rel-live"
+    mkdir -p "$rel_live/.omosense/state"
+    printf '{"pid": %d, "session": "relative"}\n' "$REL_PID" >"$rel_live/.omosense/state/listen.lock.json"
+    rel_receipt="$T/rel-receipt"
+
+    lane "relative-argv0: before measures a real digest from another cwd" 0 "RECEIPT" \
+      --cwd "$T" -- "$SCRIPT" before "$rel_live" "$rel_receipt"
+
+    want_sha="$(shasum -a 256 "$HELPER_DIR/relative-host" | awk '{print $1}')"
+    got_line="$(cat "$rel_receipt/binary.sha256" 2>/dev/null || true)"
+    case "$got_line" in
+      "$want_sha  "/*)
+        printf 'ok   relative-argv0: receipt holds the real sha256 of the resolved executable\n' ;;
+      *)
+        rc=1
+        printf 'FAIL relative-argv0: receipt does not hold the real digest %s\n%s\n' "$want_sha" "$got_line" ;;
+    esac
+    case "$got_line" in
+      *unreadable* | *./relative-host*)
+        rc=1
+        printf 'FAIL relative-argv0: receipt still carries an unreadable/relative marker\n%s\n' "$got_line" ;;
+    esac
+
+    mv "$HELPER_DIR/relative-host" "$HELPER_DIR/relative-host.running"
+    mv "$HELPER_DIR/relative-host.next" "$HELPER_DIR/relative-host"
+    lane "relative-argv0: after FAILs on a replaced binary" 1 "FAIL deployed binary" \
+      --cwd "$T" -- "$SCRIPT" after "$rel_live" "$rel_receipt"
+    mv "$HELPER_DIR/relative-host" "$HELPER_DIR/relative-host.next"
+    mv "$HELPER_DIR/relative-host.running" "$HELPER_DIR/relative-host"
+    lane "relative-argv0: after PASSes once the binary is restored" 0 "PASS" \
+      --cwd "$T" -- "$SCRIPT" after "$rel_live" "$rel_receipt"
+
+    # A content-only change at the SAME path must fail too: the receipt holds a
+    # real digest of the resolved executable, not just its pathname.
+    cp "$HELPER_DIR/relative-host" "$HELPER_DIR/relative-host.a"
+    if ! cat "$HELPER_DIR/relative-host.next" >"$HELPER_DIR/relative-host"; then
+      rc=1
+      printf 'FAIL relative-argv0: could not overwrite the running binary in place\n'
+    fi
+    lane "relative-argv0: after FAILs on an in-place content change" 1 "FAIL deployed binary" \
+      --cwd "$T" -- "$SCRIPT" after "$rel_live" "$rel_receipt"
+    if ! cat "$HELPER_DIR/relative-host.a" >"$HELPER_DIR/relative-host"; then
+      rc=1
+      printf 'FAIL relative-argv0: could not restore the running binary in place\n'
+    fi
+    lane "relative-argv0: after PASSes once the content is restored" 0 "PASS" \
+      --cwd "$T" -- "$SCRIPT" after "$rel_live" "$rel_receipt"
+
+    # (b) a live pid whose executable cannot be measured: deleting the running
+    # binary leaves the process alive but unhashable - never a PASS.
+    gone_live="$T/gone-live"
+    mkdir -p "$gone_live/.omosense/state"
+    printf '{"pid": %d, "session": "gone"}\n' "$REL_PID" >"$gone_live/.omosense/state/listen.lock.json"
+    rm "$HELPER_DIR/relative-host"
+    lane "unhashable executable: before fails closed" 1 "FAIL" \
+      -- "$SCRIPT" before "$gone_live" "$T/gone-receipt"
+    absent "unhashable-executable refusal" "$T/gone-receipt"
+  fi
+
+  # --- S5-8 R1 class, round 2: liveness must not be able to fail silently. ---
+  # The v-pr2d residual blocker: with a `ps` that could not be executed the
+  # liveness probe read as "not alive", a LIVE pid was recorded with the
+  # dead-pid marker "-", its executable was never hashed, and `after` compared
+  # empty==empty and "-"=="-" for a PASS. Liveness now comes from the shell's
+  # own `kill -0`, the required tools are resolved before anything is written,
+  # and every tool whose output is compared has its exit status checked.
+  MINBIN="$T/minbin"
+  mkdir -p "$MINBIN"
+  # Everything the audit needs EXCEPT ps, so `ps` is the only missing tool and
+  # the refusal message can be pinned exactly.
+  for t in bash sed sort shasum lsof uname basename cat cp date diff find hostname mkdir tr wc; do
+    p="$(command -v "$t" 2>/dev/null || true)"
+    if [ -n "$p" ]; then ln -s "$p" "$MINBIN/$t"; fi
+  done
+  if [ -e "$MINBIN/ps" ] || [ -L "$MINBIN/ps" ]; then
+    rc=1
+    printf 'FAIL tools lane: the minimal PATH unexpectedly contains ps\n'
+  fi
+  lane "tools: PATH without ps refuses (exit 2) before any write" 2 "FAIL missing required tool: ps" \
+    -- env PATH="$MINBIN" "$SCRIPT" before "$live" "$T/nops-receipt"
+  absent "no-ps refusal" "$T/nops-receipt"
+  lane "tools: PATH without ps never PASSes on after" 2 "FAIL missing required tool: ps" \
+    -- env PATH="$MINBIN" "$SCRIPT" after "$live" "$T/receipt"
+
+  # A `ps` that is present but non-functional: exit 1 for every call.
+  FAKEPS_FAIL="$T/fakebin-fail"
+  mkdir -p "$FAKEPS_FAIL"
+  printf '#!/bin/sh\nexit 1\n' >"$FAKEPS_FAIL/ps"
+  chmod +x "$FAKEPS_FAIL/ps"
+  lane "tools: a ps that exits 1 never PASSes (before)" 1 "FAIL cannot read start time" \
+    -- env PATH="$FAKEPS_FAIL:$PATH" "$SCRIPT" before "$live" "$T/failps-receipt"
+  absent "failing-ps refusal" "$T/failps-receipt"
+  lane "tools: a ps that exits 1 never PASSes (after)" 1 "FAIL cannot read start time" \
+    -- env PATH="$FAKEPS_FAIL:$PATH" "$SCRIPT" after "$live" "$T/receipt"
+
+  # A `ps` that succeeds and prints nothing: empty output is not a value.
+  FAKEPS_EMPTY="$T/fakebin-empty"
+  mkdir -p "$FAKEPS_EMPTY"
+  printf '#!/bin/sh\nexit 0\n' >"$FAKEPS_EMPTY/ps"
+  chmod +x "$FAKEPS_EMPTY/ps"
+  lane "tools: a ps that prints nothing never PASSes (before)" 1 "FAIL cannot read start time" \
+    -- env PATH="$FAKEPS_EMPTY:$PATH" "$SCRIPT" before "$live" "$T/emptyps-receipt"
+  absent "empty-ps refusal" "$T/emptyps-receipt"
+  lane "tools: a ps that prints nothing never PASSes (after)" 1 "FAIL cannot read start time" \
+    -- env PATH="$FAKEPS_EMPTY:$PATH" "$SCRIPT" after "$live" "$T/receipt"
+
+  # Control: liveness is decided by kill -0, so a dead pid needs no ps at all.
+  # With a ps that always fails, a dead-only lock set is still a legitimate
+  # no-hosts receipt - ps is not on the liveness path.
+  deadonly_live="$T/deadonly-live"
+  mkdir -p "$deadonly_live/.omosense/state"
+  printf '{"pid": 999999999, "session": "dead"}\n' >"$deadonly_live/.omosense/state/dead.lock.json"
+  lane "liveness: a dead pid needs no ps (kill -0 decides)" 0 "RECEIPT" \
+    -- env PATH="$FAKEPS_FAIL:$PATH" "$SCRIPT" before "$deadonly_live" "$T/deadonly-receipt"
+  lane "liveness: dead-only after PASSes with a broken ps" 0 "PASS" \
+    -- env PATH="$FAKEPS_FAIL:$PATH" "$SCRIPT" after "$deadonly_live" "$T/deadonly-receipt"
+
   if [ "$rc" -eq 0 ]; then
     printf 'SELFTEST PASS\n'
   else
@@ -679,6 +1143,12 @@ main() {
       usage >&2
       exit 2
       ;;
+  esac
+  # Resolve the required tools before any command runs: a missing tool is a
+  # clear exit-2 refusal here, never a mid-audit failure whose output could be
+  # read as a measured value.
+  case "$1" in
+    before | after | selftest) require_tools ;;
   esac
   case "$1" in
     before) cmd_before "$2" "$3" ;;
