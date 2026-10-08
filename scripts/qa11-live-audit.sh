@@ -9,6 +9,7 @@
 
 set -u -o pipefail
 export LC_ALL=C
+unset CDPATH # cd must resolve relative paths against the cwd only
 
 RECEIPT_NAME=receipt.txt
 
@@ -149,7 +150,8 @@ cmd_after() {
 # Selftest: fixtures under /tmp; the live pid is a plain sleep under its
 # own name; every lane asserts a binary observable (exit code, files, content).
 cmd_selftest() {
-  local root live1 live2 live2b live3 minbin outside helper="" passes=0 fails=0 out rc t
+  local root live1 live2 live2b live3 minbin outside helper="" passes=0 fails=0 out rc t self
+  self=$(cd "$(dirname "$0")" && pwd -P)/${0##*/}
   root=$(mktemp -d /tmp/qa11-selftest.XXXXXX) || { printf 'selftest: mktemp failed\n' >&2; return 1; }
   trap '[ -n "$helper" ] && kill "$helper" >/dev/null 2>&1; rm -rf -- "$root"' EXIT
   ok() { printf 'ok   %s\n' "$1"; passes=$((passes + 1)); }
@@ -238,6 +240,14 @@ cmd_selftest() {
     ok "receipt dir inside the live folder refused, nothing created"
   else
     bad "receipt dir inside the live folder (rc=$rc: $out)"
+  fi
+
+  out=$(cd "$root" && CDPATH=. "$self" before live1 "$root/live1/rel-receipt" 2>&1)
+  rc=$?
+  if [ "$rc" -eq 2 ] && [ ! -e "$root/live1/rel-receipt" ]; then
+    ok "relative live folder under CDPATH: inside receipt refused"
+  else
+    bad "relative live folder under CDPATH (rc=$rc: $out)"
   fi
 
   cp -R "$live1" "$root/live4" # dangling lock beside a measurable one
