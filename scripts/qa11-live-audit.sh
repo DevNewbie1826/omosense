@@ -13,11 +13,12 @@
 #       Take the receipt into <receipt-dir> (must resolve under /tmp):
 #         state-copy/     cp -p copy of <live-folder>/.omosense/state
 #                         (regular files only; the source is never written)
-#         state.sha256    sorted "sha256  ./relative/path" of the copy
-#         pids.txt        sorted "<lock> <pid> <ps lstart>" for every
+#         state.sha256    count=N, then "<sha256><TAB>./relative/path" of the copy
+#         pids.txt        count=N, then "<lock> <pid> <ps lstart>" for every
 #                         <live-folder>/.omosense/state/*.lock.json
 #                         ("-" when the pid is not alive)
-#         binary.sha256   sorted unique "sha256  <exe>" where <exe> is the
+#         binary.sha256   count=N, then "<pid><TAB><sha256><TAB><exe>" per
+#                         distinct live pid, where <exe> is the
 #                         cwd-independent absolute executable path of every
 #                         live lock pid (lsof text entry, then Linux
 #                         /proc/<pid>/exe, then an absolute `ps -o comm=`)
@@ -46,6 +47,12 @@
 # measurement is accepted as "no live hosts" only when the enumeration itself
 # succeeded - a pid that is simply not alive is a legitimate value, recorded
 # as "-".
+#
+# Every receipt has an explicit count=N header; every data record is validated
+# for shape, identity and count both on creation and on readback. Zero hosts is
+# count=0, never an empty file. Compared data and snapshot enumeration use
+# shell builtins, not sort/awk pipelines. Older uncounted receipts are rejected;
+# take a fresh before receipt with this version.
 #
 # Liveness never goes through an external tool: it comes from the shell's own
 # `kill -0`, so no missing, broken or empty-output program can make a LIVE pid
@@ -102,6 +109,38 @@ export LC_ALL=C
 # receipt and each re-measurement use the same program.
 HASH_CMD=""
 
+# The receipt grammar is also used on readback. Counts are shell integers,
+# never values derived from a lossy external pipeline.
+valid_pid() { [[ "$1" =~ ^[1-9][0-9]*$ ]]; }
+valid_digest() { [[ "$1" =~ ^[0-9a-f]{64}$ ]]; }
+valid_text() { [[ -n "$1" && "$1" != *$'\n'* && "$1" != *$'\r'* && "$1" != *$'\t'* ]]; }
+valid_exe() { valid_text "$1" && [[ "$1" = /* ]] && [ -f "$1" ]; }
+valid_start() {
+  local re='^(Mon|Tue|Wed|Thu|Fri|Sat|Sun) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) ( [1-9]|[12][0-9]|3[01]) ([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9] [1-9][0-9]{3}$'
+  [[ "$1" =~ $re ]]
+}
+valid_timestamp() {
+  local re='^[1-9][0-9]{3}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z$'
+  [[ "$1" =~ $re ]]
+}
+
+fail_measure() {
+  printf 'FAIL %s\n' "$*" >&2
+  exit 1
+}
+
+# Keep the terminal newline until its count is checked. Plain command
+# substitution would silently erase trailing blank records.
+one_line() {
+  local out
+  out="$("$@" && printf '\001')" || return 1
+  out="${out%$'\001'}"
+  [[ "$out" = *$'\n' ]] || return 1
+  out="${out%$'\n'}"
+  valid_text "$out" || return 1
+  printf '%s\n' "$out"
+}
+
 usage() {
   cat <<'EOF'
 usage: scripts/qa11-live-audit.sh <command> [args]
@@ -132,6 +171,12 @@ Every tool whose output is compared has its exit status checked. The
 executable is resolved without an OS-name branch (lsof text entry, then Linux
 /proc/<pid>/exe, then an absolute `ps -o comm=`), so ./relative-host is hashed
 by its real path.
+
+Each receipt starts with count=N. Digests are exactly 64 lowercase hex digits,
+pids are positive decimal integers, start times have the ps lstart shape, and
+executable paths are absolute existing files. Counts and live-pid coverage are
+checked before storing or comparing. Blank, malformed, truncated, reordered or
+uncounted receipts fail. A genuinely empty measurement is count=0.
 
 The script reads the live folder, writes only inside a receipt dir confined
 to /tmp, never signals any process. Exit codes: 0 ok, 1 audit FAIL or
@@ -303,13 +348,18 @@ resolve_live() {
 }
 
 # extract_pid LOCK -> the pid field of a state lock file, or fail. Locks are
-# {"pid":N,...} (the shape internal/stop reads); only the first match is used.
+# {"pid":N,...} (the shape internal/stop reads); duplicate pid fields are invalid.
 # A lock that exists but carries no parsable pid is an ERROR for every caller.
 extract_pid() {
-  local p=""
-  p="$(sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$1" 2>/dev/null)" || p=""
-  p="${p%%$'\n'*}"
-  [ -n "$p" ] || return 1
+  local text line p rest re='"pid"[[:space:]]*:[[:space:]]*([1-9][0-9]*)[[:space:]]*[,}]'
+  [ -f "$1" ] && [ -r "$1" ] || return 1
+  text=""
+  while IFS= read -r line || [ -n "$line" ]; do text="$text$line"; done <"$1"
+  [[ "$text" =~ ^[[:space:]]*\{.*\}[[:space:]]*$ && "$text" =~ $re ]] || return 1
+  p="${BASH_REMATCH[1]}"
+  rest="${text#*\"pid\"}"
+  [[ "$rest" != *'"pid"'* ]] || return 1
+  valid_pid "$p" || return 1
   printf '%s\n' "$p"
 }
 
@@ -346,7 +396,8 @@ require_tools() {
   else
     miss="$miss shasum"
   fi
-  os="$(uname -s 2>/dev/null || printf 'unknown')"
+  os="$(one_line uname -s 2>/dev/null)" || fail_measure "cannot measure platform"
+  [[ "$os" = Darwin || "$os" = Linux ]] || fail_measure "invalid platform: $os"
   if [ "$os" = "Linux" ]; then
     if ! command -v readlink >/dev/null 2>&1; then
       miss="$miss readlink"
@@ -364,14 +415,20 @@ require_tools() {
   fi
 }
 
-# hash_file PATH -> stdout "<sha256>  <path>" in the shasum/sha256sum format,
-# non-zero when the hasher fails. The hasher is resolved once at startup.
+# hash_file PATH -> exactly one validated lowercase sha256, non-zero when the
+# hasher fails or returns anything except one correctly shaped digest/path row.
 hash_file() {
+  local out digest re='^([0-9a-f]{64})  (.*)$'
+  valid_text "$1" || return 1
   if [ "$HASH_CMD" = "shasum" ]; then
-    shasum -a 256 "$1"
+    out="$(one_line shasum -a 256 "$1")" || return 1
   else
-    sha256sum "$1"
+    out="$(one_line sha256sum "$1")" || return 1
   fi
+  [[ "$out" =~ $re ]] || return 1
+  digest="${BASH_REMATCH[1]}"
+  [[ "${BASH_REMATCH[2]}" = "$1" ]] && valid_digest "$digest" || return 1
+  printf '%s\n' "$digest"
 }
 
 # pid_alive PID -> success when the pid exists. Liveness comes from the
@@ -405,35 +462,56 @@ pid_alive() {
 # never used - that was exactly the case that used to be stored as a marker
 # and compared as equal.
 exe_path() {
-  local pid="$1" p
+  local pid="$1" p line first="" comm seen=0 want=file
   if command -v lsof >/dev/null 2>&1; then
-    if ! p="$(lsof -a -p "$pid" -d txt -Fn 2>/dev/null)"; then
+    if ! p="$(lsof -a -p "$pid" -d txt -Fn 2>/dev/null && printf '\001')"; then
       return 1
     fi
-    p="$(printf '%s\n' "$p" | sed -n 's/^n//p')"
-    p="${p%%$'\n'*}"
-    if [ -n "$p" ]; then
-      printf '%s\n' "$p"
-      return 0
-    fi
-    return 1
+    p="${p%$'\001'}"
+    [[ "$p" = *$'\n' ]] || return 1
+    p="${p%$'\n'}"
+    # Exactly one matching process header followed by ftxt/n-path pairs.
+    while IFS= read -r line; do
+      if [ "$seen" -eq 0 ]; then
+        [[ "$line" = "p$pid" ]] || return 1
+        seen=1
+      elif [ "$want" = file ]; then
+        [[ "$line" = ftxt ]] || return 1
+        want=path
+      else
+        [[ "$line" = n/* ]] || return 1
+        # lsof also lists mapped data/library files which may already be
+        # unlinked. They are not executable measurements; validate framing
+        # here, and require existence only for the selected executable below.
+        valid_text "${line#n}" || return 1
+        if [ -z "$first" ]; then first="${line#n}"; fi
+        want="file"
+      fi
+    done <<<"$p"
+    if [[ -z "$first" || "$want" != file ]] || ! valid_exe "$first"; then return 1; fi
+    comm="$(one_line ps -o comm= -p "$pid" 2>/dev/null)" || return 1
+    valid_text "$comm" || return 1
+    # A reordered library entry must not be mistaken for the executable.
+    [[ "${first##*/}" = "${comm##*/}" ]] || return 1
+    printf '%s\n' "$first"
+    return 0
   fi
   if [ -L "/proc/$pid/exe" ]; then
-    if ! p="$(readlink "/proc/$pid/exe" 2>/dev/null)"; then
+    if ! p="$(one_line readlink "/proc/$pid/exe" 2>/dev/null)"; then
       return 1
     fi
-    if [ -n "$p" ]; then
+    if valid_exe "$p"; then
       printf '%s\n' "$p"
       return 0
     fi
     return 1
   fi
-  if ! p="$(ps -o comm= -p "$pid" 2>/dev/null)"; then
+  if ! p="$(one_line ps -o comm= -p "$pid" 2>/dev/null)"; then
     return 1
   fi
   case "$p" in
     /*)
-      if [ -e "$p" ]; then
+      if valid_exe "$p"; then
         printf '%s\n' "$p"
         return 0
       fi
@@ -442,72 +520,162 @@ exe_path() {
   return 1
 }
 
-# lock_pids LIVE -> stdout "<lock-basename> <pid> <lstart or ->" sorted.
-# Fails closed: a lock without a parsable pid, and a live pid whose start time
-# cannot be read, are errors. A pid that is not alive is a legitimate "-".
-lock_pids() {
-  local state="$1/.omosense/state" f pid lstart
+# One lock enumeration supplies BOTH receipts. Bash glob order is stable under
+# LC_ALL=C; no sort/awk/sed can erase or reorder the compared measurement set.
+# Each lock has one pid row; each distinct live pid has one binary row.
+measure() {
+  local state="$1/.omosense/state" f name pid lstart exe digest lock_count=0 live_count=0
+  local seen=" " pid_rows="" bin_rows="" locks=()
   require_state_dir "$1"
   for f in "$state"/*.lock.json; do
-    # The only entry to skip is the unexpanded pattern itself (no lock files).
-    # A dangling symlink DOES match the pattern and is a lock we cannot parse,
-    # so it must reach extract_pid and fail closed rather than be dropped.
     [ -e "$f" ] || [ -L "$f" ] || continue
-    if ! pid="$(extract_pid "$f")"; then
-      printf 'FAIL cannot parse pid from lock: %s\n' "$f" >&2
-      exit 1
-    fi
+    locks[${#locks[@]}]="$f"
+  done
+  for f in ${locks[@]+"${locks[@]}"}; do
+    name="${f##*/}"
+    valid_text "$name" && [[ "$name" != *' '* ]] || fail_measure "invalid lock name: $f"
+    pid="$(extract_pid "$f")" || fail_measure "cannot parse pid from lock: $f"
     if pid_alive "$pid"; then
-      if ! lstart="$(ps -o lstart= -p "$pid" 2>/dev/null)" || [ -z "${lstart//[[:space:]]/}" ]; then
-        printf 'FAIL cannot read start time of live pid %s: %s\n' "$pid" "$f" >&2
-        exit 1
+      lstart="$(one_line ps -o lstart= -p "$pid" 2>/dev/null)" || fail_measure "cannot read start time of live pid $pid: $f"
+      # ps pads its single value; trim only the exterior, then validate shape.
+      lstart="${lstart#"${lstart%%[![:space:]]*}"}"
+      lstart="${lstart%"${lstart##*[![:space:]]}"}"
+      valid_start "$lstart" || fail_measure "cannot read start time of live pid $pid: $f"
+      if [[ "$seen" != *" $pid "* ]]; then
+        if ! exe="$(exe_path "$pid")" || ! valid_exe "$exe"; then
+          fail_measure "deployed binary cannot resolve executable of live pid $pid: $f"
+        fi
+        if ! digest="$(hash_file "$exe" 2>/dev/null)" || ! valid_digest "$digest"; then
+          fail_measure "cannot hash executable $exe of live pid $pid: $f"
+        fi
+        bin_rows="$bin_rows$pid"$'\t'"$digest"$'\t'"$exe"$'\n'
+        seen="$seen$pid "
+        live_count=$((live_count + 1))
       fi
     else
       lstart="-"
     fi
-    printf '%s %s %s\n' "$(basename "$f")" "$pid" "$lstart"
-  done | sort
+    pid_rows="$pid_rows$name $pid $lstart"$'\n'
+    lock_count=$((lock_count + 1))
+  done
+  [ "$lock_count" -eq "${#locks[@]}" ] || fail_measure "lock measurement count mismatch"
+  PIDS_NOW="count=$lock_count"$'\n'"$pid_rows"
+  BINS_NOW="count=$live_count"$'\n'"$bin_rows"
+  read_receipt pids/start-times <(printf '%s' "$PIDS_NOW")
+  read_receipt "deployed binary" <(printf '%s' "$BINS_NOW")
 }
 
-# binary_hashes LIVE -> stdout "sha256  <exe>" per unique live executable,
-# sorted. Fails closed: a live pid whose executable cannot be resolved to an
-# absolute path or cannot be hashed is an error - never an "unreadable <path>"
-# marker that two receipts could compare as equal.
-binary_hashes() {
-  local state="$1/.omosense/state" f pid exe out
-  require_state_dir "$1"
-  for f in "$state"/*.lock.json; do
+# Recursive builtin enumeration replaces find|sort for the snapshot too.
+# Symlinks are not followed, just as with find -type f.
+state_files() {
+  local dir="$1" f
+  [ -r "$dir" ] && [ -x "$dir" ] || fail_measure "cannot enumerate snapshot directory: $dir"
+  for f in "$dir"/* "$dir"/.[!.]* "$dir"/..?*; do
     [ -e "$f" ] || [ -L "$f" ] || continue
-    if ! pid="$(extract_pid "$f")"; then
-      printf 'FAIL cannot parse pid from lock: %s\n' "$f" >&2
-      exit 1
+    valid_text "$f" || fail_measure "invalid snapshot path: $f"
+    [ ! -L "$f" ] || continue
+    if [ -d "$f" ]; then
+      state_files "$f"
+    elif [ -f "$f" ]; then
+      STATE_FILES[${#STATE_FILES[@]}]="$f"
     fi
-    pid_alive "$pid" || continue
-    if ! exe="$(exe_path "$pid")"; then
-      printf 'FAIL cannot resolve executable of live pid %s: %s\n' "$pid" "$f" >&2
-      exit 1
-    fi
-    if ! out="$(hash_file "$exe" 2>/dev/null)" || [ -z "$out" ]; then
-      printf 'FAIL cannot hash executable %s of live pid %s: %s\n' "$exe" "$pid" "$f" >&2
-      exit 1
-    fi
-    printf '%s\n' "$out"
-  done | sort -u
+  done
 }
 
-# write_lines FILE TEXT -> write TEXT plus one trailing newline, or an empty
-# file when TEXT is empty, so an empty measurement stays a 0-byte receipt.
-write_lines() {
-  local file="$1" text="${2-}"
-  if [ -z "$text" ]; then
-    : >"$file"
-  else
-    printf '%s\n' "$text" >"$file"
+# Read the original bytes line by line (not cat in a substitution, which loses
+# trailing blank lines). Rebuild only after every record and count validates.
+# For pids, also derive the distinct live-pid set used by the binary validator.
+read_receipt() {
+  local kind="$1" file="$2" line count n=0 key pid value prev="" seen=" "
+  local re text="" expected_live="${LIVE_PIDS- }" expected_paths="" f
+  if [ "$kind" = "pids/start-times" ]; then LIVE_PIDS=" "; fi
+  {
+    IFS= read -r line || fail_measure "$kind malformed receipt header"
+    re='^count=(0|[1-9][0-9]*)$'
+    [[ "$line" =~ $re ]] || fail_measure "$kind malformed receipt header"
+    count="${BASH_REMATCH[1]}"
+    # Avoid arithmetic on unbounded/untrusted numbers. Compare decimal strings.
+    text="$line"$'\n'
+    while IFS= read -r line; do
+      [ -n "$line" ] || fail_measure "$kind blank receipt record"
+      case "$kind" in
+        pids/start-times)
+          re='^([^[:space:]]+\.lock\.json) ([1-9][0-9]*) (.*)$'
+          [[ "$line" =~ $re ]] || fail_measure "$kind malformed receipt record"
+          key="${BASH_REMATCH[1]}"; pid="${BASH_REMATCH[2]}"; value="${BASH_REMATCH[3]}"
+          valid_pid "$pid" || fail_measure "$kind invalid pid"
+          [[ -z "$prev" || "$prev" < "$key" ]] || fail_measure "$kind reordered or duplicate lock"
+          prev="$key"
+          if [ "$value" != "-" ]; then
+            valid_start "$value" || fail_measure "$kind invalid start time"
+            if [[ "$LIVE_PIDS" != *" $pid "* ]]; then LIVE_PIDS="$LIVE_PIDS$pid "; fi
+          fi
+          ;;
+        "deployed binary")
+          re=$'^([1-9][0-9]*)\t([0-9a-f]{64})\t(.+)$'
+          [[ "$line" =~ $re ]] || fail_measure "$kind malformed receipt record"
+          key="${BASH_REMATCH[1]}"; value="${BASH_REMATCH[2]}"; pid="${BASH_REMATCH[3]}"
+          if ! valid_pid "$key" || ! valid_digest "$value" || ! valid_exe "$pid"; then
+            fail_measure "$kind invalid field"
+          fi
+          [[ "$seen" != *" $key "* && "$expected_live" = *" $key "* ]] || fail_measure "$kind duplicate or unexpected pid"
+          seen="$seen$key "
+          ;;
+        snapshot)
+          re=$'^([0-9a-f]{64})\t(\\./.+)$'
+          [[ "$line" =~ $re ]] || fail_measure "$kind malformed receipt record"
+          value="${BASH_REMATCH[1]}"; key="${BASH_REMATCH[2]}"
+          if ! valid_digest "$value" || ! valid_text "$key"; then fail_measure "$kind invalid field"; fi
+          [[ "$key" != *'/../'* && "$key" != *'/./'* && "$seen" != *$'\t'"$key"$'\t'* ]] || fail_measure "$kind invalid or duplicate path"
+          [ -f "$RECV/state-copy/$key" ] || fail_measure "$kind missing copied file"
+          seen="$seen"$'\t'"$key"$'\t'
+          ;;
+        metadata)
+          case "$n" in
+            0)
+              if [[ "$line" != 'live_folder: '* ]] || ! valid_text "${line#live_folder: }"; then
+                fail_measure "$kind invalid live folder"
+              fi
+              ;;
+            1)
+              if [[ "$line" != 'recorded_at: '* ]] || ! valid_timestamp "${line#recorded_at: }"; then
+                fail_measure "$kind invalid timestamp"
+              fi
+              ;;
+            2)
+              re='^host: [A-Za-z0-9][A-Za-z0-9._-]*$'
+              [[ "$line" =~ $re ]] || fail_measure "$kind invalid hostname"
+              ;;
+            *) fail_measure "$kind excess record" ;;
+          esac
+          ;;
+      esac
+      text="$text$line"$'\n'
+      n=$((n + 1))
+    done
+    [ -z "$line" ] || fail_measure "$kind truncated receipt record"
+  } <"$file"
+  [ "$n" = "$count" ] || fail_measure "$kind receipt count mismatch"
+  if [ "$kind" = "deployed binary" ]; then
+    [ "$seen" = "$expected_live" ] || fail_measure "$kind live pid coverage or order mismatch"
+  elif [ "$kind" = snapshot ]; then
+    STATE_FILES=()
+    state_files "$RECV/state-copy"
+    [ "$n" -eq "${#STATE_FILES[@]}" ] || fail_measure "$kind file coverage count mismatch"
+    expected_paths=" "
+    for f in ${STATE_FILES[@]+"${STATE_FILES[@]}"}; do
+      expected_paths="$expected_paths"$'\t'"./${f#"$RECV/state-copy/"}"$'\t'
+    done
+    [ "$seen" = "$expected_paths" ] || fail_measure "$kind path coverage or order mismatch"
+  elif [ "$kind" = metadata ]; then
+    [ "$count" = 3 ] || fail_measure "$kind record count mismatch"
   fi
+  RECEIPT_TEXT="$text"
 }
 
 cmd_before() {
-  local live="$1" dir="$2" f live_abs omo_abs state_src resolved pids_now bins_now
+  local live="$1" dir="$2" f live_abs omo_abs state_src resolved rel digest snapshot_rows=""
+  local recorded_at host pid_count bin_count
   require_state_dir "$live"
   # Validate the receipt path (creates nothing) before any write, then resolve
   # the live tree (folder, .omosense dir, state source - symlinks followed) and
@@ -520,8 +688,14 @@ cmd_before() {
   omo_abs="$(resolve_omo_dir "$live")"
   state_src="$(resolve_state_src "$live")"
   refuse_alias "$live_abs" "$omo_abs" "$state_src"
-  pids_now="$(lock_pids "$live")"
-  bins_now="$(binary_hashes "$live")"
+  measure "$live"
+  STATE_FILES=()
+  state_files "$state_src"
+  valid_text "$live" || fail_measure "invalid live folder"
+  recorded_at="$(one_line date -u +%Y-%m-%dT%H:%M:%SZ)" || fail_measure "cannot measure receipt time"
+  valid_timestamp "$recorded_at" || fail_measure "invalid receipt time"
+  host="$(one_line hostname)" || fail_measure "cannot measure hostname"
+  [[ "$host" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || fail_measure "invalid hostname"
   if [ -L "$RECV" ]; then
     printf 'FAIL receipt dir is a symlink: %s\n' "$RECV" >&2
     exit 2
@@ -559,32 +733,35 @@ cmd_before() {
   # Snapshot the live state (receipt only; never compared, never written back).
   # Copy FROM the resolved state source, not the live-relative spelling.
   mkdir -p "$RECV/state-copy"
-  (
-    cd "$state_src" || exit 1
-    find . -type f | sort | while IFS= read -r f; do
-      mkdir -p "$RECV/state-copy/$(dirname "$f")"
-      cp -p "$f" "$RECV/state-copy/$f"
-    done
-  )
-  (
-    cd "$RECV/state-copy" || exit 1
-    find . -type f | sort | while IFS= read -r f; do
-      hash_file "$f" || exit 1
-    done
-  ) >"$RECV/state.sha256"
-  write_lines "$RECV/pids.txt" "$pids_now"
-  write_lines "$RECV/binary.sha256" "$bins_now"
+  for f in ${STATE_FILES[@]+"${STATE_FILES[@]}"}; do
+    rel="./${f#"$state_src"/}"
+    mkdir -p "${RECV}/state-copy/${rel%/*}"
+    cp -p "$f" "$RECV/state-copy/$rel"
+    digest="$(hash_file "$RECV/state-copy/$rel")" || fail_measure "cannot hash snapshot: $rel"
+    snapshot_rows="$snapshot_rows$digest"$'\t'"$rel"$'\n'
+  done
+  printf 'count=%s\n%s' "${#STATE_FILES[@]}" "$snapshot_rows" >"$RECV/state.sha256"
+  printf '%s' "$PIDS_NOW" >"$RECV/pids.txt"
+  printf '%s' "$BINS_NOW" >"$RECV/binary.sha256"
   {
+    printf 'count=3\n'
     printf 'live_folder: %s\n' "$live"
-    printf 'recorded_at: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    printf 'host: %s\n' "$(hostname)"
+    printf 'recorded_at: %s\n' "$recorded_at"
+    printf 'host: %s\n' "$host"
   } >"$RECV/meta.txt"
   set +o noclobber
+  # Readback uses the very same grammar and coverage checks as `after`.
+  read_receipt pids/start-times "$RECV/pids.txt"
+  read_receipt "deployed binary" "$RECV/binary.sha256"
+  read_receipt snapshot "$RECV/state.sha256"
+  read_receipt metadata "$RECV/meta.txt"
+  pid_count="${PIDS_NOW%%$'\n'*}"
+  bin_count="${BINS_NOW%%$'\n'*}"
   printf 'RECEIPT %s pids=%s state_files=%s binaries=%s\n' \
     "$RECV" \
-    "$(wc -l <"$RECV/pids.txt" | tr -d '[:space:]')" \
-    "$(wc -l <"$RECV/state.sha256" | tr -d '[:space:]')" \
-    "$(wc -l <"$RECV/binary.sha256" | tr -d '[:space:]')"
+    "${pid_count#count=}" \
+    "${#STATE_FILES[@]}" \
+    "${bin_count#count=}"
 }
 
 cmd_after() {
@@ -603,7 +780,7 @@ cmd_after() {
     printf 'FAIL missing receipt dir: %s\n' "$RECV" >&2
     exit 1
   fi
-  for f in pids.txt binary.sha256 state.sha256; do
+  for f in pids.txt binary.sha256 state.sha256 meta.txt; do
     if [ -L "$RECV/$f" ]; then
       printf 'FAIL receipt file is a symlink: %s\n' "$RECV/$f" >&2
       exit 2
@@ -616,19 +793,24 @@ cmd_after() {
   # Measure first, then compare: a measurement that cannot be taken exits 1
   # here (via the functions' own fail-closed exits) instead of being compared
   # as an empty or marker value against the receipt.
-  pids_ref="$(cat "$RECV/pids.txt")"
-  bins_ref="$(cat "$RECV/binary.sha256")"
-  pids_now="$(lock_pids "$live")"
-  bins_now="$(binary_hashes "$live")"
+  read_receipt pids/start-times "$RECV/pids.txt"
+  pids_ref="$RECEIPT_TEXT"
+  read_receipt "deployed binary" "$RECV/binary.sha256"
+  bins_ref="$RECEIPT_TEXT"
+  read_receipt snapshot "$RECV/state.sha256"
+  read_receipt metadata "$RECV/meta.txt"
+  measure "$live"
+  pids_now="$PIDS_NOW"
+  bins_now="$BINS_NOW"
   if [ "$pids_ref" != "$pids_now" ]; then
     rc=1
     printf 'FAIL pids/start-times changed\n'
-    diff <(printf '%s\n' "$pids_ref") <(printf '%s\n' "$pids_now") | sed 's/^/  /' || true
+    diff <(printf '%s' "$pids_ref") <(printf '%s' "$pids_now") || true
   fi
   if [ "$bins_ref" != "$bins_now" ]; then
     rc=1
     printf 'FAIL deployed binary changed\n'
-    diff <(printf '%s\n' "$bins_ref") <(printf '%s\n' "$bins_now") | sed 's/^/  /' || true
+    diff <(printf '%s' "$bins_ref") <(printf '%s' "$bins_now") || true
   fi
   if [ "$rc" -eq 0 ]; then
     printf 'PASS pids+start-times+binary unchanged\n'
@@ -640,7 +822,7 @@ cmd_selftest() {
   local T live SPID UNIQ REFUSE ESCAPE_TARGET DIRECT rc=0 out got
   local alias_live_a alias_target_a alias_live_b alias_ext_b alias_live_c alias_target_c
   local SCRIPT REL_PID HELPER_DIR CC_BIN rel_ready rel_live rel_receipt want_sha got_line
-  local MINBIN FAKEPS_FAIL FAKEPS_EMPTY deadonly_live t p
+  local MINBIN FAKEPS_FAIL FAKEPS_EMPTY deadonly_live t p shim tag field header first rest LSOF_BIN
   local empty_live noread_live malformed_live mal2_live gone_live dangling_lock_live c
   T="$(mktemp -d /tmp/qa11-selftest.XXXXXX)"
   # Absolute script path: the new lanes run the audit from a DIFFERENT cwd, so
@@ -655,17 +837,15 @@ cmd_selftest() {
   REFUSE="/var/empty/qa11-audit-refuse-$UNIQ"
   ESCAPE_TARGET="/var/empty/qa11-audit-escape-$UNIQ"
   # The helper runs under its own name (copying /bin/sleep elsewhere is
-  # killed by macOS code signing); the audit accepts any binary. disown drops
-  # it from the job table so bash never prints a Terminated notice.
+  # killed by macOS code signing); the audit accepts any binary.
   sleep 300 &
   SPID=$!
-  disown
-  # Every helper this selftest starts is tracked here - global on purpose, since
-  # the EXIT trap runs after this function has already returned.
+  # Track every helper so the EXIT trap kills AND reaps it before removing
+  # the sandbox. wait is the completion signal, not a sleep/poll loop.
   HELPER_PIDS="$SPID"
   # Kill only the helpers this selftest started; nothing else is ever signaled.
   # The trap removes only the /tmp sandbox - never a path outside /tmp.
-  trap 'for p in $HELPER_PIDS; do kill "$p" 2>/dev/null || true; done; rm -rf "$T"' EXIT
+  trap 'for p in $HELPER_PIDS; do kill "$p" 2>/dev/null || true; wait "$p" 2>/dev/null || true; if kill -0 "$p" 2>/dev/null; then printf "FAIL cleanup: helper %s remains\n" "$p" >&2; exit 1; fi; done; rm -rf "$T"; printf "cleanup: helpers reaped; removed %s\n" "$T"' EXIT
   mkdir -p "$live/.omosense/state/inbox"
   printf '{"pid": %d, "session": "qa11-selftest"}\n' "$SPID" >"$live/.omosense/state/listen.lock.json"
   printf '{"pid": 999999999, "session": "dead"}\n' >"$live/.omosense/state/dead.lock.json"
@@ -876,13 +1056,13 @@ cmd_selftest() {
 
   # Tamper only the start-time field of the live lock line (lock + pid intact).
   cp "$T/receipt/pids.txt" "$T/pids.keep"
-  awk '$2 == 999999999 { print; next } !done { print $1, $2, "TAMPERED-START"; done = 1; next } { print }' \
+  awk 'NR == 1 || $2 == 999999999 { print; next } !done { print $1, $2, "TAMPERED-START"; done = 1; next } { print }' \
     "$T/pids.keep" >"$T/receipt/pids.txt"
   lane "after: FAIL on tampered start time" 1 "FAIL pids/start-times" -- "$0" after "$live" "$T/receipt"
   cp "$T/pids.keep" "$T/receipt/pids.txt"
 
   cp "$T/receipt/binary.sha256" "$T/binary.keep"
-  awk 'NR == 1 { print "00" $0; next } { print }' "$T/binary.keep" >"$T/receipt/binary.sha256"
+  awk 'NR == 2 { print "00" $0; next } { print }' "$T/binary.keep" >"$T/receipt/binary.sha256"
   lane "after: FAIL on tampered binary hash" 1 "FAIL deployed binary" -- "$0" after "$live" "$T/receipt"
   cp "$T/binary.keep" "$T/receipt/binary.sha256"
 
@@ -891,6 +1071,84 @@ cmd_selftest() {
   mv "$T/pids.moved" "$T/receipt/pids.txt"
 
   lane "after: PASS again after restore" 0 "PASS" -- "$0" after "$live" "$T/receipt"
+
+  # Stored receipts are untrusted input: line count, framing, field shape,
+  # identity coverage and ordering all run through the real after comparator.
+  for field in pids.txt binary.sha256 state.sha256 meta.txt; do
+    cp "$T/receipt/$field" "$T/field.keep"
+    printf '\n' >>"$T/receipt/$field"
+    lane "receipt: $field trailing blank line is FAIL" 1 "FAIL" \
+      -- "$SCRIPT" after "$live" "$T/receipt"
+    cp "$T/field.keep" "$T/receipt/$field"
+    # A dropped final record must not survive even if the other lines are valid.
+    awk 'NR > 1 { if (last != "") print last } { last = $0 }' "$T/field.keep" >"$T/receipt/$field"
+    lane "receipt: $field dropped record is FAIL" 1 "FAIL" \
+      -- "$SCRIPT" after "$live" "$T/receipt"
+    cp "$T/field.keep" "$T/receipt/$field"
+  done
+  {
+    IFS= read -r header
+    IFS= read -r first
+    IFS= read -r rest
+    printf '%s\n%s\n%s\n' "$header" "$rest" "$first"
+  } <"$T/pids.keep" >"$T/receipt/pids.txt"
+  lane "receipt: reordered pid records are FAIL" 1 "FAIL" -- "$SCRIPT" after "$live" "$T/receipt"
+  cp "$T/pids.keep" "$T/receipt/pids.txt"
+  awk 'NR == 1 { print "count=0"; next } { print }' "$T/binary.keep" >"$T/receipt/binary.sha256"
+  lane "receipt: binary header cannot hide live records" 1 "FAIL" -- "$SCRIPT" after "$live" "$T/receipt"
+  cp "$T/binary.keep" "$T/receipt/binary.sha256"
+  awk -F '\t' 'BEGIN { OFS = "\t" } NR == 2 { $1 = 999999998 } { print }' \
+    "$T/binary.keep" >"$T/receipt/binary.sha256"
+  lane "receipt: binary pid must cover the live lock pid" 1 "FAIL" -- "$SCRIPT" after "$live" "$T/receipt"
+  cp "$T/binary.keep" "$T/receipt/binary.sha256"
+  lane "receipt: intact measured fields still PASS" 0 "PASS" -- "$SCRIPT" after "$live" "$T/receipt"
+
+  # Successful but wrong output is a measurement failure, not a tool failure.
+  for tag in whitespace short garbage multiline truncated wrongpath; do
+    shim="$T/hash-$tag"
+    mkdir -p "$shim"
+    case "$tag" in
+      whitespace) printf '#!/bin/sh\nprintf "   \\n"\n' >"$shim/shasum" ;;
+      short) printf "#!/bin/sh\nprintf '%%063d  %%s\\n' 0 \"\$3\"\n" >"$shim/shasum" ;;
+      garbage) printf "#!/bin/sh\nprintf 'not-a-digest  %%s\\n' \"\$3\"\n" >"$shim/shasum" ;;
+      multiline) printf '#!/bin/sh\n/usr/bin/shasum "$@"\nprintf "\\n"\n' >"$shim/shasum" ;;
+      truncated) printf "#!/bin/sh\nout=\$(/usr/bin/shasum \"\$@\"); printf '%%s' \"\$out\"\n" >"$shim/shasum" ;;
+      wrongpath) printf '#!/bin/sh\nprintf "%%064d  /not-the-input\\n" 0\n' >"$shim/shasum" ;;
+    esac
+    chmod +x "$shim/shasum"
+    lane "hash shape: $tag before fails closed" 1 "FAIL" \
+      -- env PATH="$shim:$PATH" "$SCRIPT" before "$live" "$T/hash-receipt-$tag"
+    absent "hash-$tag refusal" "$T/hash-receipt-$tag"
+    lane "hash shape: $tag after never PASSes" 1 "FAIL" \
+      -- env PATH="$shim:$PATH" "$SCRIPT" after "$live" "$T/receipt"
+  done
+  for tag in whitespace garbage multiline; do
+    shim="$T/ps-$tag"
+    mkdir -p "$shim"
+    case "$tag" in
+      whitespace) printf '#!/bin/sh\nprintf "   \\n"\n' >"$shim/ps" ;;
+      garbage) printf '#!/bin/sh\nprintf "not-a-start-time\\n"\n' >"$shim/ps" ;;
+      multiline) printf '#!/bin/sh\n/bin/ps "$@"\nprintf "\\n"\n' >"$shim/ps" ;;
+    esac
+    chmod +x "$shim/ps"
+    lane "start shape: $tag before fails closed" 1 "FAIL" \
+      -- env PATH="$shim:$PATH" "$SCRIPT" before "$live" "$T/ps-receipt-$tag"
+    absent "ps-$tag refusal" "$T/ps-receipt-$tag"
+    lane "start shape: $tag after never PASSes" 1 "FAIL" \
+      -- env PATH="$shim:$PATH" "$SCRIPT" after "$live" "$T/receipt"
+  done
+  # A valid executable may have an unlinked non-executable mapping (observed
+  # on the real host's Logging/.plist-cache). Only the executable must exist.
+  LSOF_BIN="$(command -v lsof)"
+  shim="$T/lsof-mapped"
+  mkdir -p "$shim"
+  printf "#!/bin/sh\n\"%s\" \"\$@\" || exit 1\nprintf 'ftxt\\nn/tmp/qa11-unlinked-mapping\\n'\n" \
+    "$LSOF_BIN" >"$shim/lsof"
+  chmod +x "$shim/lsof"
+  lane "resolver: unlinked auxiliary mapping is not the executable" 0 "RECEIPT" \
+    -- env PATH="$shim:$PATH" "$SCRIPT" before "$live" "$T/mapped-receipt"
+  lane "resolver: counted real executable still PASSes with an unlinked mapping" 0 "PASS" \
+    -- env PATH="$shim:$PATH" "$SCRIPT" after "$live" "$T/mapped-receipt"
 
   # --- S5-8 R1 class: every compared measurement is fail-closed. ---
   # A pid that is not alive is a legitimate value ("-"), and an empty lock set
@@ -911,6 +1169,36 @@ cmd_selftest() {
     -- "$SCRIPT" before "$empty_live" "$T/empty-receipt"
   lane "empty state dir: after PASSes (no hosts)" 0 "PASS" \
     -- "$SCRIPT" after "$empty_live" "$T/empty-receipt"
+  for field in pids.txt binary.sha256 state.sha256; do
+    if [ "$(cat "$T/empty-receipt/$field")" = "count=0" ]; then
+      printf 'ok   empty state: %s explicitly records count=0\n' "$field"
+    else
+      rc=1
+      printf 'FAIL empty state: %s has no count=0 header\n' "$field"
+    fi
+  done
+  : >"$T/empty-receipt/pids.txt"
+  lane "empty state: zero-byte pid receipt is not a valid count=0" 1 "FAIL" \
+    -- "$SCRIPT" after "$empty_live" "$T/empty-receipt"
+  printf 'count=0\n' >"$T/empty-receipt/pids.txt"
+  lane "empty state: explicit zero header restores PASS" 0 "PASS" \
+    -- "$SCRIPT" after "$empty_live" "$T/empty-receipt"
+
+  mkdir -p "$T/same-pid-live/.omosense/state"
+  printf '{"pid":%d}\n' "$SPID" >"$T/same-pid-live/.omosense/state/a.lock.json"
+  printf '{"pid":%d}\n' "$SPID" >"$T/same-pid-live/.omosense/state/b.lock.json"
+  lane "counts: two locks for one live pid take a receipt" 0 "RECEIPT" \
+    -- "$SCRIPT" before "$T/same-pid-live" "$T/same-pid-receipt"
+  IFS= read -r header <"$T/same-pid-receipt/pids.txt"
+  IFS= read -r first <"$T/same-pid-receipt/binary.sha256"
+  if [[ "$header" = count=2 && "$first" = count=1 ]]; then
+    printf 'ok   counts: all two locks and exactly one distinct live pid\n'
+  else
+    rc=1
+    printf 'FAIL counts: lock/live headers are %s / %s\n' "$header" "$first"
+  fi
+  lane "counts: repeated live pid stays a legitimate PASS" 0 "PASS" \
+    -- "$SCRIPT" after "$T/same-pid-live" "$T/same-pid-receipt"
 
   noread_live="$T/noread-live"
   mkdir -p "$noread_live/.omosense/state"
@@ -982,7 +1270,6 @@ CEOF
     exec 9<>"$T/rel.ready"
     ( cd "$HELPER_DIR" && exec ./relative-host ) >"$T/rel.ready" 2>&1 &
     REL_PID=$!
-    disown
     HELPER_PIDS="$HELPER_PIDS $REL_PID"
     if ! IFS= read -r -t 10 -u 9 rel_ready; then
       rc=1
@@ -1002,13 +1289,12 @@ CEOF
 
     want_sha="$(shasum -a 256 "$HELPER_DIR/relative-host" | awk '{print $1}')"
     got_line="$(cat "$rel_receipt/binary.sha256" 2>/dev/null || true)"
-    case "$got_line" in
-      "$want_sha  "/*)
-        printf 'ok   relative-argv0: receipt holds the real sha256 of the resolved executable\n' ;;
-      *)
-        rc=1
-        printf 'FAIL relative-argv0: receipt does not hold the real digest %s\n%s\n' "$want_sha" "$got_line" ;;
-    esac
+    if [[ "$got_line" = "count=1"$'\n'"$REL_PID"$'\t'"$want_sha"$'\t'/* ]]; then
+      printf 'ok   relative-argv0: receipt holds the real sha256 of the resolved executable\n'
+    else
+      rc=1
+      printf 'FAIL relative-argv0: receipt does not hold the real digest %s\n%s\n' "$want_sha" "$got_line"
+    fi
     case "$got_line" in
       *unreadable* | *./relative-host*)
         rc=1
@@ -1039,6 +1325,35 @@ CEOF
     fi
     lane "relative-argv0: after PASSes once the content is restored" 0 "PASS" \
       --cwd "$T" -- "$SCRIPT" after "$rel_live" "$rel_receipt"
+
+    # sort/awk no longer process measurements. Hostile versions therefore
+    # cannot lose coverage: the receipt still holds the real pid+digest, and
+    # a SAME-PATH content replacement must FAIL through the real comparator.
+    for tag in sort-empty sort-drop awk-empty; do
+      shim="$T/$tag"
+      mkdir -p "$shim"
+      case "$tag" in
+        sort-empty) printf '#!/bin/sh\n/bin/cat >/dev/null\n' >"$shim/sort" ;;
+        sort-drop) printf '#!/bin/sh\n/usr/bin/sed "1d"\n' >"$shim/sort" ;;
+        awk-empty) printf '#!/bin/sh\n/bin/cat >/dev/null\n' >"$shim/awk" ;;
+      esac
+      chmod +x "$shim/"*
+      lane "processing: $tag cannot erase measured records before" 0 "RECEIPT" \
+        -- env PATH="$shim:$PATH" "$SCRIPT" before "$rel_live" "$T/$tag-receipt"
+      got_line="$(cat "$T/$tag-receipt/binary.sha256")"
+      if [[ "$got_line" = "count=1"$'\n'"$REL_PID"$'\t'"$want_sha"$'\t'/* ]]; then
+        printf 'ok   processing: %s preserves a real counted pid+digest\n' "$tag"
+      else
+        rc=1
+        printf 'FAIL processing: %s erased or corrupted measurements\n%s\n' "$tag" "$got_line"
+      fi
+      cat "$HELPER_DIR/relative-host.next" >"$HELPER_DIR/relative-host"
+      lane "processing: $tag never hides replaced binary bytes" 1 "FAIL deployed binary" \
+        -- env PATH="$shim:$PATH" "$SCRIPT" after "$rel_live" "$T/$tag-receipt"
+      cat "$HELPER_DIR/relative-host.a" >"$HELPER_DIR/relative-host"
+      lane "processing: $tag restored bytes legitimately PASS" 0 "PASS" \
+        -- env PATH="$shim:$PATH" "$SCRIPT" after "$rel_live" "$T/$tag-receipt"
+    done
 
     # (b) a live pid whose executable cannot be measured: deleting the running
     # binary leaves the process alive but unhashable - never a PASS.
