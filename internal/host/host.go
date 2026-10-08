@@ -323,8 +323,6 @@ func (h *Host) checkStateFiles(limit int64, warned map[string]bool) {
 					Limit: limit,
 				}))
 			}
-		} else {
-			delete(warned, path)
 		}
 		return nil
 	})
