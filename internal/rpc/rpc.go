@@ -199,6 +199,11 @@ func (s src) Run(ctx context.Context, sink core.Sink) error {
 	return run(ctx, s.c, sink, newWatcher(s.c, sink))
 }
 
+// runVerifyFn is the done-verification runner run() hands every hook to.
+// Tests replace it to observe the timeout actually delivered to the hook; in
+// production it is core.RunVerify unchanged.
+var runVerifyFn = core.RunVerify
+
 func run(ctx context.Context, c *core.Ctx, sink core.Sink, w *watcher) error {
 	store := newPendingStore(c.State)
 	b := newBatcher(c, store, sink)
@@ -222,7 +227,7 @@ func run(ctx context.Context, c *core.Ctx, sink core.Sink, w *watcher) error {
 		hooks.Add(1)
 		go func() {
 			defer hooks.Done()
-			res := core.RunVerify(ctx, c.Profile.Verify.Command, verifyTimeout(c), verifyEnv(e), deref(e.Cwd))
+			res := runVerifyFn(ctx, c.Profile.Verify.Command, verifyTimeout(c), verifyEnv(e), deref(e.Cwd))
 			if res.Status == "cancelled" {
 				return
 			}

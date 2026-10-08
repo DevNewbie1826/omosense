@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"strconv"
 	"strings"
@@ -40,6 +41,9 @@ func transportServer(t *testing.T, reply func(net.Conn, string)) string {
 				return
 			}
 			reply(conn, req.ID)
+		}
+		if err := sc.Err(); err != nil && !errors.Is(err, net.ErrClosed) {
+			t.Errorf("transport server scan: %v", err)
 		}
 	}()
 	t.Cleanup(func() {

@@ -23,6 +23,11 @@ const deadInterval = time.Minute
 // check waits out real time.
 var nowFn = time.Now
 
+// runVerifyFn is the done-verification runner emitJob hands every hook to.
+// Tests replace it to observe the timeout actually delivered to the hook; in
+// production it is core.RunVerify unchanged.
+var runVerifyFn = core.RunVerify
+
 // jobPane is one registered thread that names a pane (IS-4): the threads.json
 // key, the pane identity, and the session field IS-12 matches on.
 type jobPane struct {
@@ -432,7 +437,7 @@ func (w *watcher) emitJob(ctx context.Context, e snapEntry, jp jobPane, from *st
 	w.hooks.Add(1)
 	go func() {
 		defer w.hooks.Done()
-		res := core.RunVerify(ctx, w.verifyCmd, w.verifyTimeout, verifyEnv(e, jp), deref(e.agent.cwd))
+		res := runVerifyFn(ctx, w.verifyCmd, w.verifyTimeout, verifyEnv(e, jp), deref(e.agent.cwd))
 		if res.Status == "cancelled" {
 			ev.Verify, ev.VerifyDetail = "unverified", "cancelled"
 		} else {
