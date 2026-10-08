@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -98,7 +99,7 @@ func Run(stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "omosense: stop:", err)
 		return 1
 	}
-	files, err := filepath.Glob(filepath.Join(state, "*.lock.json"))
+	files, err := lockFiles(state)
 	if err != nil {
 		fmt.Fprintln(stderr, "omosense: stop:", err)
 		return 1
@@ -166,6 +167,30 @@ func Run(stdout, stderr io.Writer) int {
 	}
 	fmt.Fprintln(stdout, resultLine("stopped omosense "+pidNoun(pids), reports))
 	return 0
+}
+
+// lockFiles returns every <state>/*.lock.json path, built from the literal
+// state directory: the directory NAME is never interpreted as a glob pattern,
+// so a folder called "project[1]" yields only its own locks and never the
+// sibling "project1"'s. An absent state directory means nothing is running;
+// any other read error is reported.
+func lockFiles(state string) ([]string, error) {
+	entries, err := os.ReadDir(state)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	files := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if !e.Type().IsRegular() || !strings.HasSuffix(e.Name(), ".lock.json") {
+			continue
+		}
+		files = append(files, filepath.Join(state, e.Name()))
+	}
+	sort.Strings(files)
+	return files, nil
 }
 
 // parseLock reads and validates one lock file: it must be a JSON object

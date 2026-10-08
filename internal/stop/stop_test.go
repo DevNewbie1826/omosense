@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -274,8 +275,8 @@ func TestStopStopsRunningHost(t *testing.T) {
 		t.Errorf("stdout = %q, want %q", stdout, want)
 	}
 	<-host.done
-	if m, _ := filepath.Glob(filepath.Join(state, "*.lock.json")); len(m) != 0 {
-		t.Errorf("locks left after stop: %v", m)
+	if left := locksIn(t, state); len(left) != 0 {
+		t.Errorf("locks left after stop: %v", left)
 	}
 }
 
@@ -637,4 +638,176 @@ func runCLI(t *testing.T, args []string, env ...string) (stdout, stderr string, 
 		t.Fatalf("run %v: %v", args, err)
 	}
 	return ob.String(), eb.String(), code
+}
+
+// locksIn lists the *.lock.json entries of dir by reading the literal
+// directory: the test helper never globs, so a folder whose NAME contains
+// glob metacharacters cannot silently redirect the check to a sibling.
+func locksIn(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		t.Fatal(err)
+	}
+	var out []string
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".lock.json") {
+			out = append(out, e.Name())
+		}
+	}
+	return out
+}
+
+// stopEnvAt points HOME, OMOSENSE_DIR and OMOSENSE_STATE at a folder the
+// caller names, so a test can put glob metacharacters in it.
+func stopEnvAt(t *testing.T, home, folder string) (dir, state string) {
+	t.Helper()
+	dir = filepath.Join(home, folder, ".omosense")
+	state = filepath.Join(dir, "state")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("OMOSENSE_DIR", dir)
+	t.Setenv("OMOSENSE_STATE", state)
+	return dir, state
+}
+
+// stateDirIn creates a folder beside the tested one, without touching the
+// environment, so a decoy host can own its own state dir and lock.
+func stateDirIn(t *testing.T, home, folder string) string {
+	t.Helper()
+	state := filepath.Join(home, folder, ".omosense", "state")
+	if err := os.MkdirAll(state, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return state
+}
+
+// TestStopBracketFolderStopsOnlyItself pins R1: the state directory is
+// enumerated literally, so stopping from "project[1]" signals only that
+// folder's host. A glob treats "[1]" as a character class and would signal
+// the sibling "project1" instead, leaving the intended host running.
+func TestStopBracketFolderStopsOnlyItself(t *testing.T) {
+	home := t.TempDir()
+	_, state := stopEnvAt(t, home, "project[1]")
+	siblingState := stateDirIn(t, home, "project1")
+	bin := copyHelper(t, "omosense-test")
+	target := startHelper(t, bin, "-lock", filepath.Join(state, "watch-herdr.lock.json"))
+	sibling := startHelper(t, bin, "-lock", filepath.Join(siblingState, "watch-herdr.lock.json"))
+	writeLock(t, state, "watch-herdr", liveLockJSON(target.pid()))
+	siblingLock := writeLock(t, siblingState, "watch-herdr", liveLockJSON(sibling.pid()))
+	before, err := os.ReadFile(siblingLock)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stdout, stderr, code := runStop(t)
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0 (stdout=%q stderr=%q)", code, stdout, stderr)
+	}
+	want := fmt.Sprintf("stopped omosense pid %d\n", target.pid())
+	if stdout != want {
+		t.Fatalf("stdout = %q, want %q; the sibling host (pid %d, state %s) must not be touched",
+			stdout, want, sibling.pid(), siblingState)
+	}
+	<-target.done
+	if syscall.Kill(sibling.pid(), 0) != nil {
+		t.Errorf("sibling pid %d was signaled", sibling.pid())
+	}
+	after, err := os.ReadFile(siblingLock)
+	if err != nil {
+		t.Fatalf("sibling lock was removed: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Errorf("sibling lock bytes changed: %q -> %q", before, after)
+	}
+}
+
+// TestStopBracketFolderAloneStops pins that a metacharacter folder with no
+// matching sibling is still stopped: a glob finds nothing there and reports
+// "not running" while the host keeps running.
+func TestStopBracketFolderAloneStops(t *testing.T) {
+	home := t.TempDir()
+	_, state := stopEnvAt(t, home, "project[1]")
+	bin := copyHelper(t, "omosense-test")
+	host := startHelper(t, bin, "-lock", filepath.Join(state, "watch-herdr.lock.json"))
+	writeLock(t, state, "watch-herdr", liveLockJSON(host.pid()))
+
+	stdout, stderr, code := runStop(t)
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0 (stdout=%q stderr=%q)", code, stdout, stderr)
+	}
+	want := fmt.Sprintf("stopped omosense pid %d\n", host.pid())
+	if stdout != want {
+		t.Fatalf("stdout = %q, want %q", stdout, want)
+	}
+	<-host.done
+}
+
+// TestStopStarQuestFolderStopsOnlyItself pins the same literal-directory rule
+// for a state dir named with "*" and "?" beside a sibling ("projectax") the
+// pattern would match: only the intended host may be signaled.
+func TestStopStarQuestFolderStopsOnlyItself(t *testing.T) {
+	home := t.TempDir()
+	_, state := stopEnvAt(t, home, "pro*ject?x")
+	decoyState := stateDirIn(t, home, "projectax")
+	bin := copyHelper(t, "omosense-test")
+	target := startHelper(t, bin, "-lock", filepath.Join(state, "watch-herdr.lock.json"))
+	decoy := startHelper(t, bin, "-lock", filepath.Join(decoyState, "watch-herdr.lock.json"))
+	writeLock(t, state, "watch-herdr", liveLockJSON(target.pid()))
+	decoyLock := writeLock(t, decoyState, "watch-herdr", liveLockJSON(decoy.pid()))
+	before, err := os.ReadFile(decoyLock)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stdout, stderr, code := runStop(t)
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0 (stdout=%q stderr=%q)", code, stdout, stderr)
+	}
+	want := fmt.Sprintf("stopped omosense pid %d\n", target.pid())
+	if stdout != want {
+		t.Fatalf("stdout = %q, want %q; the decoy host (pid %d, state %s) must not be touched",
+			stdout, want, decoy.pid(), decoyState)
+	}
+	<-target.done
+	if syscall.Kill(decoy.pid(), 0) != nil {
+		t.Errorf("decoy pid %d was signaled", decoy.pid())
+	}
+	after, err := os.ReadFile(decoyLock)
+	if err != nil {
+		t.Fatalf("decoy lock was removed: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Errorf("decoy lock bytes changed: %q -> %q", before, after)
+	}
+}
+
+// TestStopStateDirUnreadableFails pins that a state path that cannot be read
+// (here its parent is a regular file, so the open fails with ENOTDIR) is
+// reported on stderr with exit 1 instead of a silent "not running".
+func TestStopStateDirUnreadableFails(t *testing.T) {
+	home := t.TempDir()
+	file := filepath.Join(home, "not-a-dir")
+	if err := os.WriteFile(file, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("OMOSENSE_DIR", filepath.Join(home, ".omosense"))
+	t.Setenv("OMOSENSE_STATE", filepath.Join(file, "state"))
+
+	stdout, stderr, code := runStop(t)
+	if code != 1 {
+		t.Fatalf("exit = %d, want 1 (stdout=%q stderr=%q)", code, stdout, stderr)
+	}
+	if !strings.Contains(stderr, "omosense: stop:") {
+		t.Errorf("stderr = %q, want a stop error", stderr)
+	}
+	if stdout != "" {
+		t.Errorf("stdout = %q, want no result line", stdout)
+	}
 }
