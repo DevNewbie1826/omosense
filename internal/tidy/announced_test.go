@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/DevNewbie1826/omosense/internal/core"
 )
 
 // testStartLog is the loop's first stdout line for the 5m/90m thresholds
@@ -331,5 +333,73 @@ func TestNowOnceLeavesAnnouncedAbsent(t *testing.T) {
 				t.Fatalf("%s touched tidy-announced.json", tc.name)
 			}
 		})
+	}
+}
+
+func TestAnnouncedRenameFailureRemovesTmp(t *testing.T) {
+	// Guard (D7): tidy-announced.json is a non-empty directory, so the
+	// temp file is written and Rename fails. The temp must not remain.
+	// Reading that directory fails open (one unreadable LOG). The tick
+	// still emits TIDY, logs the save failure once, and backs up.
+	_, agents, state := sandbox(t)
+	sha := commitAt(t, makeRepo(t, agents, "alpha"), testEpoch, "a1")
+	start := time.UnixMilli((testEpoch + 90*60) * 1000)
+	advance := fakeClock(t, start)
+	date := seoulDateOf(t, start)
+	wm := filepath.Join(state, "memory-tidy.json")
+	writeFile(t, wm, `{"repos":{},"lastRun":null,"lastBackupDate":null}`)
+	announced := filepath.Join(state, "tidy-announced.json")
+	mkdirAll(t, announced)
+	writeFile(t, filepath.Join(announced, "keep"), "x")
+
+	lines := tidyRun(t, state, advance, 2)
+	tmp := announced + ".tmp"
+	_, tmpErr := os.Stat(tmp)
+	if len(lines) != 5 {
+		t.Fatalf("lines = %d, want the start LOG, one unreadable LOG, one TIDY, one not-saved LOG and the backup LOG; tmp stat err=%v\n%s", len(lines), tmpErr, strings.Join(lines, "\n"))
+	}
+	if lines[0] != testStartLog {
+		t.Errorf("line 0 = %q, want %q", lines[0], testStartLog)
+	}
+	if !strings.HasPrefix(lines[1], "LOG memory-tidy announced state unreadable: ") || !strings.Contains(lines[1], "is a directory") {
+		t.Errorf("line 1 = %q, want the unreadable LOG for the directory", lines[1])
+	}
+	if lines[2] != tidyLine("alpha", sha) {
+		t.Errorf("line 2 = %q, want %q", lines[2], tidyLine("alpha", sha))
+	}
+	if n := countPrefix(lines, "LOG memory-tidy announced state not saved: "); n != 1 {
+		t.Fatalf("not-saved LOGs = %d, want 1:\n%s", n, strings.Join(lines, "\n"))
+	}
+	wantBackup := fmt.Sprintf("LOG memory-tidy backup %s repos=1 bytes=%d failed=none",
+		date, statOf(t, filepath.Join(backupsOf(t), date, "alpha.bundle")).Size())
+	if lines[4] != wantBackup {
+		t.Errorf("line 4 = %q, want the backup LOG %q (the tick must still back up)", lines[4], wantBackup)
+	}
+	if !os.IsNotExist(tmpErr) {
+		t.Fatalf("tidy-announced.json.tmp still exists after the failed rename: %v", tmpErr)
+	}
+	if _, err := os.Stat(filepath.Join(announced, "keep")); err != nil {
+		t.Fatalf("destination directory was replaced: %v", err)
+	}
+}
+
+func TestWriteWatermarkRenameFailureRemovesTmp(t *testing.T) {
+	// Guard (D7 companion): writeWatermarkDoc removes <path>.tmp when
+	// Rename fails because the destination is a non-empty directory.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "memory-tidy.json")
+	mkdirAll(t, path)
+	writeFile(t, filepath.Join(path, "keep"), "x")
+	w := core.NewOMap()
+	w.Set("repos", core.NewOMap())
+	err := writeWatermarkDoc(path, w)
+	if err == nil {
+		t.Fatal("writeWatermarkDoc returned nil, want the rename error")
+	}
+	if _, statErr := os.Stat(path + ".tmp"); !os.IsNotExist(statErr) {
+		t.Fatalf("%s.tmp still exists after the failed rename: %v", path, statErr)
+	}
+	if _, statErr := os.Stat(filepath.Join(path, "keep")); statErr != nil {
+		t.Fatalf("destination directory was replaced: %v", statErr)
 	}
 }
