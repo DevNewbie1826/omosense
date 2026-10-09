@@ -201,7 +201,7 @@ omosense say telegram send '{"bot":"other_bot","chat_id":123456789,"text":"hello
 
 Telegram actions: `send`, `edit`, `draft`, `typing`, `react`, `unreact`, `topic`, `topic-edit`, `photo`, `doc`. Discord actions: `send`, `edit`, `typing`, `react`, `unreact`, `thread`, `thread-edit`, `file`.
 
-Discord `send`, `edit` and `file` also accept `content` as an alias of `text`. When both are set, `text` wins. `omosense say --help` lists each action with its JSON fields, and an unknown action's error lists the valid ones.
+Discord `send`, `edit`, and `file` accept `content` as an alias of `text`. `send` and `edit` use `text` whenever the `text` key is present (even null); `file` uses `text` unless it is null, then `content`. `omosense say --help` lists each action with its JSON fields, and an unknown action's error lists the valid ones.
 
 `{"bot":"name"}` overrides the bot and is stripped before the request. With no `<platform>.bot` and no override, say exits 2.
 

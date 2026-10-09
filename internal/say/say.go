@@ -44,8 +44,9 @@ Discord actions (main JSON fields; bracketed fields are optional):
   thread-edit: thread_id, [name, archived]
   file: channel_id, path, [text]
 
-Discord send, edit, and file accept content as an alias of text
-(text wins when both are present).
+Discord send, edit, and file accept content as an alias of text.
+send and edit use text whenever the text key is present (even null);
+file uses text unless it is null, then content.
 `
 
 // tgActions and dcActions are the actions each dispatcher accepts, in the
