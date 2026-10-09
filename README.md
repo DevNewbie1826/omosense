@@ -72,7 +72,7 @@ Newer optional keys, shown with example values:
 {
   "verify":        { "command": ["/path/to/check-done.sh"], "timeoutSec": 60 },
   "rpc":           { "enabled": true, "verify": true, "labels": { "task": "task", "ack": "ack" } },
-  "herdr":         { "verify": false, "agentPattern": "senpi|omo|claude|codex|opencode|(^|/)pi( |$)" },
+  "herdr":         { "verify": false, "blockedAll": false, "agentPattern": "senpi|omo|claude|codex|opencode|(^|/)pi( |$)" },
   "silentMinutes": 30,
   "transcriber":   ["whisper-cli", "{audio}"],
   "guard":         { "stateFileBytes": 16777216 }
@@ -95,7 +95,8 @@ Newer optional keys, shown with example values:
 | `verify.timeoutSec` | Hook timeout in seconds. Default `60`. |
 | `rpc.verify` | Run the hook for rpc dones. Absent means on (when `verify.command` is set); only `false` turns it off. |
 | `rpc.labels` | Overrides for the rpc batch labels. See [rpc done notifications](#rpc-done-notifications). |
-| `herdr.verify` | Run the hook for herdr working to idle/done lines. Default `false`. |
+| `herdr.verify` | Run the hook for each herdr working to idle/done that goes into a done batch. Default `false`. |
+| `herdr.blockedAll` | Print a `blocked` line for every pane (except omosense's own pane), not just registered job panes. Default `false`. A non-boolean fails config load. |
 | `herdr.agentPattern` | Go regular expression a pane's foreground command line must match to count as alive. Default `senpi\|omo\|claude\|codex\|opencode\|(^\|/)pi( \|$)`. An invalid pattern fails config load. |
 | `silentMinutes` | Minutes a working session may go without change before `silent-session`. Default `30`. |
 | `transcriber` | Voice transcriber argv. Every `{audio}` is replaced by the audio file path, or the path is appended when no element has `{audio}`. Its trimmed stdout is the transcript. Unset means the built-in ffmpeg and mlx_whisper pipeline. A failure shows up as `transcribe_error` text starting with `transcriber:`. |
@@ -122,6 +123,7 @@ The state dir holds:
 | `google-seen.json` | Calendar and mail items already reported. |
 | `rpc-pending.json` (+ `rpc-pending.lock`) | rpc completions not yet acked. |
 | `rpc-subscription.json` | The session that receives rpc done batches. |
+| `herdr-pending.json` | herdr job pane completions waiting for their done batch. A malformed file is renamed to `herdr-pending.json.bad-<unix>` and herdr starts empty. |
 | `threads.json` | Job thread registry read by herdr and rpc. Written by `omosense thread`. |
 | `threads.lock` | Lock guarding `threads.json` writes. |
 | `sessions.json` | Left over from older versions. omosense no longer reads it. |
@@ -188,7 +190,23 @@ Writes hold `threads.lock` and replace the file atomically, so concurrent regist
 
 A thread whose `status` is `done` or `closed`, or that has a non-empty `closed`, isn't watched. It stays unwatched until `thread register` makes it active again. Closing a thread in the middle of a turn drops that turn's completion.
 
-When an active entry has both a session and a pane, and rpc is enabled and its socket lists a matching session, rpc owns it and herdr stays quiet for that pane (no job lines, no `silent-session`, no `dead-pane`). If the socket is down or doesn't list the session, herdr reports the pane. With `rpc.enabled` set but the rpc source not running in this host (`ALREADY_RUNNING`, or stopped after crashes), herdr still defers to the socket's session list.
+When an active entry has both a session and a pane, and rpc is enabled and its socket lists a matching session, rpc owns it and herdr stays quiet for that pane (no done batch entries, no `blocked` line unless `herdr.blockedAll` is on, no `silent-session`, no `dead-pane`). If the socket is down or doesn't list the session, herdr reports the pane. With `rpc.enabled` set but the rpc source not running in this host (`ALREADY_RUNNING`, or stopped after crashes), herdr still defers to the socket's session list.
+
+### herdr lines
+
+A `blocked` line prints right away, on the first time herdr sees the pane blocked too. By default it only prints for registered job panes: an active `threads.json` entry that rpc doesn't own. Set `herdr.blockedAll: true` to get `blocked` for every pane again, except omosense's own.
+
+A job pane going from `working` to `idle` or `done` doesn't print a line of its own. It's recorded in `herdr-pending.json`, and once 5 minutes pass with no newer completion, all recorded panes come out as one line:
+
+```
+HERDR {"event":"done-batch","entries":[{"machine":"local","pane":"p1","tab":"t1","agent":"senpi","cwd":"/work/a","from":"working","to":"idle","at":"2026-10-09T10:05:00.000Z","first_at":"2026-10-09T10:01:00.000Z","count":2}]}
+```
+
+The 5 quiet minutes count from the newest completion, the same rule rpc uses, so a busy stretch keeps the batch waiting. Each pane gets one entry. When it finished more than once, the entry keeps the last transition's `tab`, `agent`, `cwd`, `from`, `to` and `at`, `count` says how many times it finished, and `first_at` is the first one. Entries are sorted by `first_at`. Times are RFC 3339 UTC. With `herdr.verify` on, each entry also has `verify` and, when set, `verify_detail`.
+
+The file is written on every completion, so a restart or crash keeps the waiting entries. The new host picks them up and prints the batch on the same rule, 5 minutes after the newest one. Shutdown never prints the batch early. `omosense herdr --once` doesn't read or touch the file.
+
+Because `blocked` is immediate and completions wait, a pane's `blocked` can show up before the batch that holds its earlier `idle`.
 
 ## Sending messages
 
@@ -256,7 +274,7 @@ The hook gets `OMOSENSE_DONE_SOURCE` (`rpc` or `herdr`), `OMOSENSE_DONE_THREAD` 
 
 rpc (on by default once `verify.command` is set): the entry in `rpc-pending.json` gets `verify` (`pending`, `verified`, `unverified`) and `verify_detail`. The hook never delays the batch. An unverified entry gets one `<unverified>: <detail>` line in the batch; one still running gets `<unverified>: <verifyPending>`. A result that lands after its batch shows in `omosense rpc pending` but isn't re-sent. On shutdown a running hook is killed and the entry stays `pending`, and hooks don't re-run after a restart. Without a hook, entries and batches look exactly as before.
 
-herdr (only with `herdr.verify: true`): a pane's working to idle/done `HERDR` line is held until the hook finishes, then printed with `"verify"` and, when unverified, `"verify_detail"`. The hold can reorder that pane's lines: a later `blocked` may print before the held idle line. On shutdown the held line prints at once with `"verify":"unverified","verify_detail":"cancelled"`.
+herdr (only with `herdr.verify: true`): the verdict lands in the pane's done batch entry. The entry is recorded with `"verify":"pending"` the moment the pane goes idle, then the hook's result replaces it with `verified`, or `unverified` plus `verify_detail`. While any hook is still running the batch waits, so the line carries finished verdicts. If the pane finishes again before its hook returns, the older result is dropped and only the newest transition's hook counts. On shutdown a running hook is killed and its entry gets `"verify":"unverified","verify_detail":"cancelled"`. An entry still `pending` after a crash stays `pending` in the batch: hooks don't re-run after a restart.
 
 ## Subcommands
 
