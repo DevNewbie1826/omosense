@@ -130,15 +130,16 @@ func (t *tidyer) writeWatermarkCmd(ctx context.Context, args []string) error {
 	return nil
 }
 
-// nowOnce is the read-only --now/--once check: print one TIDY line when
-// any repo changed; never lock and never write (IS-9).
+// nowOnce is the read-only --now/--once check: print the TIDY lines for
+// the changed repos (at most maxTidyPerLine per line, IS-1); never lock
+// and never write (IS-9), including tidy-announced.json (IS-5).
 func (t *tidyer) nowOnce(ctx context.Context) error {
 	changes, err := t.changed(ctx)
 	if err != nil {
 		return err
 	}
 	if len(changes) > 0 {
-		t.emitTidy(changes)
+		t.emitTidy(tidyGroups(changes))
 	}
 	return nil
 }

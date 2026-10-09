@@ -74,9 +74,11 @@ func writeWatermarkDoc(path string, w *core.OMap) error {
 	}
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, append(b, '\n'), 0o644); err != nil {
+		_ = os.Remove(tmp)
 		return errors.New("Error: " + err.Error())
 	}
 	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
 		return errors.New("Error: " + err.Error())
 	}
 	return nil

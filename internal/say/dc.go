@@ -24,7 +24,7 @@ type dcCall struct {
 func (e *env) discord(action string, a *core.OMap, cfgBot string) int {
 	call, known := dcCallFor(action, a)
 	if !known {
-		fmt.Fprintf(e.stderr, "unknown discord %s\n", action)
+		rejectUnknownAction(e.stderr, "discord", action, dcActions)
 		return 2
 	}
 	home, err := os.UserHomeDir()
@@ -50,12 +50,12 @@ func dcCallFor(action string, a *core.OMap) (dcCall, bool) {
 	case "send":
 		c.method, c.path = http.MethodPost, "/channels/"+jsStr(a, "channel_id")+"/messages"
 		c.body = core.NewOMap()
-		copyAs(c.body, a, "text", "content")
+		copyDiscordContent(c.body, a)
 		setMessageRef(c.body, a)
 	case "edit":
 		c.method, c.path = http.MethodPatch, messagePath(a, "")
 		c.body = core.NewOMap()
-		copyAs(c.body, a, "text", "content")
+		copyDiscordContent(c.body, a)
 	case "typing":
 		c.method, c.path = http.MethodPost, "/channels/"+jsStr(a, "channel_id")+"/typing"
 	case "thread":
@@ -77,12 +77,37 @@ func dcCallFor(action string, a *core.OMap) (dcCall, bool) {
 	case "file":
 		c.method, c.path = http.MethodPost, "/channels/"+jsStr(a, "channel_id")+"/messages"
 		c.body = core.NewOMap()
-		c.body.Set("content", nullishDefault(a, "text", ""))
+		c.body.Set("content", discordFileContent(a))
 		c.file = strArg(a, "path")
 	default:
 		return c, false
 	}
 	return c, true
+}
+
+// copyDiscordContent copies a present "text" key onto body "content", even
+// when the value is null. Only when "text" is absent does a present
+// "content" key get copied. text wins when both keys are set.
+func copyDiscordContent(dst, src *core.OMap) {
+	if _, ok := src.Get("text"); ok {
+		copyAs(dst, src, "text", "content")
+		return
+	}
+	if _, ok := src.Get("content"); ok {
+		copyAs(dst, src, "content", "content")
+	}
+}
+
+// discordFileContent is text ?? content ?? "" (nullish). A null text falls
+// through to content, unlike copyDiscordContent.
+func discordFileContent(src *core.OMap) any {
+	if v, ok := src.Get("text"); ok && v != nil {
+		return v
+	}
+	if v, ok := src.Get("content"); ok && v != nil {
+		return v
+	}
+	return ""
 }
 
 func messagePath(a *core.OMap, suffix string) string {
