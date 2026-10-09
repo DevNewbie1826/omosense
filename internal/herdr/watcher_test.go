@@ -14,45 +14,87 @@ import (
 	"github.com/DevNewbie1826/omosense/internal/core"
 )
 
+// TestBlockedEmittedOnFirstTick guards IS-1: by default a blocked HERDR line is
+// printed only for a registered (active threads.json, not rpc-owned) job pane,
+// and herdr.blockedAll=true restores the pre-quiet rule for every pane except
+// the own pane. Seen is still updated for every pane either way, so a later
+// status change of a silenced pane is not mistaken for a first observation.
 func TestBlockedEmittedOnFirstTick(t *testing.T) {
 	unsetEnv(t, "HERDR_PANE_ID")
-	dir := t.TempDir()
-	installFakeHerdr(t, dir)
-	writeFile(t, filepath.Join(dir, "machines.out"), "[]\n")
-	writeFile(t, filepath.Join(dir, "local.out"), `{"result":{"agents":[
+	const first = `{"result":{"agents":[
 		{"pane_id":"p1","tab_id":"tab-1","display_agent":"Claude","agent":"claude","agent_status":"blocked","cwd":"/work","terminal_title_stripped":"fix <bug> 한글"},
 		{"pane_id":"p2","agent_status":"blocked"},
 		{"pane_id":"p3","agent_status":"idle"},
 		{"pane_id":"p4","display_agent":"","agent":"codex","agent_status":"blocked","terminal_title_stripped":""}
-	]}}`)
-
-	var buf bytes.Buffer
-	w := newWatcher(testCtx(t.TempDir(), "main", &buf), core.NewOut(&buf))
-	if err := w.tick(context.Background(), true); err != nil {
-		t.Fatal(err)
-	}
-	wantLines(t, linesOf(&buf),
-		`HERDR {"machine":"local","pane":"p1","tab":"tab-1","agent":"Claude","title":"fix <bug> 한글","cwd":"/work","from":null,"to":"blocked"}`,
-		`HERDR {"machine":"local","pane":"p2","tab":null,"agent":null,"title":null,"cwd":null,"from":null,"to":"blocked"}`,
-		`HERDR {"machine":"local","pane":"p4","tab":null,"agent":"","title":"","cwd":null,"from":null,"to":"blocked"}`,
-	)
-
-	// A later transition carries the previous status; an unchanged pane stays quiet.
-	buf.Reset()
-	writeFile(t, filepath.Join(dir, "local.out"), `{"result":{"agents":[
+	]}}`
+	// The later transition carries the previous status; an unchanged pane stays
+	// quiet.
+	const later = `{"result":{"agents":[
 		{"pane_id":"p1","tab_id":"tab-1","display_agent":"Claude","agent":"claude","agent_status":"blocked","cwd":"/work","terminal_title_stripped":"fix <bug> 한글"},
 		{"pane_id":"p2","agent_status":"blocked"},
 		{"pane_id":"p3","agent_status":"blocked"},
 		{"pane_id":"p4","display_agent":"","agent":"codex","agent_status":"blocked","terminal_title_stripped":""}
-	]}}`)
-	if err := w.tick(context.Background(), false); err != nil {
-		t.Fatal(err)
-	}
-	wantLines(t, linesOf(&buf),
-		`HERDR {"machine":"local","pane":"p3","tab":null,"agent":null,"title":null,"cwd":null,"from":"idle","to":"blocked"}`,
-	)
+	]}}`
+	const p1Line = `HERDR {"machine":"local","pane":"p1","tab":"tab-1","agent":"Claude","title":"fix <bug> 한글","cwd":"/work","from":null,"to":"blocked"}`
+	const p2Line = `HERDR {"machine":"local","pane":"p2","tab":null,"agent":null,"title":null,"cwd":null,"from":null,"to":"blocked"}`
+	const p4Line = `HERDR {"machine":"local","pane":"p4","tab":null,"agent":"","title":"","cwd":null,"from":null,"to":"blocked"}`
+	const p3Line = `HERDR {"machine":"local","pane":"p3","tab":null,"agent":null,"title":null,"cwd":null,"from":"idle","to":"blocked"}`
+
+	t.Run("registered job pane only", func(t *testing.T) {
+		dir := t.TempDir()
+		state := t.TempDir()
+		installFakeHerdr(t, dir)
+		writeFile(t, filepath.Join(dir, "machines.out"), "[]\n")
+		writeFile(t, filepath.Join(state, "threads.json"), `{"job":{"pane":"p1"}}`)
+		writeFile(t, filepath.Join(dir, "local.out"), first)
+
+		var buf bytes.Buffer
+		w := newWatcher(testCtx(state, "main", &buf), core.NewOut(&buf))
+		if err := w.tick(context.Background(), true); err != nil {
+			t.Fatal(err)
+		}
+		wantLines(t, linesOf(&buf), p1Line)
+
+		buf.Reset()
+		writeFile(t, filepath.Join(dir, "local.out"), later)
+		if err := w.tick(context.Background(), false); err != nil {
+			t.Fatal(err)
+		}
+		if got := linesOf(&buf); len(got) != 0 {
+			t.Fatalf("unregistered panes woke the agent: %q", got)
+		}
+	})
+
+	t.Run("blockedAll restores every pane", func(t *testing.T) {
+		dir := t.TempDir()
+		state := t.TempDir()
+		installFakeHerdr(t, dir)
+		writeFile(t, filepath.Join(dir, "machines.out"), "[]\n")
+		writeFile(t, filepath.Join(dir, "local.out"), first)
+
+		var buf bytes.Buffer
+		c := testCtx(state, "main", &buf)
+		c.Profile.Herdr.BlockedAll = true
+		w := newWatcher(c, core.NewOut(&buf))
+		if err := w.tick(context.Background(), true); err != nil {
+			t.Fatal(err)
+		}
+		wantLines(t, linesOf(&buf), p1Line, p2Line, p4Line)
+
+		buf.Reset()
+		writeFile(t, filepath.Join(dir, "local.out"), later)
+		if err := w.tick(context.Background(), false); err != nil {
+			t.Fatal(err)
+		}
+		wantLines(t, linesOf(&buf), p3Line)
+	})
 }
 
+// TestJobTransitionRules guards IS-1 and IS-3: an unregistered pane's blocked
+// line is silent by default, and a registered job pane's working->idle/done is
+// recorded for the quiet batch instead of being printed. Five quiet minutes
+// after the newest record the batch prints as exactly ONE done-batch line and
+// the record is cleared.
 func TestJobTransitionRules(t *testing.T) {
 	dir := t.TempDir()
 	state := t.TempDir()
@@ -60,6 +102,7 @@ func TestJobTransitionRules(t *testing.T) {
 	t.Setenv("HERDR_PANE_ID", "own")
 	writeFile(t, filepath.Join(state, "threads.json"), `{
 		"job":{"pane":"job"},
+		"blk":{"pane":"blk"},
 		"own":{"pane":"own"},
 		"remote":{"pane":"rjob","machine":"box"},
 		"blank":{"pane":""},
@@ -67,12 +110,15 @@ func TestJobTransitionRules(t *testing.T) {
 	}`)
 	writeFile(t, filepath.Join(dir, "machines.out"), `[{"label":"box"}]`)
 
+	start := time.Date(2026, 10, 5, 0, 0, 0, 0, time.UTC)
+	advance := fakeClock(t, start)
+
 	var buf bytes.Buffer
 	w := newWatcher(testCtx(state, "main", &buf), core.NewOut(&buf))
 
 	// first=true twice: a working→idle observed while the tick is still the
-	// first one must not emit. The guard is otherwise dead, because a fresh
-	// watcher has no previous status on its first call.
+	// first one must not be recorded. The guard is otherwise dead, because a
+	// fresh watcher has no previous status on its first call.
 	writeFile(t, filepath.Join(dir, "local.out"), agents(ag("job", "working", "j")))
 	writeFile(t, filepath.Join(dir, "box.out"), `{"result":{"agents":[]}}`)
 	if err := w.tick(context.Background(), true); err != nil {
@@ -85,12 +131,16 @@ func TestJobTransitionRules(t *testing.T) {
 	if got := linesOf(&buf); len(got) != 0 {
 		t.Fatalf("first tick emitted %q, want nothing", got)
 	}
+	if got := pendingKeys(t, state); len(got) != 0 {
+		t.Fatalf("first tick recorded %q, want nothing", got)
+	}
 
 	// Realistic stream on a fresh watcher.
 	buf.Reset()
 	w = newWatcher(testCtx(state, "main", &buf), core.NewOut(&buf))
 	writeFile(t, filepath.Join(dir, "local.out"), agents(
 		ag("job", "working", "j"),
+		ag("blk", "working", ""),
 		ag("fam", "working", ""),
 		ag("own", "blocked", "skip-me"),
 		ag("nope", "working", ""),
@@ -105,14 +155,16 @@ func TestJobTransitionRules(t *testing.T) {
 	if err := w.tick(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
-	wantLines(t, linesOf(&buf),
-		`HERDR {"machine":"local","pane":"gone","tab":null,"agent":null,"title":"g","cwd":null,"from":null,"to":"blocked"}`,
-		`HERDR {"machine":"box","pane":"own","tab":null,"agent":null,"title":"remote-own","cwd":null,"from":null,"to":"blocked"}`,
-	)
+	// IS-1: gone and the remote own pane are unregistered, so their blocked
+	// observations are silent.
+	if got := linesOf(&buf); len(got) != 0 {
+		t.Fatalf("unregistered blocked panes emitted %q, want nothing", got)
+	}
 
 	buf.Reset()
 	writeFile(t, filepath.Join(dir, "local.out"), agents(
 		ag("job", "idle", "j"),
+		ag("blk", "blocked", ""),
 		ag("fam", "idle", ""),
 		ag("own", "idle", ""),
 		ag("nope", "done", ""),
@@ -127,14 +179,17 @@ func TestJobTransitionRules(t *testing.T) {
 	if err := w.tick(context.Background(), false); err != nil {
 		t.Fatal(err)
 	}
+	// IS-1: the registered pane blk still wakes the agent on blocked. IS-3:
+	// the job panes' done is recorded, not printed.
 	wantLines(t, linesOf(&buf),
-		`HERDR {"machine":"local","pane":"job","tab":null,"agent":null,"title":"j","cwd":null,"from":"working","to":"idle"}`,
-		`HERDR {"machine":"box","pane":"rjob","tab":null,"agent":null,"title":null,"cwd":null,"from":"working","to":"done"}`,
+		`HERDR {"machine":"local","pane":"blk","tab":null,"agent":null,"title":null,"cwd":null,"from":"working","to":"blocked"}`,
 	)
+	wantPending(t, state, "box/rjob", "local/job")
 
 	buf.Reset()
 	writeFile(t, filepath.Join(dir, "local.out"), agents(
 		ag("job", "idle", "j"),
+		ag("blk", "blocked", ""),
 		ag("fam", "blocked", ""),
 		ag("own", "blocked", "skip-me"),
 		ag("gone", "blocked", "g2"),
@@ -147,10 +202,26 @@ func TestJobTransitionRules(t *testing.T) {
 	if err := w.tick(context.Background(), false); err != nil {
 		t.Fatal(err)
 	}
+	// Inside the quiet window the batch is held, an unchanged registered pane
+	// stays quiet, and an unregistered blocked pane still stays silent.
+	if got := linesOf(&buf); len(got) != 0 {
+		t.Fatalf("lines before the quiet window = %q, want none", got)
+	}
+
+	buf.Reset()
+	advance(5 * time.Minute)
+	if err := w.tick(context.Background(), false); err != nil {
+		t.Fatal(err)
+	}
+	const at = `"at":"2026-10-05T00:00:00.000Z","first_at":"2026-10-05T00:00:00.000Z","count":1`
 	wantLines(t, linesOf(&buf),
-		`HERDR {"machine":"local","pane":"fam","tab":null,"agent":null,"title":null,"cwd":null,"from":"idle","to":"blocked"}`,
-		`HERDR {"machine":"local","pane":"gone","tab":null,"agent":null,"title":"g2","cwd":null,"from":null,"to":"blocked"}`,
+		`HERDR {"event":"done-batch","entries":[`+
+			`{"machine":"box","pane":"rjob","tab":null,"agent":null,"cwd":null,"from":"working","to":"done",`+at+`},`+
+			`{"machine":"local","pane":"job","tab":null,"agent":null,"cwd":null,"from":"working","to":"idle",`+at+`}]}`,
 	)
+	if got := pendingKeys(t, state); len(got) != 0 {
+		t.Fatalf("the flushed record was not cleared: %q", got)
+	}
 }
 
 func TestHerdrErrorDedupe(t *testing.T) {
@@ -259,8 +330,12 @@ func TestHerdrErrorShapes(t *testing.T) {
 		removeFile(t, filepath.Join(dir, "local.err"))
 		writeFile(t, filepath.Join(dir, "local.out"), `{"result":{"agents":[{"pane_id":"p","agent_status":"blocked"}]}}`)
 		removeFile(t, filepath.Join(dir, "calls"))
+		state := t.TempDir()
+		// The pane is registered so its blocked line still proves the local
+		// snapshot ran despite the failed machine list (IS-1).
+		writeFile(t, filepath.Join(state, "threads.json"), `{"job":{"pane":"p"}}`)
 		var buf bytes.Buffer
-		w := newWatcher(testCtx(t.TempDir(), "main", &buf), core.NewOut(&buf))
+		w := newWatcher(testCtx(state, "main", &buf), core.NewOut(&buf))
 		if err := w.tick(context.Background(), true); err != nil {
 			t.Fatal(err)
 		}
@@ -424,10 +499,12 @@ func TestRunStartupLockStop(t *testing.T) {
 	if sleeps != 2 {
 		t.Fatalf("sleeps = %d, want 2", sleeps)
 	}
+	// IS-3: the compat Run path records the transition for the quiet batch
+	// instead of printing it, and the batch is not due yet.
 	wantLines(t, linesOf(&buf),
 		"LOG herdr watcher starting (every 5s, skip pane-9)",
-		`HERDR {"machine":"local","pane":"p1","tab":null,"agent":null,"title":"w","cwd":null,"from":"working","to":"idle"}`,
 	)
+	wantPending(t, state, "local/p1")
 	if _, err := os.Stat(filepath.Join(state, "watch-herdr.lock.json")); !os.IsNotExist(err) {
 		t.Fatalf("lock still held after Run: %v", err)
 	}
@@ -461,8 +538,12 @@ func TestSourceRunStopsOnCancel(t *testing.T) {
 	}
 	wantLines(t, linesOf(&buf),
 		"LOG herdr watcher starting (every 5s, skip none)",
-		`HERDR {"machine":"local","pane":"p","tab":null,"agent":null,"title":null,"cwd":null,"from":null,"to":"blocked"}`,
 	)
+	// IS-1: the unregistered blocked pane is silent, so nothing is recorded
+	// and the read-only state dir stays absent (IS-4).
+	if got := pendingKeys(t, state); len(got) != 0 {
+		t.Fatalf("cancel recorded %q, want nothing", got)
+	}
 	if _, err := os.Stat(state); !os.IsNotExist(err) {
 		t.Fatalf("daemon source created state/lock: %v", err)
 	}
@@ -501,12 +582,12 @@ func TestSourcesPausable(t *testing.T) {
 	}
 }
 
-// TestNullPaneNotFamily pins IS-1: a registered job pane whose pane id is
-// JSON null is reported like any other job pane. The removed family special
+// TestNullPaneNotFamily pins IS-1 and IS-3: a registered job pane whose pane id
+// is JSON null is watched like any other job pane. The removed family special
 // case read the state's family pane and compared it with every pane, and
 // paneID.equal treats two null-kind ids as equal, so with no family entry a
 // null-id pane was mistaken for the family pane and its working→idle/done
-// line was dropped.
+// transition was dropped. It must be recorded for the quiet batch.
 func TestNullPaneNotFamily(t *testing.T) {
 	for _, status := range []string{"idle", "done"} {
 		t.Run(status, func(t *testing.T) {
@@ -514,12 +595,14 @@ func TestNullPaneNotFamily(t *testing.T) {
 			state := t.TempDir()
 			installFakeHerdr(t, dir)
 			// A non-empty own pane id keeps the own-pane skip out of the way:
-			// only the family comparison could suppress this line.
+			// only the family comparison could suppress this transition.
 			t.Setenv("HERDR_PANE_ID", "own")
 			writeFile(t, filepath.Join(state, "threads.json"), `{"job":{"pane":"null"}}`)
 			writeFile(t, filepath.Join(dir, "machines.out"), "[]\n")
 			writeFile(t, filepath.Join(dir, "local.out"), `{"result":{"agents":[{"pane_id":null,"agent_status":"working"}]}}`)
 
+			start := time.Date(2026, 10, 5, 0, 0, 0, 0, time.UTC)
+			advance := fakeClock(t, start)
 			var buf bytes.Buffer
 			w := newWatcher(testCtx(state, "main", &buf), core.NewOut(&buf))
 			if err := w.tick(context.Background(), true); err != nil {
@@ -533,8 +616,21 @@ func TestNullPaneNotFamily(t *testing.T) {
 			if err := w.tick(context.Background(), false); err != nil {
 				t.Fatal(err)
 			}
+			if got := linesOf(&buf); len(got) != 0 {
+				t.Fatalf("a done printed immediately: %q", got)
+			}
+			wantPending(t, state, "local/null")
+			if got := pendingEntries(t, state)["local/null"].To; got != status {
+				t.Fatalf("recorded to = %q, want %q", got, status)
+			}
+
+			buf.Reset()
+			advance(5 * time.Minute)
+			if err := w.tick(context.Background(), false); err != nil {
+				t.Fatal(err)
+			}
 			wantLines(t, linesOf(&buf),
-				fmt.Sprintf(`HERDR {"machine":"local","pane":null,"tab":null,"agent":null,"title":null,"cwd":null,"from":"working","to":%q}`, status),
+				fmt.Sprintf(`HERDR {"event":"done-batch","entries":[{"machine":"local","pane":null,"tab":null,"agent":null,"cwd":null,"from":"working","to":%q,"at":"2026-10-05T00:00:00.000Z","first_at":"2026-10-05T00:00:00.000Z","count":1}]}`, status),
 			)
 		})
 	}

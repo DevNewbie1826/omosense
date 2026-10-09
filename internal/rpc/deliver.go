@@ -132,10 +132,7 @@ func (b *batcher) pass(ctx context.Context) {
 		return
 	}
 	now := nowFn()
-	due := lastDoneAt(entries).Add(batchQuiet)
-	if !b.retryAt.IsZero() && b.retryAt.After(due) {
-		due = b.retryAt
-	}
+	due := core.QuietDue(lastDoneAt(entries), b.retryAt, batchQuiet)
 	if now.Before(due) {
 		return
 	}

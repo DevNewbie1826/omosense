@@ -208,6 +208,8 @@ func TestResolveProfileShapeErrors(t *testing.T) {
 		{`{"rpc":{"labels":{"bogus":"x"}}}`, "config.json: rpc.labels.bogus is not a known label (task, thread, cwd, id, seq, doneAt, count, ack, unverified, verifyPending, more)"},
 		{`{"rpc":{"labels":{"task":2}}}`, "config.json: rpc.labels.task must be a string"},
 		{`{"herdr":{"verify":"yes"}}`, "config.json: herdr.verify must be a boolean"},
+		{`{"herdr":{"blockedAll":"yes"}}`, "config.json: herdr.blockedAll must be a boolean"},
+		{`{"herdr":{"blockedAll":1}}`, "config.json: herdr.blockedAll must be a boolean"},
 		{`{"herdr":{"agentPattern":5}}`, "config.json: herdr.agentPattern must be a string"},
 		{`{"herdr":{"agentPattern":"["}}`, "config.json: herdr.agentPattern is not a valid regular expression:"},
 		{`{"silentMinutes":0}`, "config.json: silentMinutes must be a positive integer"},
@@ -266,6 +268,9 @@ func TestLoadNewKeyDefaults(t *testing.T) {
 	if p.Herdr.Verify {
 		t.Errorf("herdr.verify default = true, want false")
 	}
+	if p.Herdr.BlockedAll {
+		t.Errorf("herdr.blockedAll default = true, want false")
+	}
 	const defPat = "senpi|omo|claude|codex|opencode|(^|/)pi( |$)"
 	if p.Herdr.AgentPattern != defPat || p.Herdr.AgentRe == nil {
 		t.Errorf("herdr pattern = %q %v, want the default compiled", p.Herdr.AgentPattern, p.Herdr.AgentRe)
@@ -292,7 +297,7 @@ func TestLoadNewKeysSet(t *testing.T) {
 	writeConfig(t, dir, `{
 	  "verify": {"command": ["/bin/sh", "-c", "exit 0"], "timeoutSec": 5},
 	  "rpc": {"verify": false, "labels": {"task": "T", "ack": "A", "more": "M"}},
-	  "herdr": {"verify": true, "agentPattern": "^agent-"},
+	  "herdr": {"verify": true, "blockedAll": true, "agentPattern": "^agent-"},
 	  "silentMinutes": 7,
 	  "transcriber": ["/opt/tr.sh", "{audio}"],
 	  "guard": {"stateFileBytes": 1048576}
@@ -313,9 +318,9 @@ func TestLoadNewKeysSet(t *testing.T) {
 			t.Errorf("Label(%q) = %q, want %q", key, got, want)
 		}
 	}
-	if !p.Herdr.Verify || p.Herdr.AgentPattern != "^agent-" || p.Herdr.AgentRe == nil ||
+	if !p.Herdr.Verify || !p.Herdr.BlockedAll || p.Herdr.AgentPattern != "^agent-" || p.Herdr.AgentRe == nil ||
 		!p.Herdr.AgentRe.MatchString("agent-x") || p.Herdr.AgentRe.MatchString("senpi bundle") {
-		t.Errorf("herdr verify/pattern = %v %q %v, want true and the configured pattern compiled", p.Herdr.Verify, p.Herdr.AgentPattern, p.Herdr.AgentRe)
+		t.Errorf("herdr verify/blockedAll/pattern = %v %v %q %v, want true/true and the configured pattern compiled", p.Herdr.Verify, p.Herdr.BlockedAll, p.Herdr.AgentPattern, p.Herdr.AgentRe)
 	}
 	if p.SilentMinutes != 7 {
 		t.Errorf("silentMinutes = %d, want 7", p.SilentMinutes)
@@ -479,7 +484,7 @@ func TestLoadCfgRawKeepsOrder(t *testing.T) {
 // absent for every new key (the tri-state convention of the flat shape).
 func TestLoadNullNewKeysKeepDefaults(t *testing.T) {
 	_, dir, _ := testEnv(t)
-	writeConfig(t, dir, `{"tidy":{"checkMin":null,"quietMin":null},"verify":null,"rpc":{"verify":null,"labels":null},"herdr":{"verify":null,"agentPattern":null},"silentMinutes":null,"transcriber":null,"guard":null}`)
+	writeConfig(t, dir, `{"tidy":{"checkMin":null,"quietMin":null},"verify":null,"rpc":{"verify":null,"labels":null},"herdr":{"verify":null,"blockedAll":null,"agentPattern":null},"silentMinutes":null,"transcriber":null,"guard":null}`)
 	ctx, err := Load(ParseArgs(nil), false)
 	if err != nil {
 		t.Fatalf("load: %v", err)
