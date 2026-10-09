@@ -3,6 +3,7 @@ package herdr
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -214,6 +215,109 @@ func TestPendingMalformedFilePreserved(t *testing.T) {
 	b, err := os.ReadFile(matches[0])
 	if err != nil || string(b) != "not json\n" {
 		t.Fatalf("quarantined content = %q (%v), want the original bytes", b, err)
+	}
+}
+
+// TestPendingQuarantineFailureStopsWatcher guards review R1: a malformed
+// pending file that cannot be moved aside must stop the source with the error
+// BEFORE any writable tick, so the bytes it could not preserve are never
+// overwritten. The quarantine destination is occupied by a directory, which
+// leaves ordinary writes to the state directory possible - the shape the
+// review reproduced.
+func TestPendingQuarantineFailureStopsWatcher(t *testing.T) {
+	f := newQuietFixture(t, `{"job":{"pane":"p1"}}`, "{}")
+	bad := filepath.Join(f.state, "herdr-pending.json")
+	const original = "not json\n"
+	writeFile(t, bad, original)
+	dst := fmt.Sprintf("%s.bad-%d", bad, nowFn().Unix())
+	if err := os.Mkdir(dst, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(dst, "keep"), "occupied\n")
+	writeFile(t, filepath.Join(f.dir, "local.out"), agents(ag("p1", "working", "j")))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ticks := 0
+	f.w.sleep = func(ctx context.Context, _ time.Duration) error {
+		ticks++
+		if ticks == 1 {
+			// The completion the buggy watcher records - and so overwrites
+			// the malformed original with.
+			writeFile(t, filepath.Join(f.dir, "local.out"), agents(ag("p1", "idle", "j")))
+			return nil
+		}
+		cancel()
+		return ctx.Err()
+	}
+	runErr := f.w.run(ctx)
+	got, err := os.ReadFile(bad)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("cleanup: t.TempDir removes the fixture dirs; runErr=%v ticks=%d logs=%s", runErr, ticks, f.buf.String())
+	if string(got) != original {
+		t.Fatalf("quarantine failure overwrote the original: %s", got)
+	}
+	if runErr == nil {
+		t.Fatal("quarantine failure did not stop the writable watcher")
+	}
+	if ticks != 0 {
+		t.Fatalf("the watcher ticked %d times before stopping", ticks)
+	}
+	lines := linesOf(f.buf)
+	if len(lines) != 3 || !strings.HasPrefix(lines[1], "LOG herdr pending: herdr-pending.json: ") || !strings.Contains(lines[2], "herdr-pending.json.bad-") {
+		t.Fatalf("lines = %q, want the startup LOG, the malformed error and the rename error", lines)
+	}
+}
+
+// TestPendingUnreadableFileStopsWatcher guards the other half of review R1's
+// class: a pending path that exists but cannot be READ is not a malformed
+// store, so it must stop the source with the error instead of being moved
+// aside and replaced with an empty store. A directory is the deterministic
+// member of that class.
+func TestPendingUnreadableFileStopsWatcher(t *testing.T) {
+	f := newQuietFixture(t, `{"job":{"pane":"p1"}}`, "{}")
+	bad := filepath.Join(f.state, "herdr-pending.json")
+	if err := os.Mkdir(bad, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(bad, "keep"), "occupied\n")
+	writeFile(t, filepath.Join(f.dir, "local.out"), agents(ag("p1", "working", "j")))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ticks := 0
+	f.w.sleep = func(ctx context.Context, _ time.Duration) error {
+		ticks++
+		if ticks >= 2 {
+			cancel()
+			return ctx.Err()
+		}
+		writeFile(t, filepath.Join(f.dir, "local.out"), agents(ag("p1", "idle", "j")))
+		return nil
+	}
+	runErr := f.w.run(ctx)
+	t.Logf("cleanup: t.TempDir removes the fixture dirs; runErr=%v ticks=%d logs=%s", runErr, ticks, f.buf.String())
+	if runErr == nil {
+		t.Fatal("an unreadable pending path did not stop the writable watcher")
+	}
+	if ticks != 0 {
+		t.Fatalf("the watcher ticked %d times before stopping", ticks)
+	}
+	info, err := os.Stat(bad)
+	if err != nil || !info.IsDir() {
+		t.Fatalf("the unreadable pending path was moved aside: %v (%v)", info, err)
+	}
+	if b, err := os.ReadFile(filepath.Join(bad, "keep")); err != nil || string(b) != "occupied\n" {
+		t.Fatalf("the unreadable pending path lost its content: %q (%v)", b, err)
+	}
+	if matches, _ := filepath.Glob(bad + ".bad-*"); len(matches) != 0 {
+		t.Fatalf("the unreadable pending path was quarantined: %q", matches)
+	}
+	lines := linesOf(f.buf)
+	if len(lines) != 2 || !strings.HasPrefix(lines[1], "LOG herdr pending: ") {
+		t.Fatalf("lines = %q, want the startup LOG and one read error", lines)
 	}
 }
 

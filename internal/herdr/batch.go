@@ -173,23 +173,26 @@ func (s *doneStore) sorted() []doneEntry {
 }
 
 // load reads the persisted store. A missing file is an empty store and
-// creates nothing - the state dir stays absent on a read-only path. A
-// malformed file is returned as an error so the caller can preserve it
-// instead of silently overwriting it.
-func (s *doneStore) load() error {
+// creates nothing - the state dir stays absent on a read-only path. A file
+// whose bytes are not a valid store is reported malformed so the caller can
+// preserve it instead of silently overwriting it. Any other failure - the
+// path exists but cannot be read - is returned as a plain error: the bytes
+// may well be intact, so starting empty over them would destroy data the
+// watcher never got to see.
+func (s *doneStore) load() (malformed bool, err error) {
 	b, err := os.ReadFile(s.path)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil
+		return false, nil
 	}
 	if err != nil {
-		return err
+		return false, err
 	}
 	var f pendingFile
 	if err := json.Unmarshal(b, &f); err != nil {
-		return fmt.Errorf("herdr-pending.json: %w", err)
+		return true, fmt.Errorf("herdr-pending.json: %w", err)
 	}
 	if f.Version != 1 || f.Entries == nil {
-		return errors.New("herdr-pending.json: invalid version or entries")
+		return true, errors.New("herdr-pending.json: invalid version or entries")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -199,7 +202,7 @@ func (s *doneStore) load() error {
 		s.entries[k] = e
 	}
 	s.seq = uint64(len(s.entries))
-	return nil
+	return false, nil
 }
 
 // quarantine moves a malformed store aside so the next save starts empty

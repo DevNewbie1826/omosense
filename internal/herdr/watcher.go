@@ -227,11 +227,19 @@ func (w *watcher) run(ctx context.Context) error {
 	w.sink.Log(fmt.Sprintf("herdr watcher starting (every %ds, skip %s)", int(interval/time.Second), skip))
 	// IS-4: the pending store is loaded here, not in newWatcher, so --once
 	// stays read-only. A missing file creates nothing; a malformed one is
-	// preserved aside before the watcher starts empty.
-	if err := w.store.load(); err != nil {
+	// preserved aside before the watcher starts empty. Nothing else may start
+	// a writable tick: a file that could not be read, or a malformed one that
+	// could not be moved aside, stops the source with the error instead of
+	// overwriting bytes it could not preserve.
+	malformed, err := w.store.load()
+	if err != nil {
 		w.sink.Log("herdr pending: " + err.Error())
+		if !malformed {
+			return err
+		}
 		if qerr := w.store.quarantine(); qerr != nil {
 			w.sink.Log("herdr pending: " + qerr.Error())
+			return qerr
 		}
 	}
 	first := true

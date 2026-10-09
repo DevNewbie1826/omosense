@@ -123,7 +123,7 @@ The state dir holds:
 | `google-seen.json` | Calendar and mail items already reported. |
 | `rpc-pending.json` (+ `rpc-pending.lock`) | rpc completions not yet acked. |
 | `rpc-subscription.json` | The session that receives rpc done batches. |
-| `herdr-pending.json` | herdr job pane completions waiting for their done batch. A malformed file is renamed to `herdr-pending.json.bad-<unix>` and herdr starts empty. |
+| `herdr-pending.json` | herdr job pane completions waiting for their done batch. A malformed file is renamed to `herdr-pending.json.bad-<unix>` and herdr starts empty; if that rename fails, or the file cannot be read at all, the herdr source stops with the error instead of overwriting it, and the host restarts it with backoff (5s doubling to 5m, and a `source-stopped` line after six consecutive crashes). |
 | `threads.json` | Job thread registry read by herdr and rpc. Written by `omosense thread`. |
 | `threads.lock` | Lock guarding `threads.json` writes. |
 | `sessions.json` | Left over from older versions. omosense no longer reads it. |
