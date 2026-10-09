@@ -22,36 +22,67 @@ const testStartLog = "LOG memory-tidy watcher starting (check 5m, quiet 90m)"
 const testEpoch = int64(1750001400)
 
 // tickDriver installs the loop's sleep hook for exactly n ticks under the
-// shared fake clock: each tick's sleep advances the clock by interval and
-// the n-th ends the loop, so a loop that returns has run n ticks.
-func tickDriver(t *testing.T, advance func(time.Duration), interval time.Duration, n int) {
+// shared fake clock. Each sleep is one tick that finished: onTick, when
+// set, runs before the clock advances, then the clock advances by interval
+// and the n-th sleep ends the loop. When the loop returns without having
+// slept n times, and the test has not already failed, the cleanup fails
+// the test. A per-tick hook that fails the test aborts before advance, so
+// the cleanup stays quiet and that hook's assertion is the failure.
+func tickDriver(t *testing.T, advance func(time.Duration), interval time.Duration, n int, onTick ...func(completed int)) {
 	t.Helper()
+	var hook func(int)
+	if len(onTick) > 1 {
+		t.Fatal("tickDriver accepts at most one per-tick hook")
+	}
+	if len(onTick) == 1 {
+		hook = onTick[0]
+	}
 	prev := sleepFn
 	passes := 0
 	sleepFn = func(ctx context.Context, d time.Duration) error {
 		if d != interval {
 			t.Errorf("interval = %v, want %v", d, interval)
 		}
-		advance(d)
 		passes++
+		if hook != nil {
+			hook(passes)
+		}
+		advance(d)
 		if passes >= n {
 			return context.Canceled
 		}
 		return nil
 	}
-	t.Cleanup(func() { sleepFn = prev })
+	t.Cleanup(func() {
+		sleepFn = prev
+		if !t.Failed() && passes != n {
+			t.Errorf("ticks ran = %d, want %d", passes, n)
+		}
+	})
 }
 
 // tidyRun runs one locked watcher loop for n fake-clock ticks and returns
 // its stdout lines. The watermark must already be seeded when the lane
-// needs an existing file.
-func tidyRun(t *testing.T, state string, advance func(time.Duration), n int) []string {
+// needs an existing file. onTick, when set, sees each finished tick's
+// lines before the clock advances.
+func tidyRun(t *testing.T, state string, advance func(time.Duration), n int, onTick ...func(completed int, lines []string)) []string {
 	t.Helper()
+	var hook func(int, []string)
+	if len(onTick) > 1 {
+		t.Fatal("tidyRun accepts at most one per-tick hook")
+	}
+	if len(onTick) == 1 {
+		hook = onTick[0]
+	}
 	var buf bytes.Buffer
 	c := testCtx(state, "main", &buf)
 	c.Profile.Tidy.CheckMin = floatPtr(5)
 	c.Profile.Tidy.QuietMin = floatPtr(90)
-	tickDriver(t, advance, 5*time.Minute, n)
+	tickDriver(t, advance, 5*time.Minute, n, func(completed int) {
+		if hook != nil {
+			hook(completed, linesOf(&buf))
+		}
+	})
 	if code := Run(c, nil); code != 0 {
 		t.Fatalf("Run = %d, want 0", code)
 	}
@@ -67,6 +98,16 @@ func countPrefix(lines []string, prefix string) int {
 		}
 	}
 	return n
+}
+
+// containsLine reports whether lines holds want as one whole line.
+func containsLine(lines []string, want string) bool {
+	for _, line := range lines {
+		if line == want {
+			return true
+		}
+	}
+	return false
 }
 
 // seedWatermark writes an existing memory-tidy.json with today's backup
@@ -134,8 +175,38 @@ func TestFirstRunLog(t *testing.T) {
 		advance := fakeClock(t, start)
 		// 13 ticks of 5m: tick 1 emits alpha, tick 13 (start+60m) emits the
 		// now-90m-old beta. A flag that is not cleared logs the guidance twice.
-		lines := tidyRun(t, state, advance, 13)
+		// The tick-1 backup and the alpha line are asserted before the clock
+		// advances, so a later tick cannot supply them.
 		date := seoulDateOf(t, start)
+		guide := "LOG memory-tidy no watermark yet: "
+		lines := tidyRun(t, state, advance, 13, func(completed int, got []string) {
+			if completed == 1 {
+				if _, err := os.Stat(filepath.Join(backupsOf(t), date, "alpha.bundle")); err != nil {
+					t.Fatalf("tick 1 returned without its backup: %v", err)
+				}
+				if body := readFile(t, filepath.Join(state, "memory-tidy.json")); !strings.Contains(body, fmt.Sprintf("%q", date)) {
+					t.Fatalf("tick 1 returned without lastBackupDate stamped: %s", body)
+				}
+			}
+			if n := countPrefix(got, "LOG memory-tidy backup "); n != 1 {
+				t.Fatalf("tick %d backup LOGs = %d, want the tick-1 backup only:\n%s", completed, n, strings.Join(got, "\n"))
+			}
+			if n := countPrefix(got, guide); n != 1 {
+				t.Fatalf("tick %d guidance LOGs = %d, want 1", completed, n)
+			}
+			if completed < 13 {
+				if countPrefix(got, "TIDY ") != 1 || !containsLine(got, tidyLine("alpha", shaA)) {
+					t.Fatalf("tick %d TIDY lines, want only alpha:\n%s", completed, strings.Join(got, "\n"))
+				}
+				if containsLine(got, tidyLine("beta", shaB)) {
+					t.Fatalf("tick %d emitted beta before it was quiet", completed)
+				}
+				return
+			}
+			if !containsLine(got, tidyLine("beta", shaB)) || countPrefix(got, "TIDY ") != 2 {
+				t.Fatalf("tick 13 did not emit beta after alpha:\n%s", strings.Join(got, "\n"))
+			}
+		})
 		wantLines(t, lines,
 			testStartLog,
 			`LOG memory-tidy no watermark yet: 1 repos reported in 1 TIDY lines; run "omosense tidy --write-watermark" to mark the current HEADs as tidied`,
@@ -166,7 +237,15 @@ func TestAnnouncedSurvivesRestart(t *testing.T) {
 	c1 := testCtx(state, "main", &buf1)
 	c1.Profile.Tidy.CheckMin = floatPtr(5)
 	c1.Profile.Tidy.QuietMin = floatPtr(90)
-	tickDriver(t, advance, 5*time.Minute, 13) // tick 13 runs at commit+90m
+	tickDriver(t, advance, 5*time.Minute, 13, func(completed int) { // tick 13 runs at commit+90m
+		n := countPrefix(linesOf(&buf1), "TIDY ")
+		if completed < 13 && n != 0 {
+			t.Fatalf("tick %d announced before the quiet threshold (%d TIDY lines)", completed, n)
+		}
+		if completed == 13 && n != 1 {
+			t.Fatalf("tick 13 TIDY lines = %d, want 1", n)
+		}
+	})
 	if err := Sources(c1)[0].Run(context.Background(), c1.Out); err != nil {
 		t.Fatal(err)
 	}
@@ -175,13 +254,31 @@ func TestAnnouncedSurvivesRestart(t *testing.T) {
 		t.Fatalf("tidy-announced.json after run 1:\ngot:\n%s\nwant:\n%s", got, announcedDoc("alpha", sha, firstAt))
 	}
 
-	wantLines(t, tidyRun(t, state, advance, 5), testStartLog)
+	suppressed := 0
+	wantLines(t, tidyRun(t, state, advance, 5, func(completed int, got []string) {
+		suppressed = completed
+		if len(got) != 1 || got[0] != testStartLog {
+			t.Fatalf("tick %d of the restarted loop re-announced inside 6h:\n%s", completed, strings.Join(got, "\n"))
+		}
+	}), testStartLog)
+	if suppressed != 5 {
+		t.Fatalf("next ticks did not run: completed ticks = %d, want 5 after restart", suppressed)
+	}
 	if got := readFile(t, announced); got != announcedDoc("alpha", sha, firstAt) {
 		t.Fatalf("run 2 rewrote tidy-announced.json:\ngot:\n%s\nwant:\n%s", got, announcedDoc("alpha", sha, firstAt))
 	}
 
 	advance(6 * time.Hour)
-	wantLines(t, tidyRun(t, state, advance, 1), testStartLog, line)
+	reemitted := 0
+	wantLines(t, tidyRun(t, state, advance, 1, func(completed int, got []string) {
+		reemitted = completed
+		if !containsLine(got, line) {
+			t.Fatalf("tick %d did not re-announce after 6h:\n%s", completed, strings.Join(got, "\n"))
+		}
+	}), testStartLog, line)
+	if reemitted != 1 {
+		t.Fatalf("6h re-announce tick did not run: completed ticks = %d, want 1", reemitted)
+	}
 	// Run 3's first tick runs 30m after run 2 ended (5 + 5 ticks of 5m) plus
 	// the 6h jump.
 	reemitAt := firstAt + 30*60*1000 + 6*3600*1000
@@ -201,9 +298,26 @@ func TestAnnouncedHeadMovedReannounces(t *testing.T) {
 	advance := fakeClock(t, start)
 	seedWatermark(t, state, seoulDateOf(t, start))
 
-	wantLines(t, tidyRun(t, state, advance, 13), testStartLog, tidyLine("alpha", sha1))
+	wantLines(t, tidyRun(t, state, advance, 13, func(completed int, got []string) {
+		n := countPrefix(got, "TIDY ")
+		if completed < 13 && n != 0 {
+			t.Fatalf("tick %d announced before the quiet threshold", completed)
+		}
+		if completed == 13 && !containsLine(got, tidyLine("alpha", sha1)) {
+			t.Fatalf("tick 13 did not announce %s:\n%s", sha1, strings.Join(got, "\n"))
+		}
+	}), testStartLog, tidyLine("alpha", sha1))
 	sha2 := commitAt(t, repo, testEpoch, "a2")
-	wantLines(t, tidyRun(t, state, advance, 1), testStartLog, tidyLine("alpha", sha2))
+	moved := 0
+	wantLines(t, tidyRun(t, state, advance, 1, func(completed int, got []string) {
+		moved = completed
+		if !containsLine(got, tidyLine("alpha", sha2)) {
+			t.Fatalf("tick %d did not re-announce the moved HEAD:\n%s", completed, strings.Join(got, "\n"))
+		}
+	}), testStartLog, tidyLine("alpha", sha2))
+	if moved != 1 {
+		t.Fatalf("moved-HEAD tick did not run: completed ticks = %d, want 1", moved)
+	}
 	got := readFile(t, filepath.Join(state, "tidy-announced.json"))
 	if !strings.Contains(got, sha2) || strings.Contains(got, sha1) {
 		t.Fatalf("tidy-announced.json = %s, want the record replaced with %s", got, sha2)
@@ -220,13 +334,30 @@ func TestAnnouncedPurgePersisted(t *testing.T) {
 	date := seoulDateOf(t, start)
 	seedWatermark(t, state, date)
 
-	wantLines(t, tidyRun(t, state, advance, 13), testStartLog, tidyLine("alpha", sha))
+	wantLines(t, tidyRun(t, state, advance, 13, func(completed int, got []string) {
+		n := countPrefix(got, "TIDY ")
+		if completed < 13 && n != 0 {
+			t.Fatalf("tick %d announced before the quiet threshold", completed)
+		}
+		if completed == 13 && !containsLine(got, tidyLine("alpha", sha)) {
+			t.Fatalf("tick 13 did not announce %s:\n%s", sha, strings.Join(got, "\n"))
+		}
+	}), testStartLog, tidyLine("alpha", sha))
 
 	// The watermark catches up (as `tidy --write-watermark` would), so
 	// alpha is no longer in the changed set.
 	writeFile(t, filepath.Join(state, "memory-tidy.json"),
 		fmt.Sprintf(`{"repos":{"alpha":%q},"lastRun":null,"lastBackupDate":%q}`, sha, date))
-	wantLines(t, tidyRun(t, state, advance, 1), testStartLog)
+	purged := 0
+	wantLines(t, tidyRun(t, state, advance, 1, func(completed int, got []string) {
+		purged = completed
+		if countPrefix(got, "TIDY ") != 0 {
+			t.Fatalf("purge tick %d still announced:\n%s", completed, strings.Join(got, "\n"))
+		}
+	}), testStartLog)
+	if purged != 1 {
+		t.Fatalf("purge tick did not run: completed ticks = %d, want 1", purged)
+	}
 	if got, want := readFile(t, filepath.Join(state, "tidy-announced.json")), "{\n  \"repos\": {}\n}\n"; got != want {
 		t.Fatalf("tidy-announced.json after the purge:\ngot:\n%s\nwant:\n%s", got, want)
 	}
@@ -277,7 +408,53 @@ func TestAnnouncedSaveFailureKeepsTick(t *testing.T) {
 	announced := filepath.Join(state, "tidy-announced.json")
 	mkdirAll(t, announced+".tmp") // the write target is a directory, so it fails
 
-	lines := tidyRun(t, state, advance, 2)
+	bundle := filepath.Join(backupsOf(t), date, "alpha.bundle")
+	reached := 0
+	lines := tidyRun(t, state, advance, 2, func(completed int, got []string) {
+		reached = completed
+		if completed != 1 {
+			// Tick 2's backup check is quiet: the date was stamped by tick 1,
+			// so this tick must not print a second backup LOG.
+			if countPrefix(got, "LOG memory-tidy backup ") != 1 {
+				t.Fatalf("tick 2 backup check was not quiet:\n%s", strings.Join(got, "\n"))
+			}
+			if _, err := os.Stat(bundle); err != nil {
+				t.Fatalf("tick 2 did not keep the failed-save tick's backup: %v", err)
+			}
+			return
+		}
+		// Before the clock advances, this tick's own backup must already
+		// exist. The next tick would otherwise stamp it and mask a skip.
+		if _, err := os.Stat(bundle); err != nil {
+			t.Fatalf("the failed-save tick returned without its backup: %v", err)
+		}
+		if body := readFile(t, wm); !strings.Contains(body, fmt.Sprintf("%q", date)) {
+			t.Fatalf("the failed-save tick returned without lastBackupDate stamped: %s", body)
+		}
+		if len(got) != 4 {
+			t.Fatalf("tick 1 lines = %d, want the start LOG, one TIDY, one not-saved LOG and the backup LOG:\n%s", len(got), strings.Join(got, "\n"))
+		}
+		if got[0] != testStartLog {
+			t.Errorf("tick 1 line 0 = %q, want %q", got[0], testStartLog)
+		}
+		if got[1] != tidyLine("alpha", sha) {
+			t.Errorf("tick 1 line 1 = %q, want %q", got[1], tidyLine("alpha", sha))
+		}
+		if n := countPrefix(got, "LOG memory-tidy announced state not saved: "); n != 1 {
+			t.Fatalf("tick 1 not-saved LOGs = %d, want 1:\n%s", n, strings.Join(got, "\n"))
+		}
+		if !strings.Contains(got[2], announced+".tmp") {
+			t.Errorf("tick 1 line 2 = %q, want it to name %s", got[2], announced+".tmp")
+		}
+		wantBackup := fmt.Sprintf("LOG memory-tidy backup %s repos=1 bytes=%d failed=none",
+			date, statOf(t, bundle).Size())
+		if got[3] != wantBackup {
+			t.Errorf("tick 1 line 3 = %q, want the backup LOG %q", got[3], wantBackup)
+		}
+	})
+	if reached != 2 {
+		t.Fatalf("next tick did not run: completed ticks = %d, want 2 after failed save", reached)
+	}
 	if len(lines) != 4 {
 		t.Fatalf("lines = %d, want the start LOG, one TIDY, one not-saved LOG and the backup LOG:\n%s", len(lines), strings.Join(lines, "\n"))
 	}
@@ -352,8 +529,33 @@ func TestAnnouncedRenameFailureRemovesTmp(t *testing.T) {
 	mkdirAll(t, announced)
 	writeFile(t, filepath.Join(announced, "keep"), "x")
 
-	lines := tidyRun(t, state, advance, 2)
+	bundle := filepath.Join(backupsOf(t), date, "alpha.bundle")
 	tmp := announced + ".tmp"
+	reached := 0
+	lines := tidyRun(t, state, advance, 2, func(completed int, got []string) {
+		reached = completed
+		if completed != 1 {
+			return
+		}
+		if _, err := os.Stat(bundle); err != nil {
+			t.Fatalf("the failed-rename tick returned without its backup: %v", err)
+		}
+		if body := readFile(t, wm); !strings.Contains(body, fmt.Sprintf("%q", date)) {
+			t.Fatalf("the failed-rename tick returned without lastBackupDate stamped: %s", body)
+		}
+		if _, err := os.Stat(tmp); !os.IsNotExist(err) {
+			t.Fatalf("tick 1 left %s behind: %v", tmp, err)
+		}
+		if !containsLine(got, tidyLine("alpha", sha)) {
+			t.Fatalf("tick 1 missing TIDY:\n%s", strings.Join(got, "\n"))
+		}
+		if n := countPrefix(got, "LOG memory-tidy announced state not saved: "); n != 1 {
+			t.Fatalf("tick 1 not-saved LOGs = %d, want 1:\n%s", n, strings.Join(got, "\n"))
+		}
+	})
+	if reached != 2 {
+		t.Fatalf("next tick did not run: completed ticks = %d, want 2 after failed rename", reached)
+	}
 	_, tmpErr := os.Stat(tmp)
 	if len(lines) != 5 {
 		t.Fatalf("lines = %d, want the start LOG, one unreadable LOG, one TIDY, one not-saved LOG and the backup LOG; tmp stat err=%v\n%s", len(lines), tmpErr, strings.Join(lines, "\n"))
