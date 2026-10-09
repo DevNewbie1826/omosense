@@ -22,6 +22,11 @@ var (
 // still stale is re-announced 6h after the previous announcement.
 const reemitMs = 6 * 3600_000
 
+// maxTidyPerLine caps how many repos one TIDY line carries (IS-1): a tick
+// with more ready repos prints consecutive lines of this size, the last
+// line the remainder, in the same order.
+const maxTidyPerLine = 10
+
 // sleepCtx sleeps for d, returning ctx.Err() when ctx was cancelled first.
 func sleepCtx(ctx context.Context, d time.Duration) error {
 	t := time.NewTimer(d)
@@ -77,6 +82,10 @@ type tidyer struct {
 	quietMs     float64
 	now         func() time.Time
 	sleep       func(context.Context, time.Duration) error
+	// firstRun is IS-2: <state>/memory-tidy.json did not exist when
+	// runLoop started. The first tick that emits consumes it with one
+	// guidance LOG (the first tick's backup pass may create the file).
+	firstRun bool
 }
 
 // newTidyer resolves AGENTS via the shared core rule ($OMO_MEMORY_AGENTS
@@ -121,7 +130,15 @@ func newTidyer(c *core.Ctx, sink core.Sink) *tidyer {
 func (t *tidyer) runLoop(ctx context.Context) error {
 	t.sink.Log(fmt.Sprintf("memory-tidy watcher starting (check %sm, quiet %sm)",
 		minStr(t.checkMs), minStr(t.quietMs)))
-	emitted := map[string]emitRec{}
+	// IS-2: first run = no watermark file when the loop starts. Captured
+	// here, before the first tick, because that tick's backup pass writes
+	// the file.
+	if _, err := os.Stat(t.watermarkPath()); err != nil {
+		t.firstRun = true
+	}
+	// IS-4/IS-5: the announcement record is persisted, so a restart does
+	// not reset the 6h re-emit window; an unreadable file fails open.
+	emitted := t.readAnnounced()
 	for {
 		if ctx.Err() != nil {
 			return nil
@@ -137,8 +154,9 @@ func (t *tidyer) runLoop(ctx context.Context) error {
 
 // tick is one TS try block: purge repos that left the changed set, mark
 // the ready ones (quiet elapsed since the HEAD commit, and not muted by
-// the 6h re-emit guard), emit one TIDY line for all ready repos, then run
-// the daily backup. An error aborts the rest of the pass, like the throw.
+// the 6h re-emit guard), emit the ready repos as TIDY lines of at most
+// maxTidyPerLine entries, persist the announcement record, then run the
+// daily backup. An error aborts the rest of the pass, like the throw.
 func (t *tidyer) tick(ctx context.Context, now float64, emitted map[string]emitRec) error {
 	changes, err := t.changed(ctx)
 	if err != nil {
@@ -151,9 +169,11 @@ func (t *tidyer) tick(ctx context.Context, now float64, emitted map[string]emitR
 	for _, x := range changes {
 		stillChanged[x.repo] = true
 	}
+	purged := false
 	for repo := range emitted {
 		if !stillChanged[repo] {
 			delete(emitted, repo)
+			purged = true
 		}
 	}
 	var ready []change
@@ -166,21 +186,49 @@ func (t *tidyer) tick(ctx context.Context, now float64, emitted map[string]emitR
 		}
 	}
 	if len(ready) > 0 {
-		t.emitTidy(ready)
+		groups := tidyGroups(ready)
+		if t.firstRun {
+			t.sink.Log(fmt.Sprintf("memory-tidy no watermark yet: %d repos reported in %d TIDY lines; run \"omosense tidy --write-watermark\" to mark the current HEADs as tidied",
+				len(ready), len(groups)))
+			t.firstRun = false
+		}
+		t.emitTidy(groups)
 		for _, x := range ready {
 			emitted[x.repo] = emitRec{to: x.to, at: now}
+		}
+	}
+	if purged || len(ready) > 0 {
+		// IS-5: a failed save must not abort the tick (the backup below
+		// still runs) and must not drop the in-memory record, which keeps
+		// the 6h mute rule working for the rest of this process.
+		if err := t.writeAnnounced(emitted); err != nil {
+			t.sink.Log(fmt.Sprintf("memory-tidy announced state not saved: %v", err))
 		}
 	}
 	_, err = t.backup(ctx, true)
 	return err
 }
 
-func (t *tidyer) emitTidy(changes []change) {
-	payload := make([]tidyChange, len(changes))
-	for i, x := range changes {
-		payload[i] = tidyChange{Repo: x.repo, From: x.from, To: x.to}
+// tidyGroups cuts changes into consecutive groups of at most
+// maxTidyPerLine entries, preserving order (IS-1).
+func tidyGroups(changes []change) [][]change {
+	var groups [][]change
+	for start := 0; start < len(changes); start += maxTidyPerLine {
+		groups = append(groups, changes[start:min(start+maxTidyPerLine, len(changes))])
 	}
-	t.sink.Emit("TIDY", tidyEvent{Changed: payload})
+	return groups
+}
+
+// emitTidy prints one TIDY line per group, each carrying the same
+// TIDY {"changed":[...]} shape as before (IS-1).
+func (t *tidyer) emitTidy(groups [][]change) {
+	for _, g := range groups {
+		payload := make([]tidyChange, len(g))
+		for i, x := range g {
+			payload[i] = tidyChange{Repo: x.repo, From: x.from, To: x.to}
+		}
+		t.sink.Emit("TIDY", tidyEvent{Changed: payload})
+	}
 }
 
 func (t *tidyer) nowMs() float64 { return float64(t.now().UnixMilli()) }
