@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/DevNewbie1826/omosense/internal/core"
@@ -153,6 +154,14 @@ type watcher struct {
 	// IS-12: whether the rpc source may own a job pane's session.
 	rpcEnabled bool
 
+	// IS-1: whether a blocked line is printed for every pane (herdr.blockedAll)
+	// instead of only for registered job panes.
+	blockedAll bool
+
+	// IS-3/4: the quiet done batch and its persisted store.
+	store    *doneStore
+	inflight atomic.Int32
+
 	// IS-8: the opt-in done-verification hook.
 	verify        bool
 	verifyCmd     []string
@@ -178,6 +187,9 @@ func newWatcher(c *core.Ctx, sink core.Sink) *watcher {
 		silentMinutes: c.Profile.SilentMinutes,
 
 		rpcEnabled: c.Profile.RPC.Enabled,
+
+		blockedAll: c.Profile.Herdr.BlockedAll,
+		store:      newDoneStore(c.State),
 
 		verify:        len(c.Profile.Verify.Command) > 0 && c.Profile.Herdr.Verify,
 		verifyCmd:     c.Profile.Verify.Command,
@@ -213,6 +225,15 @@ func (w *watcher) run(ctx context.Context) error {
 		skip = w.own.s
 	}
 	w.sink.Log(fmt.Sprintf("herdr watcher starting (every %ds, skip %s)", int(interval/time.Second), skip))
+	// IS-4: the pending store is loaded here, not in newWatcher, so --once
+	// stays read-only. A missing file creates nothing; a malformed one is
+	// preserved aside before the watcher starts empty.
+	if err := w.store.load(); err != nil {
+		w.sink.Log("herdr pending: " + err.Error())
+		if qerr := w.store.quarantine(); qerr != nil {
+			w.sink.Log("herdr pending: " + qerr.Error())
+		}
+	}
 	first := true
 	for {
 		if ctx.Err() != nil {
@@ -241,10 +262,11 @@ func (w *watcher) once(ctx context.Context) {
 }
 
 // tick applies watch-herdr.ts's rules. own-pane rows are skipped before
-// seen is updated. blocked emits on the first observation; working→idle
-// and working→done emit only for a job pane and not on the first tick.
-// Status that did not change is quiet, even when the title did. Panes
-// that disappear are forgotten.
+// seen is updated. blocked emits on the first observation, for a registered
+// job pane or for every pane under herdr.blockedAll. A job pane's
+// working→idle/done is recorded for the quiet batch (IS-3) instead of being
+// printed. Status that did not change is quiet, even when the title did.
+// Panes that disappear are forgotten.
 func (w *watcher) tick(ctx context.Context, first bool) error {
 	jobs := w.unowned(ctx, w.jobPanes())
 	w.checkDeadPanes(ctx, jobs)
@@ -273,14 +295,26 @@ func (w *watcher) tick(ctx context.Context, first bool) error {
 		}
 		switch {
 		case status == "blocked":
+			// IS-1: a blocked line is printed for a registered job pane (a
+			// non-owned one), or for every pane under herdr.blockedAll. The
+			// own pane was skipped above; seen is already updated either way.
+			if !isJob && !w.blockedAll {
+				break
+			}
 			var from *string
 			if had {
 				from = strPtr(prev.status)
 			}
 			w.emit(e.machine, e.agent, from, status)
 		case !first && isJob && had && prev.status == "working" && (status == "idle" || status == "done"):
-			w.emitJob(ctx, e, jp, strPtr(prev.status), status)
+			// IS-3: the done is recorded for the quiet batch, not printed now.
+			w.recordDone(ctx, e, jp, strPtr(prev.status), status)
 		}
+	}
+	// IS-3: the flush runs after the snapshot loop, so a done recorded in this
+	// tick resets the window. A cancelled context never prints the batch.
+	if ctx.Err() == nil {
+		w.flushBatch()
 	}
 	for key := range w.seen {
 		if !inSnap[key] {

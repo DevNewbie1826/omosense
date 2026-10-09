@@ -9,7 +9,9 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -50,15 +52,65 @@ func herdrCtx(t *testing.T, state, cfg string, out *bytes.Buffer) *core.Ctx {
 	return c
 }
 
-// fakeClock replaces the IS-5/IS-6 clock. It returns the advance function the
-// test uses to move time forward; nothing waits on real time.
+// fakeClock replaces the IS-3/IS-5/IS-6 clock. It returns the advance function
+// the test uses to move time forward; nothing waits on real time. The clock is
+// mutex-guarded because a test may advance it while a watcher goroutine reads
+// it.
 func fakeClock(t *testing.T, start time.Time) func(time.Duration) {
 	t.Helper()
+	var mu sync.Mutex
 	clock := start
 	old := nowFn
-	nowFn = func() time.Time { return clock }
+	nowFn = func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return clock
+	}
 	t.Cleanup(func() { nowFn = old })
-	return func(d time.Duration) { clock = clock.Add(d) }
+	return func(d time.Duration) {
+		mu.Lock()
+		defer mu.Unlock()
+		clock = clock.Add(d)
+	}
+}
+
+// pendingEntries reads the persisted IS-4 store. A missing file is an empty
+// store, matching what the watcher itself sees.
+func pendingEntries(t *testing.T, state string) map[string]doneEntry {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(state, "herdr-pending.json"))
+	if os.IsNotExist(err) {
+		return map[string]doneEntry{}
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	var f pendingFile
+	if err := json.Unmarshal(b, &f); err != nil {
+		t.Fatalf("herdr-pending.json: %v (%s)", err, b)
+	}
+	return f.Entries
+}
+
+// pendingKeys is the recorded pane set, sorted, so a test can state exactly
+// which panes produced a done.
+func pendingKeys(t *testing.T, state string) []string {
+	t.Helper()
+	entries := pendingEntries(t, state)
+	out := make([]string, 0, len(entries))
+	for k := range entries {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func wantPending(t *testing.T, state string, keys ...string) {
+	t.Helper()
+	got := pendingKeys(t, state)
+	if strings.Join(got, ",") != strings.Join(keys, ",") {
+		t.Fatalf("recorded panes = %q, want %q", got, keys)
+	}
 }
 
 func paneListJSON(ids ...string) string {
@@ -146,11 +198,13 @@ func TestClosedThreadPaneSkipped(t *testing.T) {
 	if err := w.tick(context.Background(), false); err != nil {
 		t.Fatal(err)
 	}
-	wantLines(t, linesOf(&buf),
-		`HERDR {"machine":"local","pane":"p1","tab":null,"agent":null,"title":"j","cwd":null,"from":"working","to":"idle"}`,
-		`HERDR {"machine":"local","pane":"p5","tab":null,"agent":null,"title":"j","cwd":null,"from":"working","to":"idle"}`,
-	)
-	t.Log("closed entries done/closed/closed-at produced no job event; closed:null stays watched (IS-4)")
+	// IS-3: the done is recorded for the quiet batch; only the watched
+	// (non-closed) panes p1 and p5 produce a record.
+	if got := linesOf(&buf); len(got) != 0 {
+		t.Fatalf("a done printed immediately: %q", got)
+	}
+	wantPending(t, state, "local/p1", "local/p5")
+	t.Log("closed entries done/closed/closed-at produced no job record; closed:null stays watched (IS-4)")
 	t.Log("cleanup: test Cleanup removes the fake herdr dir and restores HERDR_PANE_ID, OMOSENSE_DIR, OMOSENSE_STATE")
 }
 
@@ -516,65 +570,99 @@ func verifyPane(t *testing.T, dir, state string, w *watcher) {
 }
 
 // TestHerdrVerifyAbsentNoFieldsNoHook guards the Risk row "herdr runs the hook
-// or adds fields when herdr.verify is absent" (IS-8): without the opt-in the
-// HERDR line is byte-identical to 0.1.0 and the hook never runs.
+// or adds fields when herdr.verify is absent" (IS-5): without the opt-in the
+// batch entry is byte-identical to 0.1.0 - no verify field at all - and the
+// hook never runs.
 func TestHerdrVerifyAbsentNoFieldsNoHook(t *testing.T) {
-	base := `HERDR {"machine":"local","pane":"p1","tab":null,"agent":null,"title":"j","cwd":"/work/job","from":"working","to":"idle"}`
+	const base = `{"machine":"local","pane":"p1","tab":null,"agent":null,"cwd":"/work/job","from":"working","to":"idle","at":"2026-10-05T00:00:00.000Z","first_at":"2026-10-05T00:00:00.000Z","count":1}`
+	start := time.Date(2026, 10, 5, 0, 0, 0, 0, time.UTC)
 
 	t.Run("herdr.verify absent", func(t *testing.T) {
 		dir := t.TempDir()
 		state := t.TempDir()
 		installFakeHerdr(t, dir)
 		h := newVerifyHook(t, "0")
+		alivePanes(t, dir, "p1")
+		advance := fakeClock(t, start)
 		var buf bytes.Buffer
 		w := newWatcher(herdrCtx(t, state, fmt.Sprintf(`{"verify":{"command":[%q],"timeoutSec":10}}`, h.path()), &buf), core.NewOut(&buf))
 		verifyPane(t, dir, state, w)
 		w.hooks.Wait()
-		wantLines(t, linesOf(&buf), base)
 		if env := h.env(t); env != nil {
 			t.Fatalf("the hook ran without herdr.verify: %q", env)
 		}
+		if got := pendingEntries(t, state)["local/p1"].Verify; got != "" {
+			t.Fatalf("entry verify = %q, want no verify field", got)
+		}
+		advance(5 * time.Minute)
+		if err := w.tick(context.Background(), false); err != nil {
+			t.Fatal(err)
+		}
+		wantLines(t, linesOf(&buf), `HERDR {"event":"done-batch","entries":[`+base+`]}`)
 	})
 
 	t.Run("verify.command absent", func(t *testing.T) {
 		dir := t.TempDir()
 		state := t.TempDir()
 		installFakeHerdr(t, dir)
+		alivePanes(t, dir, "p1")
+		advance := fakeClock(t, start)
 		var buf bytes.Buffer
 		w := newWatcher(herdrCtx(t, state, `{"herdr":{"verify":true}}`, &buf), core.NewOut(&buf))
 		verifyPane(t, dir, state, w)
 		w.hooks.Wait()
-		wantLines(t, linesOf(&buf), base)
+		advance(5 * time.Minute)
+		if err := w.tick(context.Background(), false); err != nil {
+			t.Fatal(err)
+		}
+		wantLines(t, linesOf(&buf), `HERDR {"event":"done-batch","entries":[`+base+`]}`)
 	})
 }
 
-// TestHerdrVerifyRunsHook guards the IS-8 happy path: with verify.command set
-// and herdr.verify true the held HERDR line carries the verdict and the hook
-// sees the transition's identity in its environment.
+// TestHerdrVerifyRunsHook guards the IS-5 happy path: with verify.command set
+// and herdr.verify true the hook sees the transition's identity in its
+// environment and its verdict lands in the batch entry instead of a separate
+// line.
 func TestHerdrVerifyRunsHook(t *testing.T) {
 	dir := t.TempDir()
 	state := t.TempDir()
 	installFakeHerdr(t, dir)
 	h := newVerifyHook(t, "0")
+	alivePanes(t, dir, "p1")
+	advance := fakeClock(t, time.Date(2026, 10, 5, 0, 0, 0, 0, time.UTC))
 	var buf bytes.Buffer
 	w := newWatcher(herdrCtx(t, state, hookCfg(h, true), &buf), core.NewOut(&buf))
 	verifyPane(t, dir, state, w)
 	w.hooks.Wait()
-	wantLines(t, linesOf(&buf),
-		`HERDR {"machine":"local","pane":"p1","tab":null,"agent":null,"title":"j","cwd":"/work/job","from":"working","to":"idle","verify":"verified"}`,
-	)
 	want := []string{"herdr", "p1", "local", "job", "/work/job"}
 	if got := h.env(t); len(got) != len(want) || strings.Join(got, "|") != strings.Join(want, "|") {
 		t.Fatalf("hook env = %q, want %q", got, want)
 	}
+	if got := pendingEntries(t, state)["local/p1"].Verify; got != "verified" {
+		t.Fatalf("entry verify = %q, want verified", got)
+	}
+	advance(5 * time.Minute)
+	if err := w.tick(context.Background(), false); err != nil {
+		t.Fatal(err)
+	}
+	wantLines(t, linesOf(&buf),
+		`HERDR {"event":"done-batch","entries":[{"machine":"local","pane":"p1","tab":null,"agent":null,"cwd":"/work/job","from":"working","to":"idle","at":"2026-10-05T00:00:00.000Z","first_at":"2026-10-05T00:00:00.000Z","count":1,"verify":"verified"}]}`,
+	)
 
 	buf.Reset()
 	h.setCode(t, "3")
 	writeFile(t, filepath.Join(h.dir, "stderr"), "boom\n")
 	verifyPane(t, dir, state, w)
 	w.hooks.Wait()
+	if got := pendingEntries(t, state)["local/p1"].VerifyDetail; got != "exit 3: boom" {
+		t.Fatalf("entry verify_detail = %q, want the hook failure", got)
+	}
+	advance(5 * time.Minute)
+	if err := w.tick(context.Background(), false); err != nil {
+		t.Fatal(err)
+	}
 	wantLines(t, linesOf(&buf),
-		`HERDR {"machine":"local","pane":"p1","tab":null,"agent":null,"title":"j","cwd":"/work/job","from":"working","to":"idle","verify":"unverified","verify_detail":"exit 3: boom"}`,
+		`HERDR {"event":"done-batch","entries":[{"machine":"local","pane":"p1","tab":null,"agent":null,"cwd":"/work/job","from":"working","to":"idle","at":"2026-10-05T00:05:00.000Z","first_at":"2026-10-05T00:05:00.000Z","count":1,"verify":"unverified","verify_detail":"exit 3: boom"}]}`,
 	)
 	t.Log("cleanup: test Cleanup removes the fake herdr dir, the hook dir and restores the environment")
 }
@@ -644,9 +732,9 @@ func TestVerifyTimeout(t *testing.T) {
 
 // TestCancelledHoldPrintsUnverified guards the Risk row "shutdown during a
 // running hook writes a verify result or delays the source's return; a
-// cancelled herdr hold loses the transition" (IS-8): the held line is not
-// printed while the hook runs, and the cancel prints it immediately as
-// unverified/cancelled instead of losing it.
+// cancelled herdr hold loses the transition" (IS-5): the transition is recorded
+// before the hook starts, so the cancel cannot lose it - the cancelled verdict
+// lands on the persisted entry and the shutdown never prints the batch.
 func TestCancelledHoldPrintsUnverified(t *testing.T) {
 	dir := t.TempDir()
 	state := t.TempDir()
@@ -668,16 +756,20 @@ func TestCancelledHoldPrintsUnverified(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got := linesOf(&buf); len(got) != 0 {
-		t.Fatalf("the held line printed before the hook finished: %q", got)
+		t.Fatalf("the transition printed before the quiet window: %q", got)
 	}
 	wait()
 	cancel()
 	w.hooks.Wait()
 	release()
-	wantLines(t, linesOf(&buf),
-		`HERDR {"machine":"local","pane":"p1","tab":null,"agent":null,"title":"j","cwd":null,"from":"working","to":"idle","verify":"unverified","verify_detail":"cancelled"}`,
-	)
-	t.Log("the held line survived the cancel with verify unverified/cancelled (IS-8)")
+	entry := pendingEntries(t, state)["local/p1"]
+	if entry.Verify != "unverified" || entry.VerifyDetail != "cancelled" {
+		t.Fatalf("cancelled entry = %+v, want unverified/cancelled", entry)
+	}
+	if got := linesOf(&buf); len(got) != 0 {
+		t.Fatalf("the shutdown printed the batch: %q", got)
+	}
+	t.Log("the recorded done survived the cancel with verify unverified/cancelled (IS-5)")
 	t.Log("cleanup: test Cleanup removes the fake herdr dir and the hook dir, closes both FIFOs and restores the environment")
 }
 
@@ -790,6 +882,9 @@ func TestRpcOwnedPaneSuppressed(t *testing.T) {
 	if got := linesOf(&buf); len(got) != 0 {
 		t.Fatalf("an rpc-owned pane was reported (job transition, silent-session or dead-pane): %q", got)
 	}
+	if got := pendingKeys(t, state); len(got) != 0 {
+		t.Fatalf("an rpc-owned pane was recorded: %q", got)
+	}
 	for _, call := range callsOf(t, dir) {
 		if strings.Contains(call, "pane") {
 			t.Fatalf("an rpc-owned pane got a herdr pane call: %q", call)
@@ -819,9 +914,12 @@ func TestRpcFallbackSocketDown(t *testing.T) {
 
 	var buf bytes.Buffer
 	ownedJob(t, dir, state, &buf, `{"rpc":{"enabled":true}}`, false)
-	wantLines(t, linesOf(&buf),
-		`HERDR {"machine":"local","pane":"p1","tab":null,"agent":null,"title":"j","cwd":null,"from":"working","to":"idle"}`,
-	)
+	// IS-3/IS-12: the fallback reports the pane as usual, which now means the
+	// done is recorded for the quiet batch.
+	if got := linesOf(&buf); len(got) != 0 {
+		t.Fatalf("a fallback done printed immediately: %q", got)
+	}
+	wantPending(t, state, "local/p1")
 	t.Log("cleanup: test Cleanup removes the fake herdr dir and the unused socket dir")
 }
 
@@ -839,9 +937,10 @@ func TestRpcFallbackSessionNotListed(t *testing.T) {
 
 	var buf bytes.Buffer
 	ownedJob(t, dir, state, &buf, `{"rpc":{"enabled":true}}`, false)
-	wantLines(t, linesOf(&buf),
-		`HERDR {"machine":"local","pane":"p1","tab":null,"agent":null,"title":"j","cwd":null,"from":"working","to":"idle"}`,
-	)
+	if got := linesOf(&buf); len(got) != 0 {
+		t.Fatalf("a fallback done printed immediately: %q", got)
+	}
+	wantPending(t, state, "local/p1")
 	if got := sock.count(); got != 2 {
 		t.Fatalf("list_sessions calls = %d, want one per tick (2)", got)
 	}

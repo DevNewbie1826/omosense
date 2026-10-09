@@ -19,11 +19,12 @@ import (
 // every 5-second tick.
 const deadInterval = time.Minute
 
-// nowFn is the clock the IS-5 and IS-6 windows read. Tests replace it, so no
-// check waits out real time.
+// nowFn is the clock the IS-5, IS-6 and IS-3 windows read. Only the tick
+// goroutine reads it; a hook never does. Tests replace it, so no check waits
+// out real time.
 var nowFn = time.Now
 
-// runVerifyFn is the done-verification runner emitJob hands every hook to.
+// runVerifyFn is the done-verification runner recordDone hands every hook to.
 // Tests replace it to observe the timeout actually delivered to the hook; in
 // production it is core.RunVerify unchanged.
 var runVerifyFn = core.RunVerify
@@ -423,31 +424,52 @@ func revisionIncreased(cur, prev json.Number) bool {
 	return cf > pf
 }
 
-// emitJob prints a job pane's working->idle/done HERDR line. With the opt-in
-// herdr.done hook (IS-8) the line is held until the hook finishes and carries
-// the verdict; on cancel the hook is killed and the line is printed
-// immediately as unverified/cancelled, so no transition is lost. The
-// goroutines are joined by run before the source returns.
-func (w *watcher) emitJob(ctx context.Context, e snapEntry, jp jobPane, from *string, to string) {
-	ev := w.event(e.machine, e.agent, from, to)
-	if !w.verify {
-		w.sink.Emit("HERDR", ev)
+// recordDone records a job pane's working->idle/done transition for the IS-3
+// quiet batch. The record is written synchronously, at the transition time, so
+// a crash between here and the flush keeps the done. With the opt-in
+// herdr.done hook (IS-5) the entry carries verify "pending" and its sequence,
+// and the hook goroutine only writes the verdict back onto that same
+// transition; on cancel it writes unverified/cancelled, so no transition is
+// lost. The goroutines are joined by run before the source returns.
+func (w *watcher) recordDone(ctx context.Context, e snapEntry, jp jobPane, from *string, to string) {
+	entry, err := w.store.record(e.key, w.event(e.machine, e.agent, from, to), nowFn(), w.verify)
+	if err != nil {
+		w.sink.Log("herdr pending: " + err.Error())
 		return
 	}
+	if !w.verify {
+		return
+	}
+	w.inflight.Add(1)
 	w.hooks.Add(1)
 	go func() {
 		defer w.hooks.Done()
+		defer w.inflight.Add(-1)
 		res := runVerifyFn(ctx, w.verifyCmd, w.verifyTimeout, verifyEnv(e, jp), deref(e.agent.cwd))
-		if res.Status == "cancelled" {
-			ev.Verify, ev.VerifyDetail = "unverified", "cancelled"
-		} else {
-			ev.Verify, ev.VerifyDetail = res.Status, res.Detail
+		status, detail := res.Status, res.Detail
+		if status == "cancelled" {
+			status, detail = "unverified", "cancelled"
 		}
-		w.sink.Emit("HERDR", ev)
+		if err := w.store.setVerify(entry.key, entry.seq, status, detail); err != nil {
+			w.sink.Log("herdr pending: " + err.Error())
+		}
 	}()
 }
 
-// verifyEnv is the IS-8 hook environment: the held transition's identity.
+// flushBatch prints the recorded burst as ONE done-batch line once the quiet
+// window has passed. A hook still in flight holds it back, so the line always
+// carries the finished verdicts; the record itself is already durable, so
+// holding costs nothing.
+func (w *watcher) flushBatch() {
+	if w.inflight.Load() != 0 {
+		return
+	}
+	if _, err := w.store.flush(w.sink, nowFn(), batchQuiet); err != nil {
+		w.sink.Log("herdr pending: " + err.Error())
+	}
+}
+
+// verifyEnv is the IS-5 hook environment: the recorded transition's identity.
 func verifyEnv(e snapEntry, jp jobPane) []string {
 	return []string{
 		"OMOSENSE_DONE_SOURCE=herdr",
