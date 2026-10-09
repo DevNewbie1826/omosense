@@ -123,6 +123,10 @@ type HerdrCfg struct {
 	// Verify is the opt-in herdr.done hook: absent (false) keeps HERDR
 	// lines byte-identical to 0.1.0.
 	Verify bool
+	// BlockedAll restores the pre-quiet blocked rule: absent (false) prints
+	// a HERDR blocked line only for registered job panes, true prints it for
+	// every pane (the own pane is always skipped).
+	BlockedAll bool
 	// AgentPattern is the dead-pane foreground match source and AgentRe
 	// its compiled form; after Load both always carry the configured or
 	// default pattern, so AgentRe is never nil.
@@ -366,6 +370,9 @@ func parseProfile(om *OMap) (Profile, error) {
 			return out, err
 		}
 		if out.Verify, err = boolKey(section, "verify", "herdr.verify"); err != nil {
+			return out, err
+		}
+		if out.BlockedAll, err = boolKey(section, "blockedAll", "herdr.blockedAll"); err != nil {
 			return out, err
 		}
 		if out.AgentPattern, err = strKey(section, "agentPattern", "herdr.agentPattern"); err != nil {
