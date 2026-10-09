@@ -126,6 +126,7 @@ The state dir holds:
 | `threads.lock` | Lock guarding `threads.json` writes. |
 | `sessions.json` | Left over from older versions. omosense no longer reads it. |
 | `memory-tidy.json` | Tidy watermark. |
+| `tidy-announced.json` | Which HEAD tidy last reported for each repo, and when. Keeps the 6 hour re-report rule across restarts. |
 | `tg-offset-<bot>` | Telegram fetch offset for that bot. |
 | `inbox/` | Downloaded Telegram attachments. |
 | `*.lock.json` | Source locks: `listen`, `remind`, `watch-google`, `watch-herdr`, `watch-rpc`, `memory-tidy`. |
@@ -200,6 +201,8 @@ omosense say telegram send '{"bot":"other_bot","chat_id":123456789,"text":"hello
 
 Telegram actions: `send`, `edit`, `draft`, `typing`, `react`, `unreact`, `topic`, `topic-edit`, `photo`, `doc`. Discord actions: `send`, `edit`, `typing`, `react`, `unreact`, `thread`, `thread-edit`, `file`.
 
+Discord `send`, `edit` and `file` also accept `content` as an alias of `text`. When both are set, `text` wins. `omosense say --help` lists each action with its JSON fields, and an unknown action's error lists the valid ones.
+
 `{"bot":"name"}` overrides the bot and is stripped before the request. With no `<platform>.bot` and no override, say exits 2.
 
 ## rpc done notifications
@@ -266,6 +269,8 @@ omosense remind
 omosense herdr [--once]
 omosense rpc [--once] [--all]
 omosense tidy [--once|--now] [--check-min m] [--quiet-min m] [flags]
+omosense tidy --write-watermark [repo=sha ...]
+omosense tidy --backup-now
 omosense stop
 omosense say <platform> <action> <json>
 omosense thread register|close <thread-id> [flags]
@@ -275,7 +280,15 @@ omosense thread register|close <thread-id> [flags]
 
 ## Memory tidy
 
-With `tidy.enabled`, the tidy source checks the memory repos every `checkMin` minutes (default 10). A repo that changed since its last tidy is reported with one `TIDY` line once its HEAD commit has been quiet for `quietMin` minutes (default 60). A repo that keeps getting commits isn't reported until it settles. The same HEAD isn't reported again within 6 hours.
+With `tidy.enabled`, the tidy source checks the memory repos every `checkMin` minutes (default 10). A repo that changed since its last tidy is reported with one `TIDY` line once its HEAD commit has been quiet for `quietMin` minutes (default 60). A repo that keeps getting commits isn't reported until it settles. The same HEAD isn't reported again within 6 hours. What was reported, and when, is kept in `tidy-announced.json`, so restarting the host within 6 hours doesn't report the same HEAD again.
+
+One `TIDY` line carries at most 10 repos. When more are ready, the tick prints further `TIDY` lines until all of them are out. If the folder had no `memory-tidy.json` when tidy started, the first report also prints one plain LOG line, outside the monitor's alert filter:
+
+```
+LOG memory-tidy no watermark yet: 23 repos reported in 3 TIDY lines; run "omosense tidy --write-watermark" to mark the current HEADs as tidied
+```
+
+`omosense tidy --write-watermark` with no arguments marks every repo's current HEAD as tidied, which sets a baseline. `omosense tidy --write-watermark repo=sha ...` sets just those repos. `omosense tidy --backup-now` runs the daily backup once and exits, with exit 1 if a backup failed.
 
 `tidy.checkMin` and `tidy.quietMin` take any number greater than 0, fractions included. A wrong type, `0` or a negative value exits 1 naming the key, for example `config.json: tidy.quietMin ...`. The `--check-min` and `--quiet-min` flags override the config, and the config overrides the defaults. The start line shows the values in effect:
 
