@@ -21,7 +21,38 @@ JSON to stdout. The folder's config.json provides the default bot
 (<platform>.bot). Pass {"bot":"name"} in the json to override the bot
 on either platform (the field is stripped and never sent to the API).
 With no configured bot and no override, say exits 2.
+
+Telegram actions (main JSON fields; bracketed fields are optional):
+  send: chat_id, text, [reply_to, parse_mode, thread_id]
+  edit: chat_id, message_id, text, [parse_mode]
+  draft: chat_id, draft_id, text, [thread_id]
+  typing: chat_id, [thread_id]
+  react: chat_id, message_id, [emoji]
+  unreact: chat_id, message_id
+  topic: chat_id, name
+  topic-edit: chat_id, name, thread_id
+  photo: chat_id, path, [caption, thread_id]
+  doc: chat_id, path, [caption, thread_id]
+
+Discord actions (main JSON fields; bracketed fields are optional):
+  send: channel_id, text, [reply_to]
+  edit: channel_id, message_id, text
+  typing: channel_id
+  react: channel_id, message_id, [emoji]
+  unreact: channel_id, message_id, [emoji]
+  thread: channel_id, name, [message_id]
+  thread-edit: thread_id, [name, archived]
+  file: channel_id, path, [text]
+
+Discord send, edit, and file accept content as an alias of text
+(text wins when both are present).
 `
+
+// tgActions and dcActions are the actions each dispatcher accepts, in the
+// order unknown-action errors print them.
+var tgActions = []string{"send", "edit", "draft", "typing", "react", "unreact", "topic", "topic-edit", "photo", "doc"}
+
+var dcActions = []string{"send", "edit", "typing", "react", "unreact", "thread", "thread-edit", "file"}
 
 // Sources returns no host sources because say is a one-shot command.
 func Sources(*core.Ctx) []core.Source {
@@ -48,7 +79,7 @@ func run(ctx *core.Ctx, stdout, stderr io.Writer) int {
 	e := &env{stdout: stdout, stderr: stderr}
 	platform, action, raw := positionals(ctx.Args)
 	if platform != "telegram" && platform != "discord" {
-		fmt.Fprintf(stderr, "unknown %s %s\n", platform, action)
+		fmt.Fprintf(stderr, "unknown %s %s (platforms: telegram, discord)\n", platform, action)
 		return 2
 	}
 	a, err := argsJSON(raw)
@@ -83,6 +114,12 @@ func botFor(ctx *core.Ctx, a *core.OMap, platform string) string {
 	}
 	a.Delete("bot")
 	return bot
+}
+
+// rejectUnknownAction writes the usage error for an action the dispatcher
+// does not accept. The caller returns exit 2.
+func rejectUnknownAction(w io.Writer, platform, action string, actions []string) {
+	fmt.Fprintf(w, "unknown %s %s (actions: %s)\n", platform, action, strings.Join(actions, ", "))
 }
 
 func positionals(argv []string) (platform, action, raw string) {

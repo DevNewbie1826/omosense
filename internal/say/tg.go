@@ -23,7 +23,7 @@ type filePart struct{ field, path string }
 func (e *env) telegram(action string, a *core.OMap, bot string) int {
 	call, known := tgCallFor(action, a)
 	if !known {
-		fmt.Fprintf(e.stderr, "unknown telegram %s\n", action)
+		rejectUnknownAction(e.stderr, "telegram", action, tgActions)
 		return 2
 	}
 	home, err := os.UserHomeDir()

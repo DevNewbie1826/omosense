@@ -10,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -187,8 +189,8 @@ func TestUnknownPlatformExits2(t *testing.T) {
 	if code != 2 {
 		t.Errorf("exit = %d, want 2", code)
 	}
-	if stderr != "unknown nope send\n" {
-		t.Errorf("stderr = %q, want \"unknown nope send\"", stderr)
+	if stderr != "unknown nope send (platforms: telegram, discord)\n" {
+		t.Errorf("stderr = %q, want \"unknown nope send (platforms: telegram, discord)\"", stderr)
 	}
 	if stdout != "" {
 		t.Errorf("stdout = %q, want empty", stdout)
@@ -201,7 +203,11 @@ func TestUnknownActionExits2(t *testing.T) {
 		if code != 2 {
 			t.Errorf("%s: exit = %d, want 2", platform, code)
 		}
-		if want := "unknown " + platform + " nope\n"; stderr != want {
+		wants := map[string]string{
+			"telegram": "unknown telegram nope (actions: send, edit, draft, typing, react, unreact, topic, topic-edit, photo, doc)\n",
+			"discord":  "unknown discord nope (actions: send, edit, typing, react, unreact, thread, thread-edit, file)\n",
+		}
+		if want := wants[platform]; stderr != want {
 			t.Errorf("%s: stderr = %q, want %q", platform, stderr, want)
 		}
 		if stdout != "" {
@@ -212,8 +218,11 @@ func TestUnknownActionExits2(t *testing.T) {
 
 func TestEmptyArgsUnknownPlatformExits2(t *testing.T) {
 	_, stderr, code := runSay(t, "telegram")
-	if code != 2 || stderr != "unknown telegram \n" {
-		t.Errorf("code=%d stderr=%q, want 2/\"unknown telegram \"", code, stderr)
+	// One positional is a known platform and an empty action, so this is the
+	// action check (after bot resolution), not the platform check.
+	want := "unknown telegram  (actions: send, edit, draft, typing, react, unreact, topic, topic-edit, photo, doc)\n"
+	if code != 2 || stderr != want {
+		t.Errorf("code=%d stderr=%q, want 2/%q", code, stderr, want)
 	}
 }
 
@@ -358,5 +367,130 @@ func TestConfigSelectsDefaultBot(t *testing.T) {
 	}
 	if code != 0 {
 		t.Errorf("exit = %d, want 0", code)
+	}
+}
+
+// TestDiscordContentAlias pins Discord's content key: send and edit copy a
+// present text key (even null) and otherwise a present content key; file
+// uses text ?? content ?? "". text wins when both are set.
+func TestDiscordContentAlias(t *testing.T) {
+	f := filepath.Join(t.TempDir(), "doc.txt")
+	if err := os.WriteFile(f, []byte("FILEDATA"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	quotedPath := strconv.Quote(f)
+	rec := &recorder{}
+	srv := httptest.NewServer(rec.handler(jsonResponder(200, `{"id":"1"}`)))
+	t.Cleanup(srv.Close)
+	t.Setenv("OMOSENSE_DISCORD_API", srv.URL)
+
+	cases := []struct {
+		name   string
+		action string
+		args   string
+		file   bool
+		want   string
+	}{
+		{"send content only", "send", `{"channel_id":"1","content":"hi"}`, false, `{"content":"hi"}`},
+		{"edit content only", "edit", `{"channel_id":"1","message_id":"2","content":"e"}`, false, `{"content":"e"}`},
+		{"file content only", "file", `{"channel_id":"1","content":"f","path":` + quotedPath + `}`, true, `{"content":"f"}`},
+		{"send text wins", "send", `{"channel_id":"1","text":"T","content":"C"}`, false, `{"content":"T"}`},
+		{"edit text wins", "edit", `{"channel_id":"1","message_id":"2","text":"T","content":"C"}`, false, `{"content":"T"}`},
+		{"file text wins", "file", `{"channel_id":"1","text":"T","content":"C","path":` + quotedPath + `}`, true, `{"content":"T"}`},
+		{"send text null is presence", "send", `{"channel_id":"1","text":null,"content":"x"}`, false, `{"content":null}`},
+		{"edit text null is presence", "edit", `{"channel_id":"1","message_id":"2","text":null,"content":"x"}`, false, `{"content":null}`},
+		{"file text null uses content", "file", `{"channel_id":"1","text":null,"content":"kept","path":` + quotedPath + `}`, true, `{"content":"kept"}`},
+		{"send neither key omits content", "send", `{"channel_id":"1"}`, false, `{}`},
+		{"file neither key is empty", "file", `{"channel_id":"1","path":` + quotedPath + `}`, true, `{"content":""}`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, stderr, code := runSay(t, "discord", c.action, c.args)
+			r := rec.last(t)
+			if c.file {
+				got := r.fields["payload_json"]
+				if len(got) != 1 {
+					t.Fatalf("payload_json = %v, want one field", got)
+				}
+				jsonEqual(t, []byte(got[0]), c.want)
+			} else {
+				jsonEqual(t, r.body, c.want)
+			}
+			if code != 0 {
+				t.Errorf("exit = %d, want 0 (stderr=%q)", code, stderr)
+			}
+		})
+	}
+}
+
+// actionInHelp reports whether Help has a line naming action as a field list.
+func actionInHelp(action string) bool {
+	prefix := action + ":"
+	for _, line := range strings.Split(Help, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestActionListsMatchDispatch pins tgActions/dcActions to the dispatch
+// switches, to Help, and to rejection of a name that is not a case.
+func TestActionListsMatchDispatch(t *testing.T) {
+	// Hand-typed from the switch cases in tgCallFor and dcCallFor, in the
+	// order the unknown-action error prints. Not derived from the slices.
+	tgProbe := []string{"send", "edit", "draft", "typing", "react", "unreact", "topic", "topic-edit", "photo", "doc"}
+	dcProbe := []string{"send", "edit", "typing", "react", "unreact", "thread", "thread-edit", "file"}
+	empty := core.NewOMap()
+
+	for _, action := range tgActions {
+		if _, ok := tgCallFor(action, empty); !ok {
+			t.Errorf("tgActions %q is rejected by tgCallFor", action)
+		}
+		if !actionInHelp(action) {
+			t.Errorf("tgActions %q does not appear in Help", action)
+		}
+	}
+	for _, action := range tgProbe {
+		if !slices.Contains(tgActions, action) {
+			t.Errorf("tgCallFor case %q is not in tgActions %v", action, tgActions)
+		}
+	}
+	if !reflect.DeepEqual(tgActions, tgProbe) {
+		t.Errorf("tgActions = %v, want %v", tgActions, tgProbe)
+	}
+
+	for _, action := range dcActions {
+		if _, ok := dcCallFor(action, empty); !ok {
+			t.Errorf("dcActions %q is rejected by dcCallFor", action)
+		}
+		if !actionInHelp(action) {
+			t.Errorf("dcActions %q does not appear in Help", action)
+		}
+	}
+	for _, action := range dcProbe {
+		if !slices.Contains(dcActions, action) {
+			t.Errorf("dcCallFor case %q is not in dcActions %v", action, dcActions)
+		}
+	}
+	if !reflect.DeepEqual(dcActions, dcProbe) {
+		t.Errorf("dcActions = %v, want %v", dcActions, dcProbe)
+	}
+
+	const bogus = "not-a-real-action"
+	if _, ok := tgCallFor(bogus, empty); ok {
+		t.Errorf("tgCallFor accepted %q", bogus)
+	}
+	if _, ok := dcCallFor(bogus, empty); ok {
+		t.Errorf("dcCallFor accepted %q", bogus)
+	}
+	if slices.Contains(tgActions, bogus) || slices.Contains(dcActions, bogus) {
+		t.Errorf("%q is listed in an action slice", bogus)
+	}
+	if strings.Contains(Help, bogus) {
+		t.Errorf("Help lists %q", bogus)
+	}
+	if strings.Contains(strings.Join(tgActions, ", "), bogus) || strings.Contains(strings.Join(dcActions, ", "), bogus) {
+		t.Errorf("printed action list contains %q", bogus)
 	}
 }
