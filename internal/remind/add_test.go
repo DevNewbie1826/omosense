@@ -138,53 +138,50 @@ func TestConcurrentAddsAllKept(t *testing.T) {
 	}
 }
 
-// TestAddDuringTickNotLost: a tick holds reminders.lock while its say send
-// runs, so an add made mid-send lands after the tick's rewrite instead of
-// being overwritten by it. The fake say blocks on a FIFO the test releases.
-// Whether the lock is held is checked with LOCK_NB, which only fixes the
-// order of the two writers - the assertion is the final file either way.
+// TestAddDuringTickNotLost: a tick sends OUTSIDE reminders.lock, so an add
+// made while a send is in flight completes at once (the lock is free, IS-1)
+// and is not overwritten by the tick's per-result record, which re-reads the
+// file before writing (IS-2). The fake say blocks on a FIFO the test releases.
 func TestAddDuringTickNotLost(t *testing.T) {
 	ctx := loadCtx(t)
-	tmp := t.TempDir()
-	inSend, release := filepath.Join(tmp, "in-send"), filepath.Join(tmp, "release")
-	for _, p := range []string{inSend, release} {
-		if err := syscall.Mkfifo(p, 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	say := filepath.Join(tmp, "say")
-	if err := os.WriteFile(say, []byte("#!/bin/sh\nprintf x > \"$IN_SEND\"\nread _ < \"$RELEASE\"\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("IN_SEND", inSend)
-	t.Setenv("RELEASE", release)
-	withHooks(t, fixedTime, say, nil)
+	dir := t.TempDir()
+	inSend := fifo(t, dir, "in-send")
+	g := newGate(t, dir, "release")
+	capture := filepath.Join(dir, "args")
+	withHooks(t, fixedTime, gatedSay(t, capture, inSend, "", g.path, `"text":"due"`), nil)
 	if err := os.MkdirAll(ctx.State, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(remindersFile(ctx), []byte(`[{"id":"due","at":"2026-10-03T10:00:00.000Z","platform":"telegram","target":{"chat_id":1},"text":"due"}]`), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(g.release)
 
 	tickDone := make(chan error, 1)
 	go func() { tickDone <- newScheduler(ctx, newChanSink()).tick(context.Background()) }()
-	if _, err := os.ReadFile(inSend); err != nil { // returns once say is mid-send
-		t.Fatal(err)
-	}
+	awaitFifo(t, inSend) // the say child is mid-send
 
+	if lockHeld(t, ctx.State) {
+		g.release()
+		t.Fatal("the tick holds reminders.lock across the send; add would wait for the network")
+	}
 	addDone := make(chan int, 1)
-	doAdd := func() {
+	go func() {
 		var out, errb bytes.Buffer
 		addDone <- add(ctx, []string{"--in", "1h", "--platform", "telegram", "--target", `{"chat_id":2}`, "--text", "new", "--id", "added"}, &out, &errb)
+	}()
+	select {
+	case code := <-addDone:
+		if code != 0 {
+			g.release()
+			t.Fatalf("add exit %d, want 0", code)
+		}
+	case <-time.After(10 * time.Second):
+		g.release()
+		t.Fatal("add did not finish while a send was in flight")
 	}
-	if lockHeld(t, ctx.State) {
-		go doAdd()
-	} else {
-		doAdd()
-	}
-	if err := os.WriteFile(release, []byte("\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	g.release() // only now may the send finish
+
 	select {
 	case err := <-tickDone:
 		if err != nil {
@@ -192,14 +189,6 @@ func TestAddDuringTickNotLost(t *testing.T) {
 		}
 	case <-time.After(30 * time.Second):
 		t.Fatal("tick did not finish")
-	}
-	select {
-	case code := <-addDone:
-		if code != 0 {
-			t.Fatalf("add exit %d", code)
-		}
-	case <-time.After(30 * time.Second):
-		t.Fatal("add did not finish")
 	}
 
 	es := entries(t, ctx)
@@ -209,6 +198,41 @@ func TestAddDuringTickNotLost(t *testing.T) {
 	}
 	if strings.Join(ids, ",") != "due,added" || !doneEntry(es[0], "sent") {
 		t.Fatalf("entries = %v (due sent=%v), want due(sent),added", ids, len(es) > 0 && doneEntry(es[0], "sent"))
+	}
+}
+
+// TestAddDuplicateIDRejected (IS-8): an --id already in the file is refused
+// with the usage and exit 2, whatever the existing entry's state, and the file
+// is left byte-identical.
+func TestAddDuplicateIDRejected(t *testing.T) {
+	cases := map[string]string{
+		"pending":  `[{"id":"dup","at":"2026-10-03T10:00:00.000Z","platform":"telegram","target":{"chat_id":1},"text":"x"}]`,
+		"terminal": `[{"id":"dup","at":"2026-10-03T10:00:00.000Z","platform":"telegram","target":{"chat_id":1},"text":"x","sent":"2026-10-03T09:00:00.000Z"}]`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			ctx := loadCtx(t)
+			withHooks(t, fixedTime, "", nil)
+			if err := os.MkdirAll(ctx.State, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(remindersFile(ctx), []byte(body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			code, out, errOut := runAdd(t, ctx, "--in", "1h", "--platform", "telegram", "--target", `{"chat_id":2}`, "--text", "y", "--id", "dup")
+			if code != 2 {
+				t.Fatalf("exit %d, want 2 (stderr %q)", code, errOut)
+			}
+			if out != "" {
+				t.Errorf("stdout = %q, want empty", out)
+			}
+			if !strings.Contains(errOut, `id "dup" already exists`) || !strings.Contains(errOut, "Usage: omosense remind add") {
+				t.Errorf("stderr = %q, want the duplicate id and the usage", errOut)
+			}
+			if got := mustRead(t, remindersFile(ctx)); string(got) != body {
+				t.Errorf("file changed:\n got %s\nwant %s", got, body)
+			}
+		})
 	}
 }
 

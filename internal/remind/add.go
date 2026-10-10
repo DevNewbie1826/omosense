@@ -22,8 +22,8 @@ const AddUsage = `Usage: omosense remind add (--at TIME | --in DURATION) --platf
 
 // add appends one pending reminder to <State>/reminders.json in the schema
 // the scheduler reads ({id, at, platform, target, text}) and prints
-// "REMIND added <entry>". A bad argument exits 2 with the usage; a failed
-// read or write exits 1.
+// "REMIND added <entry>". A bad argument, or an --id that is already in the
+// file, exits 2 with the usage; a failed read or write exits 1.
 func add(c *core.Ctx, args []string, stdout, stderr io.Writer) int {
 	r, err := parseAdd(args, hookNow())
 	if err != nil {
@@ -31,9 +31,24 @@ func add(c *core.Ctx, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprint(stderr, AddUsage)
 		return 2
 	}
-	if err := withReminders(c.State, func(arr []any) ([]any, error) {
-		return append(arr, r), nil
+	if err := withReminders(c.State, func(arr []any) ([]any, bool, error) {
+		for _, ev := range arr {
+			e, ok := ev.(*core.OMap)
+			if !ok {
+				continue
+			}
+			if fieldStr(e, "id") == fieldStr(r, "id") {
+				return nil, false, duplicateIDError{id: fieldStr(r, "id")}
+			}
+		}
+		return append(arr, r), true, nil
 	}); err != nil {
+		var dup duplicateIDError
+		if errors.As(err, &dup) {
+			fmt.Fprintln(stderr, "omosense: remind add:", err)
+			fmt.Fprint(stderr, AddUsage)
+			return 2
+		}
 		fmt.Fprintln(stderr, "omosense: remind add:", err)
 		return 1
 	}
@@ -41,6 +56,13 @@ func add(c *core.Ctx, args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "%s %s\n", line.prefix, line.text)
 	return 0
 }
+
+// duplicateIDError reports that the requested --id already exists in the file,
+// whatever the existing entry's state. It is a usage error: add prints the
+// usage and exits 2.
+type duplicateIDError struct{ id string }
+
+func (e duplicateIDError) Error() string { return fmt.Sprintf("id %q already exists", e.id) }
 
 // parseAdd validates the flags and builds the entry. --at accepts every form
 // the scheduler parses; --in is a Go duration from now. The stored at is the
@@ -109,11 +131,16 @@ func parseAdd(args []string, now time.Time) (*core.OMap, error) {
 }
 
 // withReminders runs fn on the reminder list under the exclusive
-// <state>/reminders.lock and writes the result back atomically (temp file +
-// rename). The scheduler's tick takes the same lock, so an add and a tick
-// never overwrite each other. The lock is opened per call so flock also
-// serializes goroutines (the threads.lock / rpc-pending.lock pattern).
-func withReminders(state string, fn func([]any) ([]any, error)) error {
+// <state>/reminders.lock and, when fn asks for it, writes the result back
+// atomically (temp file + rename). The scheduler's tick takes the same lock
+// briefly for its read and for each result write, and never across a send, so
+// an add and a tick never overwrite each other. The lock is opened per call so
+// flock also serializes goroutines (the threads.lock / rpc-pending.lock
+// pattern).
+//
+// fn returns write=false to change nothing: the file is left exactly as it was
+// read, and a missing file is never created.
+func withReminders(state string, fn func([]any) ([]any, bool, error)) error {
 	if err := os.MkdirAll(state, 0o755); err != nil {
 		return err
 	}
@@ -140,8 +167,8 @@ func withReminders(state string, fn func([]any) ([]any, error)) error {
 			return errors.New("reminders: expected a JSON array")
 		}
 	}
-	arr, err = fn(arr)
-	if err != nil {
+	arr, write, err := fn(arr)
+	if err != nil || !write {
 		return err
 	}
 	out, err := marshalIndent2Array(arr)
