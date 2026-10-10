@@ -18,8 +18,11 @@ stdout.
 
 A blocked line is printed only for registered job panes. Set
 herdr.blockedAll to true (default false) to print one for every pane
-except omosense's own pane. A job pane's working to idle/done goes into
-one done-batch line, printed once 5 quiet minutes pass with no new done.
+except omosense's own pane. A pane that re-enters blocked within
+herdr.blockedCooldownSec seconds (default 60, 0 = off) of its last
+printed blocked line prints nothing until the window has passed. A job
+pane's working to idle/done goes into one done-batch line, printed once
+5 quiet minutes pass with no new done.
 
 Flags:
   --once    read-only single snapshot: prints SNAP lines, no lock

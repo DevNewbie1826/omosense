@@ -12,10 +12,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 )
 
 // Profile is the resolved flat config.json of the folder omosense runs in.
@@ -127,6 +129,11 @@ type HerdrCfg struct {
 	// a HERDR blocked line only for registered job panes, true prints it for
 	// every pane (the own pane is always skipped).
 	BlockedAll bool
+	// BlockedCooldownSec caps how often one pane may re-wake the agent:
+	// after an emitted blocked line, a re-entry into blocked inside this many
+	// seconds prints nothing. Nil (absent or null) means the default, 0 turns
+	// the cooldown off (every re-entry prints, the pre-os7 behavior).
+	BlockedCooldownSec *int
 	// AgentPattern is the dead-pane foreground match source and AgentRe
 	// its compiled form; after Load both always carry the configured or
 	// default pattern, so AgentRe is never nil.
@@ -134,8 +141,26 @@ type HerdrCfg struct {
 	AgentRe      *regexp.Regexp
 }
 
+// DefaultBlockedCooldownSec is the herdr blocked-re-emission window used
+// when herdr.blockedCooldownSec is absent or null.
+const DefaultBlockedCooldownSec = 60
+
+// maxBlockedCooldownSec is the largest second count that fits in a
+// time.Duration. A larger value overflows the nanosecond multiply and
+// BlockedCooldown wraps negative, which turns the cooldown off.
+const maxBlockedCooldownSec = math.MaxInt64 / int64(time.Second)
+
 // On reports whether the herdr source runs: absent means yes.
 func (h HerdrCfg) On() bool { return h.Enabled == nil || *h.Enabled }
+
+// BlockedCooldown is the blocked re-emission window: the default when the
+// key is absent or null, otherwise the configured seconds (0 = off).
+func (h HerdrCfg) BlockedCooldown() time.Duration {
+	if h.BlockedCooldownSec == nil {
+		return DefaultBlockedCooldownSec * time.Second
+	}
+	return time.Duration(*h.BlockedCooldownSec) * time.Second
+}
 
 // Cfg is the parsed config.json: the raw document kept in order. parseCfg
 // rejects profiles-shaped and legacy documents, so a loaded Cfg is always
@@ -375,6 +400,13 @@ func parseProfile(om *OMap) (Profile, error) {
 		if out.BlockedAll, err = boolKey(section, "blockedAll", "herdr.blockedAll"); err != nil {
 			return out, err
 		}
+		if out.BlockedCooldownSec, err = nonNegIntKey(section, "blockedCooldownSec", "herdr.blockedCooldownSec"); err != nil {
+			return out, err
+		}
+		// Seconds above maxBlockedCooldownSec overflow time.Duration and BlockedCooldown wraps negative.
+		if out.BlockedCooldownSec != nil && int64(*out.BlockedCooldownSec) > maxBlockedCooldownSec {
+			return out, fmt.Errorf("config.json: herdr.blockedCooldownSec must be a non-negative integer of at most %d", maxBlockedCooldownSec)
+		}
 		if out.AgentPattern, err = strKey(section, "agentPattern", "herdr.agentPattern"); err != nil {
 			return out, err
 		}
@@ -613,6 +645,27 @@ func posIntKey(m *OMap, key, path string) (int64, error) {
 		return 0, fmt.Errorf("config.json: %s must be a positive integer", path)
 	}
 	return i, nil
+}
+
+// nonNegIntKey reads a non-negative integer key: a JSON number that is an
+// integer of at least zero, so 0 is a real value ("off"), unlike posIntKey.
+// Absent and null return nil so the caller can tell "not set" (the default)
+// from an explicit 0.
+func nonNegIntKey(m *OMap, key, path string) (*int, error) {
+	v, ok := m.Get(key)
+	if !ok || v == nil {
+		return nil, nil
+	}
+	n, isNum := v.(json.Number)
+	if !isNum {
+		return nil, fmt.Errorf("config.json: %s must be a non-negative integer", path)
+	}
+	i, err := n.Int64()
+	if err != nil || i < 0 {
+		return nil, fmt.Errorf("config.json: %s must be a non-negative integer", path)
+	}
+	out := int(i)
+	return &out, nil
 }
 
 // posNumberKey reads a positive number key: a JSON number greater than

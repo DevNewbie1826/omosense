@@ -72,7 +72,7 @@ Newer optional keys, shown with example values:
 {
   "verify":        { "command": ["/path/to/check-done.sh"], "timeoutSec": 60 },
   "rpc":           { "enabled": true, "verify": true, "labels": { "task": "task", "ack": "ack" } },
-  "herdr":         { "verify": false, "blockedAll": false, "agentPattern": "senpi|omo|claude|codex|opencode|(^|/)pi( |$)" },
+  "herdr":         { "verify": false, "blockedAll": false, "blockedCooldownSec": 60, "agentPattern": "senpi|omo|claude|codex|opencode|(^|/)pi( |$)" },
   "silentMinutes": 30,
   "transcriber":   ["whisper-cli", "{audio}"],
   "guard":         { "stateFileBytes": 16777216 }
@@ -97,6 +97,7 @@ Newer optional keys, shown with example values:
 | `rpc.labels` | Overrides for the rpc batch labels. See [rpc done notifications](#rpc-done-notifications). |
 | `herdr.verify` | Run the hook for each herdr working to idle/done that goes into a done batch. Default `false`. |
 | `herdr.blockedAll` | Print a `blocked` line for every pane (except omosense's own pane), not just registered job panes. Default `false`. A non-boolean fails config load. |
+| `herdr.blockedCooldownSec` | After a pane prints `blocked`, it won't print `blocked` again for this many seconds. Absent or `null` means the default, `60`. `0` turns the cooldown off. Any other value must be an integer from 0 through 9223372036, or config load fails. |
 | `herdr.agentPattern` | Go regular expression a pane's foreground command line must match to count as alive. Default `senpi\|omo\|claude\|codex\|opencode\|(^\|/)pi( \|$)`. An invalid pattern fails config load. |
 | `silentMinutes` | Minutes a working session may go without change before `silent-session`. Default `30`. |
 | `transcriber` | Voice transcriber argv. Every `{audio}` is replaced by the audio file path, or the path is appended when no element has `{audio}`. Its trimmed stdout is the transcript. Unset means the built-in ffmpeg and mlx_whisper pipeline. A failure shows up as `transcribe_error` text starting with `transcriber:`. |
@@ -196,6 +197,12 @@ When an active entry has both a session and a pane, and rpc is enabled and its s
 ### herdr lines
 
 A `blocked` line prints right away, on the first time herdr sees the pane blocked too. By default it only prints for registered job panes: an active `threads.json` entry that rpc doesn't own. Set `herdr.blockedAll: true` to get `blocked` for every pane again, except omosense's own.
+
+A pane that printed `blocked` won't print it again for `herdr.blockedCooldownSec` seconds (default 60). The window counts from the last `blocked` that printed, even if the pane left `blocked` and came back. A `blocked` inside the window is dropped, not printed later, and it doesn't restart the window. A pane that stays blocked never repeats the line anyway. The rule covers every printed `blocked`, `herdr.blockedAll` panes included. Each machine and pane has its own window. When a pane drops out of herdr's agent list (it closed, or its machine is failing or backing off), its cooldown is forgotten. The cooldown lives in memory, so a restart can print one more `blocked`.
+
+herdr checks every 5 seconds, so the window is compared between the ticks that see the lines.
+
+Before this setting, every return to `blocked` printed. The default of 60 changes that. Set `herdr.blockedCooldownSec: 0` to keep the old behavior.
 
 A job pane going from `working` to `idle` or `done` doesn't print a line of its own. It's recorded in `herdr-pending.json`, and once 5 minutes pass with no newer completion, all recorded panes come out as one line:
 

@@ -173,6 +173,13 @@ type watcher struct {
 	// instead of only for registered job panes.
 	blockedAll bool
 
+	// os7: after an emitted blocked, a re-entry into blocked inside this
+	// window prints nothing (herdr.blockedCooldownSec, default 60s, 0 = off).
+	// blockedAt is the clock: the time of the last EMITTED blocked per key,
+	// memory only, so a restart starts cold.
+	blockedCooldown time.Duration
+	blockedAt       map[string]time.Time
+
 	// IS-3/4: the quiet done batch and its persisted store.
 	store    *doneStore
 	inflight atomic.Int32
@@ -206,6 +213,9 @@ func newWatcher(c *core.Ctx, sink core.Sink) *watcher {
 
 		blockedAll: c.Profile.Herdr.BlockedAll,
 		store:      newDoneStore(c.State),
+
+		blockedCooldown: c.Profile.Herdr.BlockedCooldown(),
+		blockedAt:       map[string]time.Time{},
 
 		verify:        len(c.Profile.Verify.Command) > 0 && c.Profile.Herdr.Verify,
 		verifyCmd:     c.Profile.Verify.Command,
@@ -325,11 +335,21 @@ func (w *watcher) tick(ctx context.Context, first bool) error {
 			if !isJob && !w.blockedAll {
 				break
 			}
+			// os7: a re-entry into blocked inside the cooldown window prints
+			// nothing. The window is measured from the last EMITTED blocked,
+			// so a suppressed blocked does not extend it; elapsed >= window
+			// emits. blockedAt is only written on an emit.
+			if w.blockedCooldown > 0 {
+				if at, ok := w.blockedAt[e.key]; ok && nowFn().Sub(at) < w.blockedCooldown {
+					break
+				}
+			}
 			var from *string
 			if had {
 				from = strPtr(prev.status)
 			}
 			w.emit(e.machine, e.agent, from, status)
+			w.blockedAt[e.key] = nowFn()
 		case !first && isJob && had && prev.status == "working" && (status == "idle" || status == "done"):
 			// IS-3: the done is recorded for the quiet batch, not printed now.
 			w.recordDone(ctx, e, jp, strPtr(prev.status), status)
@@ -343,6 +363,13 @@ func (w *watcher) tick(ctx context.Context, first bool) error {
 	for key := range w.seen {
 		if !inSnap[key] {
 			delete(w.seen, key)
+		}
+	}
+	// os7: a pane that left the snapshot loses its cooldown, so its return
+	// is a first blocked. The same disappearance rule as seen.
+	for key := range w.blockedAt {
+		if !inSnap[key] {
+			delete(w.blockedAt, key)
 		}
 	}
 	w.silent = silent
