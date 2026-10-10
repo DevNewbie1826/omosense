@@ -174,7 +174,7 @@ type watcher struct {
 	blockedAll bool
 
 	// os7: after an emitted blocked, a re-entry into blocked inside this
-	// window prints nothing (herdr.blockedCooldownSec, default 60s, 0 = off).
+	// window prints nothing (herdr.blockedCooldownSec, default 0 = off).
 	// blockedAt is the clock: the time of the last EMITTED blocked per key,
 	// memory only, so a restart starts cold.
 	blockedCooldown time.Duration

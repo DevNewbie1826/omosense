@@ -13,7 +13,7 @@ import (
 )
 
 // The os7 blocked re-emission cooldown (herdr.blockedCooldownSec, default
-// 60s, 0 = off): after an emitted blocked line, a re-entry into blocked
+// 0 = off; these fixtures turn it on at 60s): after an emitted blocked line, a re-entry into blocked
 // inside the window prints nothing; the window is measured from the last
 // EMITTED line, never extended by a suppressed one; keys are machine/pane
 // and a pane that leaves the snapshot loses its cooldown. Every test
@@ -43,7 +43,10 @@ func cooldownFixture(t *testing.T, threads string) (*watcher, *bytes.Buffer, str
 		writeFile(t, filepath.Join(state, "threads.json"), threads)
 	}
 	var buf bytes.Buffer
-	return newWatcher(testCtx(state, "main", &buf), core.NewOut(&buf)), &buf, dir
+	c := testCtx(state, "main", &buf)
+	sixty := 60
+	c.Profile.Herdr.BlockedCooldownSec = &sixty
+	return newWatcher(c, core.NewOut(&buf)), &buf, dir
 }
 
 // tickW advances the fake clock by step, swaps local.out and runs one tick.
@@ -243,6 +246,8 @@ func TestBlockedAllPaneFollowsCooldown(t *testing.T) {
 	var buf bytes.Buffer
 	c := testCtx(state, "main", &buf)
 	c.Profile.Herdr.BlockedAll = true
+	sixty := 60
+	c.Profile.Herdr.BlockedCooldownSec = &sixty
 	w := newWatcher(c, core.NewOut(&buf))
 	advance := fakeClock(t, time.Date(2026, 10, 5, 0, 0, 0, 0, time.UTC))
 
@@ -262,4 +267,32 @@ func TestBlockedAllPaneFollowsCooldown(t *testing.T) {
 	buf.Reset()
 	tickW(t, w, advance, 5*time.Second, false, dir, agents(ag("u1", "blocked", "")))
 	wantLines(t, linesOf(&buf), blockedLine("local", "u1", "working"))
+}
+
+// TestBlockedCooldownDefaultOff guards the default: with
+// herdr.blockedCooldownSec unset the cooldown is off, so a re-entry into
+// blocked 5s after the last line prints (the 0.2.0 behavior).
+func TestBlockedCooldownDefaultOff(t *testing.T) {
+	dir := t.TempDir()
+	state := t.TempDir()
+	installFakeHerdr(t, dir)
+	writeFile(t, filepath.Join(dir, "machines.out"), "[]\n")
+	writeFile(t, filepath.Join(state, "threads.json"), `{"job":{"pane":"p1"}}`)
+	var buf bytes.Buffer
+	c := testCtx(state, "main", &buf)
+	if c.Profile.Herdr.BlockedCooldownSec != nil {
+		t.Fatalf("fixture sets blockedCooldownSec = %d, want unset", *c.Profile.Herdr.BlockedCooldownSec)
+	}
+	w := newWatcher(c, core.NewOut(&buf))
+	advance := fakeClock(t, time.Date(2026, 10, 5, 0, 0, 0, 0, time.UTC))
+
+	tickW(t, w, advance, 0, true, dir, agents(ag("p1", "blocked", "")))
+	wantLines(t, linesOf(&buf), blockedLine("local", "p1", ""))
+	for i := 0; i < 3; i++ {
+		buf.Reset()
+		tickW(t, w, advance, 5*time.Second, false, dir, agents(ag("p1", "working", "")))
+		buf.Reset()
+		tickW(t, w, advance, 5*time.Second, false, dir, agents(ag("p1", "blocked", "")))
+		wantLines(t, linesOf(&buf), blockedLine("local", "p1", "working"))
+	}
 }
