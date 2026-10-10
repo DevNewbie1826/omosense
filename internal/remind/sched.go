@@ -71,9 +71,9 @@ func reminderFile(c *core.Ctx) string {
 // file is rewritten with marshalIndent2Array only when n > 0, where n is
 // the number of entries marked.
 //
-// CancelPending does not take any lock. The caller owns the remind lock
-// and must hold it across the call so a scheduler tick cannot race the
-// rewrite.
+// CancelPending does not take any lock. The caller owns reminders.lock and
+// must hold it across the call so a scheduler tick's record (or an add)
+// cannot race the rewrite.
 func CancelPending(c *core.Ctx, now time.Time) (int, error) {
 	b, err := os.ReadFile(reminderFile(c))
 	if os.IsNotExist(err) {
@@ -139,45 +139,127 @@ func (s *scheduler) run(ctx context.Context) error {
 // cancelled are terminal); due entries send through the say executable;
 // the file is rewritten in the bun indent layout only when an entry changed.
 //
-// The whole read-send-write runs under <state>/reminders.lock so a
-// concurrent `remind add` is never overwritten by this tick's rewrite.
+// The read and every write take <state>/reminders.lock briefly, never across
+// a send: phase 1 selects the due entries under the lock and releases it,
+// every send then runs unlocked, and each result is recorded by a second
+// short lock that re-reads the file before writing it back atomically. A
+// concurrent `remind add` therefore waits for a read or a write, never for
+// the network.
 func (s *scheduler) tick(ctx context.Context) error {
 	if _, err := os.Stat(s.file); os.IsNotExist(err) {
 		return nil
 	}
-	unlock, err := lockReminders(filepath.Dir(s.file))
+	arr, plan, err := s.planDue()
 	if err != nil {
 		return err
+	}
+	for _, it := range plan {
+		if ctx.Err() != nil {
+			break
+		}
+		sel, ok := arr[it.index].(*core.OMap)
+		if !ok {
+			return fmt.Errorf("reminders: entry is not a JSON object")
+		}
+		var o outcome
+		if it.skip {
+			o = outcome{verb: "skipped-late", apply: func(r *core.OMap) {
+				r.Set("skipped", core.ISO(hookNow()))
+			}}
+		} else {
+			code, out, errOut, err := s.sendViaSay(ctx, sel)
+			if ctx.Err() != nil {
+				break // cancelled mid-send: record nothing, start nothing more
+			}
+			if err != nil {
+				return err
+			}
+			if code != 0 {
+				// Keep the TS LOG line (remind.ts:24) so existing LOG
+				// handling still sees send failures.
+				s.sink.Log(fmt.Sprintf("remind send failed %s: %s", fieldStr(sel, "id"), core.Trunc(errOut, 200)))
+				msg := core.Trunc(strings.TrimSpace(out+errOut), 200)
+				o = outcome{verb: "failed", apply: func(r *core.OMap) {
+					r.Set("failed", core.ISO(hookNow()))
+					r.Set("error", msg)
+				}}
+			} else {
+				o = outcome{verb: "sent", apply: func(r *core.OMap) {
+					r.Set("sent", core.ISO(hookNow()))
+				}}
+			}
+		}
+		line, recorded, recErr := s.record(arr, it, o)
+		// The REMIND line prints only once the state write is durable, so an
+		// observer that saw a line can rely on the entry it names; when the
+		// write fails the line still prints (the send happened) and the error
+		// follows as "LOG remind <err>".
+		if line.prefix != "" {
+			s.sink.Raw(line.prefix, line.text)
+		}
+		if recErr != nil {
+			return recErr
+		}
+		if !recorded {
+			s.sink.Log(fmt.Sprintf("remind %s changed or removed during send; not recorded", entryID(sel)))
+		}
+	}
+	return nil
+}
+
+// plannedSend is one pending entry selected in phase 1: where it sits in the
+// list read under the lock and the compact JSON it had at that moment.
+type plannedSend struct {
+	index    int
+	snapshot string
+	skip     bool // more than maxLateDelivery past due: record skipped, never send
+}
+
+// outcome is the state a finished item records, plus how to set it.
+type outcome struct {
+	verb  string
+	apply func(*core.OMap)
+}
+
+// planDue takes the short read lock, reads the reminder list and returns it
+// with the entries to act on, in file order. A future entry is left alone
+// (still pending, not due yet); an entry more than maxLateDelivery past due is
+// planned as a skip, so it is recorded skipped-late and never sent. Nothing is
+// written, so the lock is held only for the read.
+func (s *scheduler) planDue() ([]any, []plannedSend, error) {
+	unlock, err := lockReminders(filepath.Dir(s.file))
+	if err != nil {
+		return nil, nil, err
 	}
 	defer unlock()
 	b, err := os.ReadFile(s.file)
 	if os.IsNotExist(err) {
-		return nil
+		return nil, nil, nil
 	}
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 	v, err := core.ParseJSON(b)
 	if err != nil {
-		return fmt.Errorf("parse reminders: %w", err)
+		return nil, nil, fmt.Errorf("parse reminders: %w", err)
 	}
 	arr, ok := v.([]any)
 	if !ok {
-		return fmt.Errorf("reminders: expected a JSON array")
+		return nil, nil, fmt.Errorf("reminders: expected a JSON array")
 	}
 	now := hookNow()
-	changed := false
-	var pending []pendingLine
-	for _, ev := range arr {
-		if ctx.Err() != nil {
-			break
-		}
+	var plan []plannedSend
+	for i, ev := range arr {
 		r, ok := ev.(*core.OMap)
 		if !ok {
-			return fmt.Errorf("reminders: entry is not a JSON object")
+			return nil, nil, fmt.Errorf("reminders: entry is not a JSON object")
 		}
 		if !pendingEntry(r) {
 			continue
+		}
+		snap, err := r.Marshal()
+		if err != nil {
+			return nil, nil, err
 		}
 		due, parsed := jsDateParse(fieldStr(r, "at"))
 		if parsed {
@@ -185,53 +267,76 @@ func (s *scheduler) tick(ctx context.Context) error {
 				continue // not due yet: wait
 			}
 			if now.Sub(due) > maxLateDelivery {
-				r.Set("skipped", core.ISO(hookNow()))
-				changed = true
-				pending = append(pending, entryLine("skipped-late", r))
+				plan = append(plan, plannedSend{index: i, snapshot: string(snap), skip: true})
 				continue
 			}
 		}
 		// An unparsed at is Date.parse NaN: remind.ts's two comparisons
 		// are both false on NaN, so the entry sends immediately.
-		code, out, errOut, err := s.sendViaSay(ctx, r)
-		if ctx.Err() != nil {
-			break
-		}
-		if err != nil {
-			return err
-		}
-		if code != 0 {
-			// Keep the TS LOG line (remind.ts:24) so existing LOG
-			// handling still sees send failures.
-			s.sink.Log(fmt.Sprintf("remind send failed %s: %s", fieldStr(r, "id"), core.Trunc(errOut, 200)))
-			r.Set("failed", core.ISO(hookNow()))
-			r.Set("error", core.Trunc(strings.TrimSpace(out+errOut), 200))
-			changed = true
-			pending = append(pending, entryLine("failed", r))
-			continue
-		}
-		r.Set("sent", core.ISO(hookNow()))
-		changed = true
-		pending = append(pending, entryLine("sent", r))
+		plan = append(plan, plannedSend{index: i, snapshot: string(snap)})
 	}
-	if !changed {
-		return nil
-	}
-	out, err := marshalIndent2Array(arr)
-	if err == nil {
-		err = os.WriteFile(s.file, out, 0o644)
-	}
-	// The REMIND lines print only once the state write is durable, so an
-	// observer that saw a line can rely on the entry it names; when the
-	// write fails the lines still print (the send happened) and the error
-	// follows as "LOG remind <err>".
-	for _, p := range pending {
-		if p.prefix == "" { // entryLine failed to marshal; never emit junk
-			continue
+	return arr, plan, nil
+}
+
+// record writes one outcome back for the entry selected as it, and reports
+// whether that entry was found.
+//
+// It takes the short write lock, re-reads the file - so an `add` that landed
+// while the send was in flight is never overwritten - and matches the FIRST
+// pending entry whose compact JSON equals the phase-1 snapshot. Matching on
+// content is deliberately stricter than matching on the id: an entry edited or
+// removed meanwhile is left alone and the caller reports it. Nothing is
+// written when nothing matched, and a missing file is never created. The
+// rendered line still comes back when the write failed, because the send
+// already happened.
+func (s *scheduler) record(stale []any, it plannedSend, o outcome) (pendingLine, bool, error) {
+	var line pendingLine
+	recorded := false
+	err := withReminders(s.c.State, func(arr []any) ([]any, bool, error) {
+		for _, ev := range arr {
+			r, ok := ev.(*core.OMap)
+			if !ok {
+				return nil, false, fmt.Errorf("reminders: entry is not a JSON object")
+			}
+			if !pendingEntry(r) {
+				continue
+			}
+			b, err := r.Marshal()
+			if err != nil {
+				return nil, false, err
+			}
+			if string(b) != it.snapshot {
+				continue
+			}
+			o.apply(r)
+			line = entryLine(o.verb, r)
+			recorded = true
+			return arr, true, nil
 		}
-		s.sink.Raw(p.prefix, p.text)
+		return arr, false, nil
+	})
+	if err != nil && !recorded {
+		// The re-read or the write failed: the send already happened, so the
+		// line still prints, rendered from the entry as it was selected.
+		if sel, ok := stale[it.index].(*core.OMap); ok {
+			line = applyLine(sel, o)
+		}
 	}
-	return err
+	return line, recorded, err
+}
+
+// applyLine applies o to e and renders its REMIND grammar line.
+func applyLine(e *core.OMap, o outcome) pendingLine {
+	o.apply(e)
+	return entryLine(o.verb, e)
+}
+
+// entryID is the entry's id, or "(no id)" for a legacy entry without one.
+func entryID(r *core.OMap) string {
+	if id := fieldStr(r, "id"); id != "" {
+		return id
+	}
+	return "(no id)"
 }
 
 // pendingLine is one buffered grammar line, flushed after the state

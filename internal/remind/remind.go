@@ -3,6 +3,10 @@
 // prints REMIND and LOG lines. sent, skipped, failed and cancelled are
 // terminal. A failed send records failed and error and is never retried
 // (plan IS-8), fixing remind.ts, which retried failed sends on every tick.
+//
+// Each tick selects the due entries under a short reminders.lock and sends
+// them outside it, recording every result under a second short lock, so
+// `remind add` never waits for an in-flight send.
 package remind
 
 import (

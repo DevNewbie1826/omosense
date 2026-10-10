@@ -31,8 +31,8 @@ func add(c *core.Ctx, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprint(stderr, AddUsage)
 		return 2
 	}
-	if err := withReminders(c.State, func(arr []any) ([]any, error) {
-		return append(arr, r), nil
+	if err := withReminders(c.State, func(arr []any) ([]any, bool, error) {
+		return append(arr, r), true, nil
 	}); err != nil {
 		fmt.Fprintln(stderr, "omosense: remind add:", err)
 		return 1
@@ -109,11 +109,16 @@ func parseAdd(args []string, now time.Time) (*core.OMap, error) {
 }
 
 // withReminders runs fn on the reminder list under the exclusive
-// <state>/reminders.lock and writes the result back atomically (temp file +
-// rename). The scheduler's tick takes the same lock, so an add and a tick
-// never overwrite each other. The lock is opened per call so flock also
-// serializes goroutines (the threads.lock / rpc-pending.lock pattern).
-func withReminders(state string, fn func([]any) ([]any, error)) error {
+// <state>/reminders.lock and, when fn asks for it, writes the result back
+// atomically (temp file + rename). The scheduler's tick takes the same lock
+// briefly for its read and for each result write, and never across a send, so
+// an add and a tick never overwrite each other. The lock is opened per call so
+// flock also serializes goroutines (the threads.lock / rpc-pending.lock
+// pattern).
+//
+// fn returns write=false to change nothing: the file is left exactly as it was
+// read, and a missing file is never created.
+func withReminders(state string, fn func([]any) ([]any, bool, error)) error {
 	if err := os.MkdirAll(state, 0o755); err != nil {
 		return err
 	}
@@ -140,8 +145,8 @@ func withReminders(state string, fn func([]any) ([]any, error)) error {
 			return errors.New("reminders: expected a JSON array")
 		}
 	}
-	arr, err = fn(arr)
-	if err != nil {
+	arr, write, err := fn(arr)
+	if err != nil || !write {
 		return err
 	}
 	out, err := marshalIndent2Array(arr)
