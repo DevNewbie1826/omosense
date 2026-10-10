@@ -22,6 +22,18 @@ import (
 // interval is watch-herdr.ts's Bun.sleep(5_000).
 const interval = 5 * time.Second
 
+// maxRemoteBackoff caps the retry delay of a remote machine whose agent list
+// keeps failing: 10s, 20s, 40s ... up to five minutes, back to every tick on
+// the first success.
+const maxRemoteBackoff = 5 * time.Minute
+
+// remoteFail is a remote machine's consecutive agent-list failures and the
+// earliest time it is asked again.
+type remoteFail struct {
+	fails int
+	next  time.Time
+}
+
 // sleepFn is replaced by tests so a tick loop can be stopped without
 // waiting out the interval. Production calls sleepCtx.
 var sleepFn = sleepCtx
@@ -140,6 +152,9 @@ type watcher struct {
 	errs  map[string]string
 	sleep func(context.Context, time.Duration) error
 
+	// remote holds the backoff of each remote machine that is failing.
+	remote map[string]*remoteFail
+
 	// IS-5: the 60-second dead-pane check, its pattern, and the panes already
 	// reported dead.
 	pattern  string
@@ -171,12 +186,13 @@ type watcher struct {
 
 func newWatcher(c *core.Ctx, sink core.Sink) *watcher {
 	w := &watcher{
-		state: c.State,
-		sink:  sink,
-		own:   ownPane(),
-		seen:  map[string]seenRec{},
-		errs:  map[string]string{},
-		sleep: sleepFn,
+		state:  c.State,
+		sink:   sink,
+		own:    ownPane(),
+		seen:   map[string]seenRec{},
+		errs:   map[string]string{},
+		sleep:  sleepFn,
+		remote: map[string]*remoteFail{},
 
 		pattern:  c.Profile.Herdr.AgentPattern,
 		agentRe:  c.Profile.Herdr.AgentRe,
@@ -361,6 +377,9 @@ func (w *watcher) snapshot(ctx context.Context) []snapEntry {
 		if ctx.Err() != nil {
 			break
 		}
+		if r := w.remote[t.machine]; r != nil && nowFn().Before(r.next) {
+			continue
+		}
 		w.collect(ctx, t, &out, index)
 	}
 	return out
@@ -376,18 +395,18 @@ func (w *watcher) collect(ctx context.Context, t target, out *[]snapEntry, index
 		if ctx.Err() != nil {
 			return
 		}
-		w.noteError(t.machine, err)
+		w.targetFailed(t.machine, err)
 		return
 	}
 	agents, err := resultAgents(v)
 	if err != nil {
-		w.noteError(t.machine, err)
+		w.targetFailed(t.machine, err)
 		return
 	}
 	for _, raw := range agents {
 		m, ok := raw.(*core.OMap)
 		if !ok {
-			w.noteError(t.machine, errors.New("TypeError: agent is not an object"))
+			w.targetFailed(t.machine, errors.New("TypeError: agent is not an object"))
 			return
 		}
 		a := parseAgent(m)
@@ -401,6 +420,32 @@ func (w *watcher) collect(ctx context.Context, t target, out *[]snapEntry, index
 		}
 	}
 	delete(w.errs, t.machine)
+	if w.remote[t.machine] != nil {
+		delete(w.remote, t.machine)
+		w.sink.Log("herdr " + t.machine + " recovered")
+	}
+}
+
+// targetFailed records a failed agent list. local keeps the per-message rule
+// and is asked every tick. A remote machine logs only its first failure, then
+// is asked again after a doubling delay until a success clears it.
+func (w *watcher) targetFailed(machine string, err error) {
+	if machine == "local" {
+		w.noteError(machine, err)
+		return
+	}
+	r := w.remote[machine]
+	if r == nil {
+		r = &remoteFail{}
+		w.remote[machine] = r
+		w.noteError(machine, err)
+	}
+	r.fails++
+	delay := maxRemoteBackoff
+	if r.fails < 7 {
+		delay = min(interval<<r.fails, maxRemoteBackoff)
+	}
+	r.next = nowFn().Add(delay)
 }
 
 func (w *watcher) noteError(machine string, err error) {
