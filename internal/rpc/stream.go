@@ -201,7 +201,8 @@ func (w *watcher) applyStream(ctx context.Context, item streamItem) {
 	case item.err != nil:
 		w.streamUp = false
 		msg := item.err.Error()
-		if !w.streamErrors[msg] {
+		// A missing socket is normal before the first connect: not logged.
+		if !w.streamErrors[msg] && !noSocket(item.err) {
 			w.streamErrors[msg] = true
 			w.sink.Log("rpc stream " + msg)
 		}

@@ -637,8 +637,9 @@ func TestErrorsAndRecovery(t *testing.T) {
 	}
 	w.tick(context.Background())
 	w.tick(context.Background())
-	if strings.Count(b.String(), "LOG rpc ") != 1 {
-		t.Fatalf("missing socket dedupe: %s", b.String())
+	// A missing socket is the normal state before the first connect: no LOG.
+	if strings.Count(b.String(), "LOG rpc ") != 0 {
+		t.Fatalf("missing socket logged: %s", b.String())
 	}
 	serveRPC(t, path, []scriptTick{
 		{sessions: []map[string]any{session("rpc-1", "d")}, states: map[string]any{"rpc-1": state("working", 0)}},
