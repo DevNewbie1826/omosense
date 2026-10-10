@@ -55,7 +55,14 @@ type RPCCfg struct {
 	// Labels holds the configured rpc.labels overrides; Label resolves a
 	// key against them and the defaults.
 	Labels map[string]string
+	// BlockedCooldownSec is rpc.blockedCooldownSec: after an emitted RPC
+	// blocked line, a re-entry into blocked inside this many seconds prints
+	// nothing. Nil (absent or null) and 0 both mean off.
+	BlockedCooldownSec *int
 }
+
+// BlockedCooldown is the rpc blocked re-emission window (0 = off).
+func (r RPCCfg) BlockedCooldown() time.Duration { return cooldown(r.BlockedCooldownSec) }
 
 // VerifyOn reports whether the rpc done-verification hook runs.
 func (r RPCCfg) VerifyOn() bool { return r.Verify == nil || *r.Verify }
@@ -131,8 +138,8 @@ type HerdrCfg struct {
 	BlockedAll bool
 	// BlockedCooldownSec caps how often one pane may re-wake the agent:
 	// after an emitted blocked line, a re-entry into blocked inside this many
-	// seconds prints nothing. Nil (absent or null) means the default, 0 turns
-	// the cooldown off (every re-entry prints, the pre-os7 behavior).
+	// seconds prints nothing. Nil (absent or null) means the default, which is
+	// 0: the cooldown is off (every re-entry prints, the 0.2.0 behavior).
 	BlockedCooldownSec *int
 	// AgentPattern is the dead-pane foreground match source and AgentRe
 	// its compiled form; after Load both always carry the configured or
@@ -143,7 +150,7 @@ type HerdrCfg struct {
 
 // DefaultBlockedCooldownSec is the herdr blocked-re-emission window used
 // when herdr.blockedCooldownSec is absent or null.
-const DefaultBlockedCooldownSec = 60
+const DefaultBlockedCooldownSec = 0
 
 // maxBlockedCooldownSec is the largest second count that fits in a
 // time.Duration. A larger value overflows the nanosecond multiply and
@@ -155,11 +162,30 @@ func (h HerdrCfg) On() bool { return h.Enabled == nil || *h.Enabled }
 
 // BlockedCooldown is the blocked re-emission window: the default when the
 // key is absent or null, otherwise the configured seconds (0 = off).
-func (h HerdrCfg) BlockedCooldown() time.Duration {
-	if h.BlockedCooldownSec == nil {
+func (h HerdrCfg) BlockedCooldown() time.Duration { return cooldown(h.BlockedCooldownSec) }
+
+// cooldown resolves a blockedCooldownSec key: nil is the default, otherwise
+// the configured seconds.
+func cooldown(sec *int) time.Duration {
+	if sec == nil {
 		return DefaultBlockedCooldownSec * time.Second
 	}
-	return time.Duration(*h.BlockedCooldownSec) * time.Second
+	return time.Duration(*sec) * time.Second
+}
+
+// cooldownKey reads a blockedCooldownSec key: a non-negative integer that
+// fits in a time.Duration once multiplied to seconds.
+func cooldownKey(section *OMap, path string) (*int, error) {
+	v, err := nonNegIntKey(section, "blockedCooldownSec", path)
+	if err != nil {
+		return nil, err
+	}
+	// Seconds above maxBlockedCooldownSec overflow time.Duration and the
+	// window wraps negative, which would turn the cooldown off.
+	if v != nil && int64(*v) > maxBlockedCooldownSec {
+		return nil, fmt.Errorf("config.json: %s must be a non-negative integer of at most %d", path, maxBlockedCooldownSec)
+	}
+	return v, nil
 }
 
 // Cfg is the parsed config.json: the raw document kept in order. parseCfg
@@ -362,6 +388,9 @@ func parseProfile(om *OMap) (Profile, error) {
 		if out.Labels, err = labelsKey(section); err != nil {
 			return out, err
 		}
+		if out.BlockedCooldownSec, err = cooldownKey(section, "rpc.blockedCooldownSec"); err != nil {
+			return out, err
+		}
 		return out, nil
 	}); err != nil {
 		return Profile{}, err
@@ -400,12 +429,8 @@ func parseProfile(om *OMap) (Profile, error) {
 		if out.BlockedAll, err = boolKey(section, "blockedAll", "herdr.blockedAll"); err != nil {
 			return out, err
 		}
-		if out.BlockedCooldownSec, err = nonNegIntKey(section, "blockedCooldownSec", "herdr.blockedCooldownSec"); err != nil {
+		if out.BlockedCooldownSec, err = cooldownKey(section, "herdr.blockedCooldownSec"); err != nil {
 			return out, err
-		}
-		// Seconds above maxBlockedCooldownSec overflow time.Duration and BlockedCooldown wraps negative.
-		if out.BlockedCooldownSec != nil && int64(*out.BlockedCooldownSec) > maxBlockedCooldownSec {
-			return out, fmt.Errorf("config.json: herdr.blockedCooldownSec must be a non-negative integer of at most %d", maxBlockedCooldownSec)
 		}
 		if out.AgentPattern, err = strKey(section, "agentPattern", "herdr.agentPattern"); err != nil {
 			return out, err

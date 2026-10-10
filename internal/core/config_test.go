@@ -217,6 +217,11 @@ func TestResolveProfileShapeErrors(t *testing.T) {
 		{`{"herdr":{"blockedCooldownSec":true}}`, "config.json: herdr.blockedCooldownSec must be a non-negative integer"},
 		{`{"herdr":{"blockedCooldownSec":9223372036854775807}}`, "config.json: herdr.blockedCooldownSec must be a non-negative integer of at most 9223372036"},
 		{`{"herdr":{"blockedCooldownSec":9223372037}}`, "config.json: herdr.blockedCooldownSec must be a non-negative integer of at most 9223372036"},
+		{`{"rpc":{"blockedCooldownSec":-1}}`, "config.json: rpc.blockedCooldownSec must be a non-negative integer"},
+		{`{"rpc":{"blockedCooldownSec":"60"}}`, "config.json: rpc.blockedCooldownSec must be a non-negative integer"},
+		{`{"rpc":{"blockedCooldownSec":1.5}}`, "config.json: rpc.blockedCooldownSec must be a non-negative integer"},
+		{`{"rpc":{"blockedCooldownSec":true}}`, "config.json: rpc.blockedCooldownSec must be a non-negative integer"},
+		{`{"rpc":{"blockedCooldownSec":9223372037}}`, "config.json: rpc.blockedCooldownSec must be a non-negative integer of at most 9223372036"},
 		{`{"herdr":{"agentPattern":5}}`, "config.json: herdr.agentPattern must be a string"},
 		{`{"herdr":{"agentPattern":"["}}`, "config.json: herdr.agentPattern is not a valid regular expression:"},
 		{`{"silentMinutes":0}`, "config.json: silentMinutes must be a positive integer"},
@@ -278,16 +283,19 @@ func TestLoadNewKeyDefaults(t *testing.T) {
 	if p.Herdr.BlockedAll {
 		t.Errorf("herdr.blockedAll default = true, want false")
 	}
-	// IS-7: the cooldown default holds for a missing herdr section, an
-	// empty one, and a null one; only an explicit number overrides it.
-	for _, cfg := range []string{mainCfg, `{"herdr":{}}`, `{"herdr":null}`} {
+	// The cooldown default is off (0) for a missing section, an empty one,
+	// and a null one, for herdr and rpc alike; only a number overrides it.
+	for _, cfg := range []string{mainCfg, `{"herdr":{},"rpc":{}}`, `{"herdr":null,"rpc":null}`} {
 		writeConfig(t, dir, cfg)
 		ctx, err := Load(ParseArgs(nil), false)
 		if err != nil {
 			t.Fatalf("cfg %s: load: %v", cfg, err)
 		}
-		if got := ctx.Profile.Herdr.BlockedCooldown(); got != DefaultBlockedCooldownSec*time.Second {
-			t.Errorf("cfg %s: herdr.blockedCooldownSec default = %v, want %ds", cfg, got, DefaultBlockedCooldownSec)
+		if got := ctx.Profile.Herdr.BlockedCooldown(); got != 0 {
+			t.Errorf("cfg %s: herdr.blockedCooldownSec default = %v, want 0 (off)", cfg, got)
+		}
+		if got := ctx.Profile.RPC.BlockedCooldown(); got != 0 || ctx.Profile.RPC.BlockedCooldownSec != nil {
+			t.Errorf("cfg %s: rpc.blockedCooldownSec default = %v, want 0 (off)", cfg, got)
 		}
 		if ctx.Profile.Herdr.BlockedCooldownSec != nil {
 			t.Errorf("cfg %s: herdr.blockedCooldownSec = %v, want the nil default", cfg, *ctx.Profile.Herdr.BlockedCooldownSec)
@@ -318,7 +326,7 @@ func TestLoadNewKeysSet(t *testing.T) {
 	_, dir, _ := testEnv(t)
 	writeConfig(t, dir, `{
 	  "verify": {"command": ["/bin/sh", "-c", "exit 0"], "timeoutSec": 5},
-	  "rpc": {"verify": false, "labels": {"task": "T", "ack": "A", "more": "M"}},
+	  "rpc": {"verify": false, "labels": {"task": "T", "ack": "A", "more": "M"}, "blockedCooldownSec": 45},
 	  "herdr": {"verify": true, "blockedAll": true, "blockedCooldownSec": 90, "agentPattern": "^agent-"},
 	  "silentMinutes": 7,
 	  "transcriber": ["/opt/tr.sh", "{audio}"],
@@ -346,6 +354,9 @@ func TestLoadNewKeysSet(t *testing.T) {
 	}
 	if p.Herdr.BlockedCooldownSec == nil || *p.Herdr.BlockedCooldownSec != 90 || p.Herdr.BlockedCooldown() != 90*time.Second {
 		t.Errorf("herdr blocked cooldown = %v (%v), want the configured 90s", p.Herdr.BlockedCooldownSec, p.Herdr.BlockedCooldown())
+	}
+	if p.RPC.BlockedCooldownSec == nil || *p.RPC.BlockedCooldownSec != 45 || p.RPC.BlockedCooldown() != 45*time.Second {
+		t.Errorf("rpc blocked cooldown = %v (%v), want the configured 45s", p.RPC.BlockedCooldownSec, p.RPC.BlockedCooldown())
 	}
 	if p.SilentMinutes != 7 {
 		t.Errorf("silentMinutes = %d, want 7", p.SilentMinutes)
@@ -509,7 +520,7 @@ func TestLoadCfgRawKeepsOrder(t *testing.T) {
 // absent for every new key (the tri-state convention of the flat shape).
 func TestLoadNullNewKeysKeepDefaults(t *testing.T) {
 	_, dir, _ := testEnv(t)
-	writeConfig(t, dir, `{"tidy":{"checkMin":null,"quietMin":null},"verify":null,"rpc":{"verify":null,"labels":null},"herdr":{"verify":null,"blockedAll":null,"blockedCooldownSec":null,"agentPattern":null},"silentMinutes":null,"transcriber":null,"guard":null}`)
+	writeConfig(t, dir, `{"tidy":{"checkMin":null,"quietMin":null},"verify":null,"rpc":{"verify":null,"labels":null,"blockedCooldownSec":null},"herdr":{"verify":null,"blockedAll":null,"blockedCooldownSec":null,"agentPattern":null},"silentMinutes":null,"transcriber":null,"guard":null}`)
 	ctx, err := Load(ParseArgs(nil), false)
 	if err != nil {
 		t.Fatalf("load: %v", err)
@@ -519,8 +530,11 @@ func TestLoadNullNewKeysKeepDefaults(t *testing.T) {
 		p.Herdr.Verify || p.Herdr.AgentRe == nil || p.SilentMinutes != 30 || p.Transcriber != nil || p.Guard.StateFileBytes != 16<<20 {
 		t.Errorf("null new keys changed the defaults: %+v", p)
 	}
-	if p.Herdr.BlockedCooldownSec != nil || p.Herdr.BlockedCooldown() != DefaultBlockedCooldownSec*time.Second {
-		t.Errorf("null herdr.blockedCooldownSec = %v (%v), want the nil default %ds", p.Herdr.BlockedCooldownSec, p.Herdr.BlockedCooldown(), DefaultBlockedCooldownSec)
+	if p.Herdr.BlockedCooldownSec != nil || p.Herdr.BlockedCooldown() != 0 {
+		t.Errorf("null herdr.blockedCooldownSec = %v (%v), want the nil default 0 (off)", p.Herdr.BlockedCooldownSec, p.Herdr.BlockedCooldown())
+	}
+	if p.RPC.BlockedCooldownSec != nil || p.RPC.BlockedCooldown() != 0 {
+		t.Errorf("null rpc.blockedCooldownSec = %v (%v), want off", p.RPC.BlockedCooldownSec, p.RPC.BlockedCooldown())
 	}
 	if p.Tidy.CheckMin != nil || p.Tidy.QuietMin != nil {
 		t.Errorf("null tidy cadence keys changed the defaults: %+v", p.Tidy)

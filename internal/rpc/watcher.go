@@ -67,6 +67,11 @@ type watcher struct {
 	queue                    *streamFIFO
 	silent                   map[string]silentState
 	silentMinutes            int
+	// After an emitted blocked, a re-entry into blocked inside this window
+	// prints nothing (rpc.blockedCooldownSec, default 0 = off). blockedAt is
+	// the time of the last EMITTED blocked per session id, memory only.
+	blockedCooldown time.Duration
+	blockedAt       map[string]time.Time
 }
 
 func newWatcher(c *core.Ctx, sink core.Sink) *watcher {
@@ -78,6 +83,7 @@ func newWatcher(c *core.Ctx, sink core.Sink) *watcher {
 		closed: map[string]string{}, deferred: map[string][]deferredDone{},
 		streamErrors: map[string]bool{},
 		silent:       map[string]silentState{}, silentMinutes: c.Profile.SilentMinutes,
+		blockedCooldown: c.Profile.RPC.BlockedCooldown(), blockedAt: map[string]time.Time{},
 	}
 }
 
@@ -290,7 +296,13 @@ func (w *watcher) poll(ctx context.Context, reconcile bool) {
 			next.entry = e
 			switch {
 			case status == "blocked" && prev.status != "blocked":
+				// A re-entry inside the cooldown window, measured from the last
+				// EMITTED blocked, prints nothing and does not extend it.
+				if at, ok := w.blockedAt[id]; ok && w.blockedCooldown > 0 && nowFn().Sub(at) < w.blockedCooldown {
+					break
+				}
 				w.emit("blocked", e, from, status)
+				w.blockedAt[id] = nowFn()
 			case status == "idle" && prev.active && (!w.streamUp || prev.activeEpoch < w.streamEpoch || prev.pollArmed):
 				w.conclude(&next, e)
 			}
@@ -327,6 +339,13 @@ func (w *watcher) poll(ctx context.Context, reconcile bool) {
 			if ended, ok := w.closed[prev.entry.info.Session]; !ok || ended != id {
 				w.emit("closed", prev.entry, from, "closed")
 			}
+		}
+	}
+	// A session that left the list loses its cooldown: its return is a first
+	// blocked.
+	for id := range w.blockedAt {
+		if !present[id] {
+			delete(w.blockedAt, id)
 		}
 	}
 	w.seen, w.listed, w.first, w.silent = seen, listed, false, silent
