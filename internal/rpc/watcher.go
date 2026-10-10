@@ -3,7 +3,9 @@ package rpc
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"time"
 
 	"github.com/DevNewbie1826/omosense/internal/core"
@@ -150,13 +152,22 @@ func (w *watcher) noteError(key string, err error) {
 	msg := err.Error()
 	if w.errs[key] != msg {
 		w.errs[key] = msg
-		if key == "list" {
+		// Before the first connect a missing socket is the normal state.
+		switch {
+		case noSocket(err):
+		case key == "list":
 			w.sink.Log("rpc " + msg)
-		} else {
+		default:
 			w.sink.Log("rpc " + key + " " + msg)
 		}
 		w.ready = false
 	}
+}
+
+// noSocket reports a dial to a socket path that does not exist yet, the
+// normal state before rpc's first start. Any other dial error is real.
+func noSocket(err error) bool {
+	return errors.Is(err, fs.ErrNotExist)
 }
 
 func (w *watcher) once(ctx context.Context) error {
