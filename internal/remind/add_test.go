@@ -201,6 +201,41 @@ func TestAddDuringTickNotLost(t *testing.T) {
 	}
 }
 
+// TestAddDuplicateIDRejected (IS-8): an --id already in the file is refused
+// with the usage and exit 2, whatever the existing entry's state, and the file
+// is left byte-identical.
+func TestAddDuplicateIDRejected(t *testing.T) {
+	cases := map[string]string{
+		"pending":  `[{"id":"dup","at":"2026-10-03T10:00:00.000Z","platform":"telegram","target":{"chat_id":1},"text":"x"}]`,
+		"terminal": `[{"id":"dup","at":"2026-10-03T10:00:00.000Z","platform":"telegram","target":{"chat_id":1},"text":"x","sent":"2026-10-03T09:00:00.000Z"}]`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			ctx := loadCtx(t)
+			withHooks(t, fixedTime, "", nil)
+			if err := os.MkdirAll(ctx.State, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(remindersFile(ctx), []byte(body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			code, out, errOut := runAdd(t, ctx, "--in", "1h", "--platform", "telegram", "--target", `{"chat_id":2}`, "--text", "y", "--id", "dup")
+			if code != 2 {
+				t.Fatalf("exit %d, want 2 (stderr %q)", code, errOut)
+			}
+			if out != "" {
+				t.Errorf("stdout = %q, want empty", out)
+			}
+			if !strings.Contains(errOut, `id "dup" already exists`) || !strings.Contains(errOut, "Usage: omosense remind add") {
+				t.Errorf("stderr = %q, want the duplicate id and the usage", errOut)
+			}
+			if got := mustRead(t, remindersFile(ctx)); string(got) != body {
+				t.Errorf("file changed:\n got %s\nwant %s", got, body)
+			}
+		})
+	}
+}
+
 func lockHeld(t *testing.T, state string) bool {
 	t.Helper()
 	f, err := os.OpenFile(filepath.Join(state, "reminders.lock"), os.O_CREATE|os.O_RDWR, 0o600)
