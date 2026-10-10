@@ -128,6 +128,7 @@ The state dir holds:
 | `threads.lock` | Lock guarding `threads.json` writes. |
 | `sessions.json` | Left over from older versions. omosense no longer reads it. |
 | `memory-tidy.json` | Tidy watermark. |
+| `memory-tidy.json.lock` | Lock guarding `memory-tidy.json` updates (daily backup and `tidy --write-watermark`). |
 | `tidy-announced.json` | Which HEAD tidy last reported for each repo, and when. Keeps the 6 hour re-report rule across restarts. |
 | `tg-offset-<bot>` | Telegram fetch offset for that bot. |
 | `inbox/` | Downloaded Telegram attachments. |
