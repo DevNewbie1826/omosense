@@ -21,14 +21,15 @@ import (
 // AND the second writer reads the watermark only after the first writer
 // wrote it. The backup writer is parked inside the lock by the hook (after
 // its own in-lock read) and a LOCK_EX|LOCK_NB probe proves the lock is
-// held; only then is the --write-watermark writer started. The test waits
-// (channel, no sleep) until that writer reaches the instant immediately
-// BEFORE it requests the lock: a correct updateWatermark has read nothing
-// yet, while a re-read hoisted above the Flock, or a stale pre-lock
-// document, has already read by then - so the guard fails. Releasing the
-// backup writer then forces the order write(1), read(2), write(2), with
-// read(1) already recorded. Fails when the Flock call is removed (the
-// probe succeeds).
+// held; only then is the --write-watermark writer started. The readiness
+// signal is emitted by the watermarkFlockFn wrapper immediately before it
+// calls the real syscall.Flock, so it marks the acquisition itself: a
+// correct updateWatermark has read nothing when it fires, while a re-read
+// hoisted above the acquisition, or a stale pre-lock document, has already
+// read by then - so the guard fails even if the second writer is
+// descheduled between the signal and the Flock. Releasing the backup writer
+// then forces the order write(1), read(2), write(2), with read(1) already
+// recorded. Fails when the Flock call is removed (the probe succeeds).
 func TestWatermarkConcurrentBackupAndWriteWatermark(t *testing.T) {
 	_, agents, state := sandbox(t)
 	shaA := commitAt(t, makeRepo(t, agents, "alpha"), testEpoch, "a1")
@@ -67,6 +68,19 @@ func TestWatermarkConcurrentBackupAndWriteWatermark(t *testing.T) {
 		mu.Unlock()
 	}
 	t.Cleanup(func() { watermarkEventHook = prevEvent })
+
+	// Emit the "prelock" readiness signal from the acquisition itself: the
+	// wrapper signals and then calls the real Flock, so any production read
+	// placed above the acquisition necessarily runs before this signal - and
+	// therefore before the test can release the first writer.
+	prevFlock := watermarkFlockFn
+	watermarkFlockFn = func(fd, how int) error {
+		if watermarkEventHook != nil {
+			watermarkEventHook("prelock")
+		}
+		return syscall.Flock(fd, how)
+	}
+	t.Cleanup(func() { watermarkFlockFn = prevFlock })
 
 	entered := make(chan struct{})
 	release := make(chan struct{})

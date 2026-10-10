@@ -29,11 +29,20 @@ var watermarkLockedHook func()
 
 // watermarkEventHook, when set, observes the steps a writer takes on the
 // watermark: "read" after each watermark read (readWatermark), "prelock"
-// immediately BEFORE updateWatermark requests the exclusive lock, and
-// "write" immediately after it writes the document. Tests use it to prove
-// the re-read happens inside the lock; nil in production, where it has no
-// effect.
+// immediately BEFORE the exclusive lock is acquired, and "write"
+// immediately after it writes the document. Tests use it to prove the
+// re-read happens inside the lock; nil in production, where it has no
+// effect. The "prelock" event is emitted by the test wrapper around
+// watermarkFlockFn, never by production code, so the readiness signal is
+// inseparable from the acquisition it marks.
 var watermarkEventHook func(ev string)
+
+// watermarkFlockFn acquires the watermark lock. It is syscall.Flock in
+// production; tests replace it with a wrapper that emits the writer's
+// "prelock" readiness signal immediately before calling the real
+// syscall.Flock, so a read moved above the acquisition necessarily happens
+// before the test observes readiness.
+var watermarkFlockFn = syscall.Flock
 
 // updateWatermark runs fn against the FRESH <State>/memory-tidy.json under
 // the exclusive <State>/memory-tidy.json.lock, then writes the result
@@ -49,10 +58,7 @@ func (t *tidyer) updateWatermark(fn func(w *core.OMap) error) error {
 		return errors.New("Error: " + err.Error())
 	}
 	defer lock.Close()
-	if watermarkEventHook != nil {
-		watermarkEventHook("prelock")
-	}
-	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+	if err := watermarkFlockFn(int(lock.Fd()), syscall.LOCK_EX); err != nil {
 		return errors.New("Error: " + err.Error())
 	}
 	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
