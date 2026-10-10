@@ -145,7 +145,7 @@ func testCancelledSend(t *testing.T, descendant bool) {
 		if _, err := b.conn.Read(data[:]); !errors.Is(err, io.EOF) {
 			t.Fatalf("fake say %d retained gate: %v", b.pid, err)
 		}
-		if err := syscall.Kill(b.pid, 0); !errors.Is(err, syscall.ESRCH) {
+		if err := awaitExit(b.pid, 5*time.Second); err != nil {
 			t.Fatalf("cancelled say %d remains alive: %v", b.pid, err)
 		}
 		_ = b.conn.Close()
