@@ -67,54 +67,50 @@ func reminderFile(c *core.Ctx) string {
 // and key order are preserved.
 //
 // The file is <State>/reminders.json. A missing file returns
-// 0, nil. A parse error is returned and the file is left untouched. The
-// file is rewritten with marshalIndent2Array only when n > 0, where n is
-// the number of entries marked.
+// 0, nil and is not created. A parse error is returned and the file is left
+// untouched. The file is rewritten (temp file + rename) with
+// marshalIndent2Array only when n > 0, where n is the number of entries
+// marked.
 //
-// CancelPending does not take any lock. The caller owns reminders.lock and
-// must hold it across the call so a scheduler tick's record (or an add)
-// cannot race the rewrite.
+// CancelPending takes reminders.lock itself, through withReminders like
+// remind add, so a tick's read and per-result record and an add serialize
+// with it. The entries cancelled are those pending when the file is read
+// under the lock; a send already in flight finishes outside the lock and its
+// result is then not recorded (record finds the entry changed). No caller
+// holds reminders.lock around CancelPending (it has no production caller);
+// one that did would deadlock, because the lock is opened per call and flock
+// then blocks even within the same process.
 func CancelPending(c *core.Ctx, now time.Time) (int, error) {
-	b, err := os.ReadFile(reminderFile(c))
-	if os.IsNotExist(err) {
-		return 0, nil
-	}
-	if err != nil {
-		return 0, err
-	}
-	v, err := core.ParseJSON(b)
-	if err != nil {
-		return 0, err
-	}
-	arr, ok := v.([]any)
-	if !ok {
-		return 0, fmt.Errorf("reminders: expected a JSON array")
-	}
-	iso := core.ISO(now)
 	n := 0
-	for _, ev := range arr {
-		r, ok := ev.(*core.OMap)
-		if !ok {
-			return 0, fmt.Errorf("reminders: entry is not a JSON object")
+	err := withReminders(c.State, func(arr []any) ([]any, bool, error) {
+		if cancelPendingLockedHook != nil {
+			cancelPendingLockedHook()
 		}
-		if !pendingEntry(r) {
-			continue
+		iso := core.ISO(now)
+		marked := 0
+		for _, ev := range arr {
+			r, ok := ev.(*core.OMap)
+			if !ok {
+				return nil, false, fmt.Errorf("reminders: entry is not a JSON object")
+			}
+			if !pendingEntry(r) {
+				continue
+			}
+			r.Set("cancelled", iso)
+			marked++
 		}
-		r.Set("cancelled", iso)
-		n++
-	}
-	if n == 0 {
-		return 0, nil
-	}
-	out, err := marshalIndent2Array(arr)
+		n = marked
+		return arr, marked > 0, nil
+	})
 	if err != nil {
-		return 0, err
-	}
-	if err := os.WriteFile(reminderFile(c), out, 0o644); err != nil {
 		return 0, err
 	}
 	return n, nil
 }
+
+// cancelPendingLockedHook, when set, runs inside CancelPending's lock right
+// after the read and before any entry is marked; nil in production.
+var cancelPendingLockedHook func()
 
 // run prints the startup LOG and then loops tick/sleep, logging every tick
 // error as "LOG remind <err>" (remind.ts try/catch), until ctx is
