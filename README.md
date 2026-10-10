@@ -304,6 +304,8 @@ omosense thread register|close <thread-id> [flags]
 omosense remind add --in 30m --platform telegram --target '{"chat_id":123}' --text "stand-up"
 ```
 
+`remind add` never waits for a send that is already in flight: remind takes `reminders.lock` only for its read and for each result write, and sends outside it. A crash or cancel mid-send leaves that reminder pending, so it is sent again on the next run (at-least-once).
+
 ## Memory tidy
 
 With `tidy.enabled`, the tidy source checks the memory repos every `checkMin` minutes (default 10). A repo that changed since its last tidy is reported with one `TIDY` line once its HEAD commit has been quiet for `quietMin` minutes (default 60). A repo that keeps getting commits isn't reported until it settles. The same HEAD isn't reported again within 6 hours. What was reported, and when, is kept in `tidy-announced.json`, so restarting the host within 6 hours doesn't report the same HEAD again.
