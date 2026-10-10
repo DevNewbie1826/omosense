@@ -11,6 +11,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/DevNewbie1826/omosense/internal/core"
 )
 
 // TestWatermarkConcurrentBackupAndWriteWatermark is the IS-1/IS-2 guard:
@@ -185,6 +187,61 @@ func TestWatermarkConcurrentBackupAndWriteWatermark(t *testing.T) {
 	}
 	if doc.Repos["alpha"] != shaA {
 		t.Fatalf("repos[alpha] = %q, want %q (the --write-watermark entry was lost):\n%s", doc.Repos["alpha"], shaA, body)
+	}
+}
+
+// failWriteFileFn replaces writeFileFn with a fake that writes the real
+// temp file and then fails, so the caller's cleanup is observable (D4).
+func failWriteFileFn(t *testing.T) {
+	t.Helper()
+	prev := writeFileFn
+	writeFileFn = func(name string, data []byte, perm os.FileMode) error {
+		if err := os.WriteFile(name, data, perm); err != nil {
+			return err
+		}
+		return errors.New("no space left on device")
+	}
+	t.Cleanup(func() { writeFileFn = prev })
+}
+
+// TestWriteWatermarkWriteFileFailureRemovesTmp is the IS-4 guard for
+// writeWatermarkDoc: a failed WriteFile leaves no <path>.tmp.
+func TestWriteWatermarkWriteFileFailureRemovesTmp(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "memory-tidy.json")
+	failWriteFileFn(t)
+
+	w := core.NewOMap()
+	w.Set("repos", core.NewOMap())
+	err := writeWatermarkDoc(path, w)
+	if err == nil || !strings.Contains(err.Error(), "no space left on device") {
+		t.Fatalf("writeWatermarkDoc error = %v, want the write failure", err)
+	}
+	if _, statErr := os.Stat(path + ".tmp"); !os.IsNotExist(statErr) {
+		t.Fatalf("%s.tmp still exists after the failed write: %v", path, statErr)
+	}
+	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+		t.Fatalf("the destination exists after the failed write: %v", statErr)
+	}
+}
+
+// TestWriteAnnouncedWriteFileFailureRemovesTmp is the IS-4 guard for
+// writeAnnounced: a failed WriteFile leaves no <path>.tmp.
+func TestWriteAnnouncedWriteFileFailureRemovesTmp(t *testing.T) {
+	_, _, state := sandbox(t)
+	failWriteFileFn(t)
+	tt := &tidyer{state: state}
+
+	err := tt.writeAnnounced(map[string]emitRec{"alpha": {to: "AAA", at: 1}})
+	if err == nil || !strings.Contains(err.Error(), "no space left on device") {
+		t.Fatalf("writeAnnounced error = %v, want the write failure", err)
+	}
+	path := tt.announcedPath()
+	if _, statErr := os.Stat(path + ".tmp"); !os.IsNotExist(statErr) {
+		t.Fatalf("%s.tmp still exists after the failed write: %v", path, statErr)
+	}
+	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+		t.Fatalf("the destination exists after the failed write: %v", statErr)
 	}
 }
 
