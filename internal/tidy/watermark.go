@@ -28,17 +28,19 @@ var writeFileFn = os.WriteFile
 var watermarkLockedHook func()
 
 // watermarkEventHook, when set, observes the steps a writer takes on the
-// watermark: "read" after each watermark read (readWatermark), "prelock"
-// immediately BEFORE the exclusive lock is acquired, and "write"
-// immediately after it writes the document. Tests use it to prove the
+// watermark. Production code emits only two events: "read" after each
+// watermark read (readWatermark) and "write" right after updateWatermark's
+// write attempt (also when that write failed). A third event, "prelock", is
+// emitted only by the test wrapper installed as watermarkFlockFn, right
+// before it calls the real syscall.Flock, so the readiness signal is
+// inseparable from the acquisition it marks. Tests use the hook to prove the
 // re-read happens inside the lock; nil in production, where it has no
-// effect. The "prelock" event is emitted by the test wrapper around
-// watermarkFlockFn, never by production code, so the readiness signal is
-// inseparable from the acquisition it marks.
+// effect.
 var watermarkEventHook func(ev string)
 
-// watermarkFlockFn acquires the watermark lock. It is syscall.Flock in
-// production; tests replace it with a wrapper that emits the writer's
+// watermarkFlockFn acquires the watermark lock (LOCK_EX only; the deferred
+// unlock calls syscall.Flock directly). It is syscall.Flock in production;
+// tests replace it with a wrapper that emits the writer's
 // "prelock" readiness signal immediately before calling the real
 // syscall.Flock, so a read moved above the acquisition necessarily happens
 // before the test observes readiness.
