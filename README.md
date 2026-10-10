@@ -119,7 +119,7 @@ The state dir holds:
 
 | File | What it is |
 |---|---|
-| `reminders.json` | Reminder queue. Agents add entries here; remind sends them. |
+| `reminders.json` (+ `reminders.lock`) | Reminder queue. `omosense remind add` appends entries; remind sends them. |
 | `google-seen.json` | Calendar and mail items already reported. |
 | `rpc-pending.json` (+ `rpc-pending.lock`) | rpc completions not yet acked. |
 | `rpc-subscription.json` | The session that receives rpc done batches. |
@@ -284,6 +284,7 @@ Each source can also run alone, which is handy for checks:
 omosense listen [--dry-run]
 omosense google [--once]
 omosense remind
+omosense remind add (--at TIME | --in DURATION) --platform telegram|discord --target JSON --text TEXT [--id ID]
 omosense herdr [--once]
 omosense rpc [--once] [--all]
 omosense tidy [--once|--now] [--check-min m] [--quiet-min m] [flags]
@@ -295,6 +296,12 @@ omosense thread register|close <thread-id> [flags]
 ```
 
 `--once`, `--now` and `--dry-run` are read-only: they take no lock and don't create the state dir. Run `omosense <subcommand> --help` for details.
+
+`remind add` appends one reminder in the same schema remind reads and prints `REMIND added <entry>`. `--at` takes an ISO time, `--in` a duration from now. A time more than 6 hours in the past is refused (exit 2), since remind would only skip it. Example:
+
+```
+omosense remind add --in 30m --platform telegram --target '{"chat_id":123}' --text "stand-up"
+```
 
 ## Memory tidy
 

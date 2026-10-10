@@ -138,7 +138,18 @@ func (s *scheduler) run(ctx context.Context) error {
 // truthy sent, skipped, failed or cancelled are skipped (failed and
 // cancelled are terminal); due entries send through the say executable;
 // the file is rewritten in the bun indent layout only when an entry changed.
+//
+// The whole read-send-write runs under <state>/reminders.lock so a
+// concurrent `remind add` is never overwritten by this tick's rewrite.
 func (s *scheduler) tick(ctx context.Context) error {
+	if _, err := os.Stat(s.file); os.IsNotExist(err) {
+		return nil
+	}
+	unlock, err := lockReminders(filepath.Dir(s.file))
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	b, err := os.ReadFile(s.file)
 	if os.IsNotExist(err) {
 		return nil
