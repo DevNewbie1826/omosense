@@ -15,14 +15,24 @@ import (
 
 // Help is the usage text printed by omosense remind --help.
 const Help = `Usage: omosense remind
+       omosense remind add (--at TIME | --in DURATION) --platform telegram|discord --target JSON --text TEXT [--id ID]
 
 Runs the reminder scheduler, printing REMIND and LOG lines to stdout.
+
+add appends one pending reminder to <state>/reminders.json and prints
+"REMIND added <entry>". TIME is an ISO time (2026-10-10T09:00:00+09:00);
+DURATION is a Go duration from now (30m, 2h). A time more than 6h in the
+past is refused. Example:
+
+  omosense remind add --in 30m --platform telegram --target '{"chat_id":123}' --text "stand-up"
 `
 
 // Run is the compat subcommand host: it runs the remind source in-process
 // under the remind lock with the TS stdout grammar and exit semantics.
 func Run(c *core.Ctx, args []string) int {
-	_ = args
+	if len(args) > 0 && args[0] == "add" {
+		return add(c, args[1:], os.Stdout, os.Stderr)
+	}
 	release := c.Acquire("remind", "")
 	defer release()
 	if err := newScheduler(c, c.Out).run(context.Background()); err != nil {
