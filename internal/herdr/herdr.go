@@ -16,6 +16,11 @@ const Help = `Usage: omosense herdr [--once]
 Watches herdr panes every 5 seconds, printing HERDR and LOG lines to
 stdout.
 
+A blocked line is printed only for registered job panes. Set
+herdr.blockedAll to true (default false) to print one for every pane
+except omosense's own pane. A job pane's working to idle/done goes into
+one done-batch line, printed once 5 quiet minutes pass with no new done.
+
 Flags:
   --once    read-only single snapshot: prints SNAP lines, no lock
 `
