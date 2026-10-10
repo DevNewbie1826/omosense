@@ -117,12 +117,10 @@ func (t *tidyer) backup(ctx context.Context, quietIfDone bool) (bool, error) {
 	if err := pruneBackups(t.backups); err != nil {
 		return false, err
 	}
-	fresh, err := t.readWatermark()
-	if err != nil {
-		return false, err
-	}
-	fresh.Set("lastBackupDate", date)
-	if err := writeWatermarkDoc(t.watermarkPath(), fresh); err != nil {
+	if err := t.updateWatermark(func(w *core.OMap) error {
+		w.Set("lastBackupDate", date)
+		return nil
+	}); err != nil {
 		return false, err
 	}
 	failedStr := strings.Join(failed, ",")

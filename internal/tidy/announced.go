@@ -111,7 +111,7 @@ func (t *tidyer) writeAnnounced(rec map[string]emitRec) error {
 	}
 	path := t.announcedPath()
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, append(b, '\n'), 0o644); err != nil {
+	if err := writeFileFn(tmp, append(b, '\n'), 0o644); err != nil {
 		_ = os.Remove(tmp)
 		return err
 	}

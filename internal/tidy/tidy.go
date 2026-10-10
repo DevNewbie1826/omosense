@@ -86,12 +86,10 @@ func Run(c *core.Ctx, args []string) int {
 // flag (skipping --flags and values without "=") override the current
 // heads as the repos map, lastRun is stamped, and the LOG line reports
 // the unique key count. The JS split("=", 2) limit drops any tail:
-// "a=b=c" sets repo "a" to "b".
+// "a=b=c" sets repo "a" to "b". The current heads are computed BEFORE
+// the lock; the mutation is applied to the fresh in-lock document
+// (IS-1/IS-2).
 func (t *tidyer) writeWatermarkCmd(ctx context.Context, args []string) error {
-	w, err := t.readWatermark()
-	if err != nil {
-		return err
-	}
 	set := core.NewOMap()
 	if i := slices.Index(args, "--write-watermark"); i >= 0 {
 		for _, a := range args[i+1:] {
@@ -103,27 +101,31 @@ func (t *tidyer) writeWatermarkCmd(ctx context.Context, args []string) error {
 		}
 	}
 	count := set.Len()
-	if count > 0 {
-		if repos := reposOf(w); repos != nil {
-			for _, k := range set.Keys() {
-				v, _ := set.Get(k)
-				repos.Set(k, v)
-			}
-		}
-	} else {
-		heads, err := t.heads(ctx)
+	var heads []headRec
+	if count == 0 {
+		h, err := t.heads(ctx)
 		if err != nil {
 			return err
 		}
+		heads = h
 		count = len(heads)
+	}
+	if err := t.updateWatermark(func(w *core.OMap) error {
 		if repos := reposOf(w); repos != nil {
-			for _, h := range heads {
-				repos.Set(h.name, h.sha)
+			if set.Len() > 0 {
+				for _, k := range set.Keys() {
+					v, _ := set.Get(k)
+					repos.Set(k, v)
+				}
+			} else {
+				for _, h := range heads {
+					repos.Set(h.name, h.sha)
+				}
 			}
 		}
-	}
-	w.Set("lastRun", core.ISO(t.now()))
-	if err := writeWatermarkDoc(t.watermarkPath(), w); err != nil {
+		w.Set("lastRun", core.ISO(t.now()))
+		return nil
+	}); err != nil {
 		return err
 	}
 	t.sink.Log(fmt.Sprintf("memory-tidy watermark set %d repos", count))

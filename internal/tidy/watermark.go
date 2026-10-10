@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 
 	"github.com/DevNewbie1826/omosense/internal/core"
 )
@@ -17,12 +18,70 @@ func (t *tidyer) watermarkPath() string {
 	return filepath.Join(t.state, "memory-tidy.json")
 }
 
+// writeFileFn is the atomic-write primitive behind writeWatermarkDoc and
+// writeAnnounced; tests replace it to force a write failure.
+var writeFileFn = os.WriteFile
+
+// watermarkLockedHook, when set, runs inside updateWatermark's lock right
+// after the in-lock read and before the mutation is applied; nil in
+// production.
+var watermarkLockedHook func()
+
+// watermarkEventHook, when set, observes the steps a writer takes on the
+// watermark: "read" after each watermark read (readWatermark), "prelock"
+// immediately BEFORE updateWatermark requests the exclusive lock, and
+// "write" immediately after it writes the document. Tests use it to prove
+// the re-read happens inside the lock; nil in production, where it has no
+// effect.
+var watermarkEventHook func(ev string)
+
+// updateWatermark runs fn against the FRESH <State>/memory-tidy.json under
+// the exclusive <State>/memory-tidy.json.lock, then writes the result
+// through a temp file + rename. A nil fn return writes; an error leaves the
+// file untouched. The lock is opened per call so flock also serializes
+// goroutines, not only separate processes (like thread.transact).
+func (t *tidyer) updateWatermark(fn func(w *core.OMap) error) error {
+	if err := os.MkdirAll(t.state, 0o755); err != nil {
+		return errors.New("Error: " + err.Error())
+	}
+	lock, err := os.OpenFile(filepath.Join(t.state, "memory-tidy.json.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return errors.New("Error: " + err.Error())
+	}
+	defer lock.Close()
+	if watermarkEventHook != nil {
+		watermarkEventHook("prelock")
+	}
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		return errors.New("Error: " + err.Error())
+	}
+	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+	w, err := t.readWatermark()
+	if err != nil {
+		return err
+	}
+	if watermarkLockedHook != nil {
+		watermarkLockedHook()
+	}
+	if err := fn(w); err != nil {
+		return err
+	}
+	err = writeWatermarkDoc(t.watermarkPath(), w)
+	if watermarkEventHook != nil {
+		watermarkEventHook("write")
+	}
+	return err
+}
+
 // readWatermark parses <State>/memory-tidy.json, filling the TS defaults
 // (repos, lastRun, lastBackupDate, appended in that order) exactly like
 // {...raw, repos: ..., lastRun: ..., lastBackupDate: ...} does. A missing
 // file yields the defaults; a parse failure is a SyntaxError, like
 // JSON.parse in the TS.
 func (t *tidyer) readWatermark() (*core.OMap, error) {
+	if watermarkEventHook != nil {
+		defer watermarkEventHook("read")
+	}
 	b, err := os.ReadFile(t.watermarkPath())
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -73,7 +132,7 @@ func writeWatermarkDoc(path string, w *core.OMap) error {
 		return errors.New("Error: " + err.Error())
 	}
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, append(b, '\n'), 0o644); err != nil {
+	if err := writeFileFn(tmp, append(b, '\n'), 0o644); err != nil {
 		_ = os.Remove(tmp)
 		return errors.New("Error: " + err.Error())
 	}
