@@ -50,34 +50,61 @@ func awaitFifo(t *testing.T, p string) {
 }
 
 // gate is a release FIFO written at most once, from the test body or from a
-// cleanup. The write is non-blocking so a failing test cannot hang on a FIFO
-// whose reader is already gone.
+// cleanup. newGate opens the FIFO O_RDWR before the fake say is started and
+// holds that endpoint for the whole test, the way the herdr and rpc barriers
+// do: the child can be descheduled between announcing itself and opening
+// RELEASE, so a release written in that window must already have a reader - a
+// fresh non-blocking open would fail ENXIO, sync.Once would consume the only
+// release, and the wakeup would be lost for good (R1). The write goes through
+// the held endpoint, so it cannot be dropped.
 type gate struct {
+	t    *testing.T
 	path string
+	held *os.File
 	once sync.Once
 }
 
+// newGate creates the release FIFO and retains an endpoint on it; the endpoint
+// is closed when the test ends.
+func newGate(t *testing.T, dir, name string) *gate {
+	t.Helper()
+	g := &gate{t: t, path: fifo(t, dir, name)}
+	f, err := os.OpenFile(g.path, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.held = f
+	t.Cleanup(func() { _ = f.Close() })
+	return g
+}
+
+// release writes the single release through the endpoint newGate retained. A
+// failing write is reported, never swallowed: the wakeup must not be dropped
+// silently.
 func (g *gate) release() {
 	g.once.Do(func() {
-		f, err := os.OpenFile(g.path, os.O_WRONLY|syscall.O_NONBLOCK, 0o600)
-		if err != nil {
-			return // no reader left; nothing to unblock
+		if _, err := g.held.Write([]byte("\n")); err != nil {
+			g.t.Errorf("gate.release could not write %s: %v", filepath.Base(g.path), err)
 		}
-		_, _ = f.Write([]byte("\n"))
-		_ = f.Close()
 	})
 }
 
 // gatedSay installs a fake say that appends its argv to capture and, when the
-// argv contains blockText, announces itself on inFifo and blocks until release
-// is written.
-func gatedSay(t *testing.T, capture, inFifo, release, blockText string) string {
+// argv contains blockText, announces itself on inFifo, waits for barrier when
+// one is given and then blocks until release is written. The barrier parks the
+// child exactly in the window between its announcement and its open of release,
+// so a test can force the adverse schedule R1 names.
+func gatedSay(t *testing.T, capture, inFifo, barrier, release, blockText string) string {
 	t.Helper()
 	p := filepath.Join(t.TempDir(), "gated-say")
 	script := `#!/bin/sh
 printf '%s\n' "$*" >> "$FAKE_SAY_CAPTURE"
 case "$*" in
-*"$BLOCK_TEXT"*) printf x > "$IN_FIFO"; read _ < "$RELEASE" ;;
+*"$BLOCK_TEXT"*)
+	printf x > "$IN_FIFO"
+	if [ -n "$BARRIER" ]; then read _ < "$BARRIER"; fi
+	read _ < "$RELEASE"
+	;;
 esac
 exit "${FAKE_SAY_EXIT:-0}"
 `
@@ -88,6 +115,7 @@ exit "${FAKE_SAY_EXIT:-0}"
 	t.Setenv("FAKE_SAY_EXIT", "0")
 	t.Setenv("BLOCK_TEXT", blockText)
 	t.Setenv("IN_FIFO", inFifo)
+	t.Setenv("BARRIER", barrier)
 	t.Setenv("RELEASE", release)
 	return p
 }
@@ -150,9 +178,9 @@ func TestTickRecordsPerEntry(t *testing.T) {
 	ctx := loadCtx(t)
 	dir := t.TempDir()
 	inFifo := fifo(t, dir, "in-send")
-	g := &gate{path: fifo(t, dir, "release")}
+	g := newGate(t, dir, "release")
 	capture := filepath.Join(dir, "args")
-	withHooks(t, fixedTime, gatedSay(t, capture, inFifo, g.path, `"text":"b"`), sleepCtx)
+	withHooks(t, fixedTime, gatedSay(t, capture, inFifo, "", g.path, `"text":"b"`), sleepCtx)
 	if err := os.WriteFile(remindersFile(ctx), []byte(twoDue), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -209,10 +237,10 @@ func runChangedEntry(t *testing.T, body, rewritten, wantText string) {
 	ctx := loadCtx(t)
 	dir := t.TempDir()
 	inFifo := fifo(t, dir, "in-send")
-	g := &gate{path: fifo(t, dir, "release")}
+	g := newGate(t, dir, "release")
 	capture := filepath.Join(dir, "args")
 	sleep := newFakeSleeper()
-	withHooks(t, fixedTime, gatedSay(t, capture, inFifo, g.path, `"text":"a"`), sleep.sleep)
+	withHooks(t, fixedTime, gatedSay(t, capture, inFifo, "", g.path, `"text":"a"`), sleep.sleep)
 	if err := os.WriteFile(remindersFile(ctx), []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -371,10 +399,10 @@ func TestTickRecordNoMatchWritesNothing(t *testing.T) {
 		ctx := loadCtx(t)
 		dir := t.TempDir()
 		inFifo := fifo(t, dir, "in-send")
-		g := &gate{path: fifo(t, dir, "release")}
+		g := newGate(t, dir, "release")
 		capture := filepath.Join(dir, "args")
 		sleep := newFakeSleeper()
-		withHooks(t, fixedTime, gatedSay(t, capture, inFifo, g.path, `"text":"a"`), sleep.sleep)
+		withHooks(t, fixedTime, gatedSay(t, capture, inFifo, "", g.path, `"text":"a"`), sleep.sleep)
 		if err := os.MkdirAll(ctx.State, 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -437,4 +465,54 @@ func TestTickRecordNoMatchWritesNothing(t *testing.T) {
 			t.Errorf("Run returned %v, want nil after cancel", err)
 		}
 	})
+}
+
+// TestGateReleaseBeforeReaderOpens (R1): the fake say can be descheduled
+// between announcing itself and opening RELEASE, so the parent may release the
+// gate inside that window. newGate's retained endpoint buffers the release and
+// delivers it when the reader finally opens the FIFO, so the tick completes and
+// records the entry. A gate that opens RELEASE itself only when a reader is
+// already there drops the only wakeup and the fake say blocks forever.
+func TestGateReleaseBeforeReaderOpens(t *testing.T) {
+	ctx := loadCtx(t)
+	dir := t.TempDir()
+	inFifo := fifo(t, dir, "in-send")
+	g := newGate(t, dir, "release")
+	// The barrier parks the child after its announcement: the parent holds the
+	// barrier's endpoint, so the child's read of it blocks until start.release.
+	start := newGate(t, dir, "reader-start")
+	capture := filepath.Join(dir, "args")
+	sleep := newFakeSleeper()
+	withHooks(t, fixedTime, gatedSay(t, capture, inFifo, start.path, g.path, `"text":"b"`), sleep.sleep)
+	if err := os.WriteFile(remindersFile(ctx), []byte(twoDue), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sink := newChanSink()
+	cancel, done := runSource(t, ctx, sink)
+	t.Cleanup(cancel)
+
+	awaitFifo(t, inFifo) // b announced itself and is parked before RELEASE
+	g.release()          // the release lands while RELEASE has no reader
+	start.release()      // only now may the child open RELEASE
+
+	// The buffered release must be delivered: b's send finishes, its result is
+	// recorded and the tick moves on. A dropped release leaves the fake say
+	// blocked on RELEASE, so this line would never print.
+	sent := sink.waitLine(t, `"id":"b"`)
+	if !strings.HasPrefix(sent, "REMIND sent ") {
+		t.Errorf("line for b = %q, want a REMIND sent line", sent)
+	}
+	sleep.waitCalls(t, 1)
+	es := entries(t, ctx)
+	if len(es) != 2 || !doneEntry(es[0], "sent") || !doneEntry(es[1], "sent") {
+		t.Errorf("entries after the delayed reader opened RELEASE: %s", mustRead(t, remindersFile(ctx)))
+	}
+	if got := readCapture(t, capture); strings.Count(got, "\n") != 2 {
+		t.Errorf("say invocations = %q, want 2", got)
+	}
+
+	cancel()
+	if err := waitDone(t, done); err != nil {
+		t.Errorf("Run returned %v, want nil after cancel", err)
+	}
 }

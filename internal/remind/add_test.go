@@ -146,9 +146,9 @@ func TestAddDuringTickNotLost(t *testing.T) {
 	ctx := loadCtx(t)
 	dir := t.TempDir()
 	inSend := fifo(t, dir, "in-send")
-	g := &gate{path: fifo(t, dir, "release")}
+	g := newGate(t, dir, "release")
 	capture := filepath.Join(dir, "args")
-	withHooks(t, fixedTime, gatedSay(t, capture, inSend, g.path, `"text":"due"`), nil)
+	withHooks(t, fixedTime, gatedSay(t, capture, inSend, "", g.path, `"text":"due"`), nil)
 	if err := os.MkdirAll(ctx.State, 0o755); err != nil {
 		t.Fatal(err)
 	}
