@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -143,6 +144,11 @@ type HerdrCfg struct {
 // DefaultBlockedCooldownSec is the herdr blocked-re-emission window used
 // when herdr.blockedCooldownSec is absent or null.
 const DefaultBlockedCooldownSec = 60
+
+// maxBlockedCooldownSec is the largest second count that fits in a
+// time.Duration. A larger value overflows the nanosecond multiply and
+// BlockedCooldown wraps negative, which turns the cooldown off.
+const maxBlockedCooldownSec = math.MaxInt64 / int64(time.Second)
 
 // On reports whether the herdr source runs: absent means yes.
 func (h HerdrCfg) On() bool { return h.Enabled == nil || *h.Enabled }
@@ -396,6 +402,10 @@ func parseProfile(om *OMap) (Profile, error) {
 		}
 		if out.BlockedCooldownSec, err = nonNegIntKey(section, "blockedCooldownSec", "herdr.blockedCooldownSec"); err != nil {
 			return out, err
+		}
+		// Seconds above maxBlockedCooldownSec overflow time.Duration and BlockedCooldown wraps negative.
+		if out.BlockedCooldownSec != nil && int64(*out.BlockedCooldownSec) > maxBlockedCooldownSec {
+			return out, fmt.Errorf("config.json: herdr.blockedCooldownSec must be a non-negative integer of at most %d", maxBlockedCooldownSec)
 		}
 		if out.AgentPattern, err = strKey(section, "agentPattern", "herdr.agentPattern"); err != nil {
 			return out, err

@@ -215,6 +215,8 @@ func TestResolveProfileShapeErrors(t *testing.T) {
 		{`{"herdr":{"blockedCooldownSec":"60"}}`, "config.json: herdr.blockedCooldownSec must be a non-negative integer"},
 		{`{"herdr":{"blockedCooldownSec":1.5}}`, "config.json: herdr.blockedCooldownSec must be a non-negative integer"},
 		{`{"herdr":{"blockedCooldownSec":true}}`, "config.json: herdr.blockedCooldownSec must be a non-negative integer"},
+		{`{"herdr":{"blockedCooldownSec":9223372036854775807}}`, "config.json: herdr.blockedCooldownSec must be a non-negative integer of at most 9223372036"},
+		{`{"herdr":{"blockedCooldownSec":9223372037}}`, "config.json: herdr.blockedCooldownSec must be a non-negative integer of at most 9223372036"},
 		{`{"herdr":{"agentPattern":5}}`, "config.json: herdr.agentPattern must be a string"},
 		{`{"herdr":{"agentPattern":"["}}`, "config.json: herdr.agentPattern is not a valid regular expression:"},
 		{`{"silentMinutes":0}`, "config.json: silentMinutes must be a positive integer"},
@@ -553,6 +555,25 @@ func TestLoadBlockedCooldownZeroOff(t *testing.T) {
 	}
 	if got := ctx.Profile.Herdr.BlockedCooldown(); got != 0 {
 		t.Errorf("herdr blocked cooldown = %v, want 0 (off)", got)
+	}
+}
+
+// TestLoadBlockedCooldownMaxFitsDuration pins the largest second count that
+// still fits in a time.Duration. One past it is rejected by the shape table.
+func TestLoadBlockedCooldownMaxFitsDuration(t *testing.T) {
+	_, dir, _ := testEnv(t)
+	writeConfig(t, dir, `{"herdr":{"blockedCooldownSec":9223372036}}`)
+	ctx, err := Load(ParseArgs(nil), false)
+	if err != nil {
+		t.Fatalf("load max blockedCooldownSec: %v", err)
+	}
+	if ctx.Profile.Herdr.BlockedCooldownSec == nil || *ctx.Profile.Herdr.BlockedCooldownSec != 9223372036 {
+		t.Fatalf("herdr.blockedCooldownSec = %v, want 9223372036", ctx.Profile.Herdr.BlockedCooldownSec)
+	}
+	got := ctx.Profile.Herdr.BlockedCooldown()
+	t.Logf("blockedCooldownSec=9223372036 BlockedCooldown()=%v", got)
+	if got <= 0 {
+		t.Fatalf("BlockedCooldown() = %v, want > 0", got)
 	}
 }
 
