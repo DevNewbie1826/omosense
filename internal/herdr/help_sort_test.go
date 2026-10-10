@@ -25,10 +25,10 @@ func TestBatchSortedByFirstAt(t *testing.T) {
 	}
 }
 
-// TestHelpNamesBlockedAllAndDoneBatch pins the config key and line name the
-// herdr help must point at.
+// TestHelpNamesBlockedAllAndDoneBatch pins the config keys and line names
+// the herdr help must point at.
 func TestHelpNamesBlockedAllAndDoneBatch(t *testing.T) {
-	for _, want := range []string{"herdr.blockedAll", "default false", "done-batch", "5 quiet minutes"} {
+	for _, want := range []string{"herdr.blockedAll", "default false", "herdr.blockedCooldownSec", "default 60, 0 = off", "done-batch", "5 quiet minutes"} {
 		if !strings.Contains(Help, want) {
 			t.Errorf("Help lacks %q:\n%s", want, Help)
 		}
