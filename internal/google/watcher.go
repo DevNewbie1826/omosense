@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -195,7 +196,7 @@ func (w *watcher) mail(ctx context.Context, silent bool) error {
 		if !ok {
 			continue
 		}
-		k := fmt.Sprintf("mail:%s:%s", omapStr(m, "account"), omapStr(m, "id"))
+		k := mailKey(m)
 		if w.seen.Has(k) {
 			continue
 		}
@@ -223,6 +224,21 @@ func (w *watcher) mail(ctx context.Context, silent bool) error {
 		w.sink.Emit("MAIL", p)
 	}
 	return nil
+}
+
+// mailKey is the seen key of one `zele mail list` item. zele lists Gmail
+// threads, so the id is a thread id; the thread's message count is part of
+// the key so a new message in an already-reported thread fires again
+// (mail:<account>:<id>:<messages>). An item without a numeric messages
+// field keeps the bare mail:<account>:<id> key.
+func mailKey(m *core.OMap) string {
+	k := fmt.Sprintf("mail:%s:%s", omapStr(m, "account"), omapStr(m, "id"))
+	if v, ok := m.Get("messages"); ok {
+		if n, ok := numberFloat(v); ok {
+			k += ":" + strconv.FormatFloat(n, 'f', -1, 64)
+		}
+	}
+	return k
 }
 
 // prune drops seen values strictly older than 7 days (watch-google.ts).
