@@ -159,7 +159,7 @@ func TestSOONWindowBoundaries(t *testing.T) {
 
 // TestMailSilentNoiseTrunc pins mail(firstRun) silence, the NOISE filter,
 // the MAIL payload shape (absent from/subject omitted, rune-truncated
-// snippet) and the mail:<account>:<id> keys.
+// snippet) and the mail:<account>:<id>:<messages> keys.
 func TestMailSilentNoiseTrunc(t *testing.T) {
 	var buf bytes.Buffer
 	sink := core.NewOut(&buf)
@@ -201,7 +201,7 @@ func TestMailSilentNoiseTrunc(t *testing.T) {
 	if n := len([]rune(snip.(string))); n != 200 {
 		t.Errorf("snippet runes = %d, want 200 (rune truncation)", n)
 	}
-	if !w2.seen.Has("mail:fixturemain@gmail.com:1a10300000000001") {
+	if !w2.seen.Has("mail:fixturemain@gmail.com:1a10300000000001:1") {
 		t.Errorf("NOISE mail not marked seen")
 	}
 	for _, l := range mails {
@@ -237,6 +237,34 @@ func TestMailFieldOmission(t *testing.T) {
 	sn, _ := p.Get("snippet")
 	if sn != "" {
 		t.Errorf("snippet = %#v, want empty string", sn)
+	}
+}
+
+// TestMailThreadNewMessageFires pins the thread seen key: zele lists Gmail
+// threads, so the same id with a higher message count is a new message and
+// prints a second MAIL line, while an unchanged count prints nothing.
+func TestMailThreadNewMessageFires(t *testing.T) {
+	thread := func(n int) []byte {
+		return []byte(fmt.Sprintf("summary: 1 threads (inbox)\nitems:\n  - account: a@masked.example\n    id: 19a0000000000abc\n    from: GitHub <notifications@github.example>\n    subject: 'Re: [o/r] PR title (PR #1)'\n    snippet: new comment\n    messages: %d\n", n))
+	}
+	var buf bytes.Buffer
+	sink := core.NewOut(&buf)
+	w, err := newWatcher(newTestCtx(t.TempDir(), core.Profile{Mail: true}, sink), sink, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.now = time.Now
+	for i, step := range []struct {
+		count int
+		want  int
+	}{{1, 1}, {1, 1}, {2, 2}, {2, 2}} {
+		w.zele = fakeZele(nil, thread(step.count), nil)
+		if err := w.mail(context.Background(), false); err != nil {
+			t.Fatal(err)
+		}
+		if got := len(linesWith(&buf, "MAIL")); got != step.want {
+			t.Fatalf("pass %d (messages %d): MAIL lines = %d, want %d:\n%s", i, step.count, got, step.want, buf.String())
+		}
 	}
 }
 
@@ -287,7 +315,7 @@ func TestOnceReadOnly(t *testing.T) {
 	mustSeoul(t)
 	dir := t.TempDir()
 	path := filepath.Join(dir, "google-seen.json")
-	seed := []byte(`{"mail:fixturemain@gmail.com:1a10300000000001":100,"cal:20261005_a3v3ietd9obqpnrv5hg4emhmvc@google.com@1002207600000":100}`)
+	seed := []byte(`{"mail:fixturemain@gmail.com:1a10300000000001:1":100,"cal:20261005_a3v3ietd9obqpnrv5hg4emhmvc@google.com@1002207600000":100}`)
 	if err := os.WriteFile(path, seed, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -407,11 +435,11 @@ func TestLoopTicks(t *testing.T) {
 	}
 	keys := v.(*core.OMap).Keys()
 	want := []string{
-		"mail:fixturemain@gmail.com:1a1024917255ca5b",
-		"mail:fixturemain@gmail.com:1a0ffa63888a1460",
-		"mail:fixturemain@gmail.com:1a0ff41e81e22bc6",
-		"mail:fixturemain@gmail.com:1a10300000000001",
-		"mail:fixturemain@gmail.com:1a10300000000002",
+		"mail:fixturemain@gmail.com:1a1024917255ca5b:1",
+		"mail:fixturemain@gmail.com:1a0ffa63888a1460:1",
+		"mail:fixturemain@gmail.com:1a0ff41e81e22bc6:1",
+		"mail:fixturemain@gmail.com:1a10300000000001:1",
+		"mail:fixturemain@gmail.com:1a10300000000002:1",
 		"cal:20261005_a3v3ietd9obqpnrv5hg4emhmvc@google.com@1002207600000",
 	}
 	if len(keys) < len(want) || !reflect.DeepEqual(keys[:len(want)], want) {
